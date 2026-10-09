@@ -1409,6 +1409,27 @@ struct IlQ6K {
         }
     }
 };
+// Q8_0: one Q8_1 block a weight block; its traits' single-column apply reads the same two ints and scale, so here the
+// loaded W meets the interleaved columns' u() and scales() - the same dot product, bitwise.
+struct IlQ80 {
+    using F = SmallTraits<Q80Block, 8>;
+    static constexpr bool PM = false;
+    template <int NC, class X>
+    __device__ static void apply(const F::W& r, const X& x, int kby, int iqs, float (&out)[NC]) {
+        int u0[NC], u1[NC];
+        x.u(kby, iqs, u0);
+        x.u(kby, iqs + 1, u1);
+        float d8[NC];
+        x.scales(kby, d8);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            int sumi = 0;
+            sumi = STRATA_DP4A(r.v[0], u0[c], sumi);
+            sumi = STRATA_DP4A(r.v[1], u1[c], sumi);
+            out[c] = r.d0 * d8[c] * float(sumi);
+        }
+    }
+};
 
 template <typename I, int NC, int R>
 __launch_bounds__(4 * WARP)
@@ -2505,6 +2526,7 @@ constexpr IlRows kIlRowsShared[] = {   // sm_86 + sm_120, and the fallback for e
     {12, {{0, 0, 1, 1, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q4_K
     {13, {{0, 0, 1, 1, 1}, {0, 4, 1, 1, 1}, {0, 1, 1, 1, 2}}},   // Q5_K
     {14, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}}},   // Q6_K
+    {8, {{0, 0, 0, 0, 0}, {0, 0, 4, 2, 1}, {0, 2, 2, 2, 2}}},   // Q8_0 (the fork's measured row)
 };
 // Per-architecture tables (P10).  A card whose compute capability (major * 10 + minor) is listed here uses its own table;
 // every other sm_80+ card uses kIlRowsShared.  sm_89 (Ada) has none yet: nobody measured it (we have no such card), so
@@ -2520,6 +2542,8 @@ constexpr IlRows kIlRows_70[] = {
     {12, {{0, 2, 2, 4, 4}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q4_K
     {13, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 1, 2, 2, 2}}},   // Q5_K
     {14, {{0, 1, 1, 1, 1}, {0, 2, 2, 2, 2}, {0, 2, 2, 4, 2}}},   // Q6_K
+    // Q8_0: provisional (the fork's row) until the V100 emit-table run; a wrong choice is only speed, never output
+    {8, {{0, 0, 0, 0, 0}, {0, 0, 4, 2, 1}, {0, 2, 2, 2, 2}}},    // Q8_0
 };
 struct IlArch { int cc; const IlRows* t; size_t n; };
 constexpr IlArch kIlArch[] = {
@@ -2613,7 +2637,7 @@ bool il_arch_ok() {
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
     if (ncols < 2 || ncols > 4 || !g_multi_exact || !il_arch_ok()) return false;
     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
-           (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14);
+           (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 8);
 }
 
 void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void* x_il, float* y, int n_in,
@@ -2623,7 +2647,7 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
         return;
     }
     const int r = g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out);
-    validate_shape(n_in, ncols, QK);
+    validate_shape(n_in, ncols, ggml_type == 8 ? Q8K : QK);
     validate_pointer(weights);
     validate_pointer(x_il);
     validate_pointer(y);
@@ -2634,6 +2658,7 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
     case 12: launch_il_rows<IlQ4K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
     case 13: launch_il_rows<IlQ5K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
     case 14: launch_il_rows<IlQ6K>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
+    case 8: launch_il_rows<IlQ80>(r, weights, x_il, y, n_in, n_out, ncols, s); break;
     }
     launch_check();
 }

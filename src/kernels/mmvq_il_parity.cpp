@@ -51,6 +51,12 @@ const Case CASES[] = {
     {"Q6_K 4096x2560", 14, 4096, 2560, 256, 210, {208, -1}},
     {"Q6_K odd rows 2560x2051", 14, 2560, 2051, 256, 210, {208, -1}},
     {"Q6_K 2560x512", 14, 2560, 512, 256, 210, {208, -1}},
+    {"Q8_0 2560x10240", 8, 2560, 10240, 32, 34, {0, -1}},
+    {"Q8_0 2560x6144", 8, 2560, 6144, 32, 34, {0, -1}},
+    {"Q8_0 4096x2560", 8, 4096, 2560, 32, 34, {0, -1}},
+    {"Q8_0 2560x512", 8, 2560, 512, 32, 34, {0, -1}},
+    {"Q8_0 2560x12288", 8, 2560, 12288, 32, 34, {0, -1}},
+    {"Q8_0 odd rows 2560x2051", 8, 2560, 2051, 32, 34, {0, -1}},
 };
 
 uint16_t sane_half(std::mt19937& rng) {
@@ -176,10 +182,10 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
 // A cell with several measured shapes takes the worst (smallest) gain of the best choice, as the shipped table does for
 // two cards; a class with no measured shape prints the value of its neighbour below it (or 0).
 void emit_table() {
-    const int types[] = {23, 12, 13, 14};
-    const char* names[] = {"IQ4_XS", "Q4_K", "Q5_K", "Q6_K"};
+    const int types[] = {23, 12, 13, 14, 8};
+    const char* names[] = {"IQ4_XS", "Q4_K", "Q5_K", "Q6_K", "Q8_0"};
     std::printf("// measured on this card by mmvq_il_parity --bench --emit-table\n");
-    for (int ti = 0; ti < 4; ++ti) {
+    for (int ti = 0; ti < 5; ++ti) {
         std::printf("    {%d, {", types[ti]);
         for (int nc = 2; nc <= 4; ++nc) {
             int prev = 0;
@@ -209,7 +215,7 @@ void emit_table() {
 // the per-architecture lookup, no GPU needed for its answers
 int check_tables() {
     int bad = 0;
-    for (int type : {23, 12, 13, 14})
+    for (int type : {23, 12, 13, 14, 8})
         for (int nc = 2; nc <= 4; ++nc)
             for (int n_out : {512, 2560, 6144, 10240, 12288, 248320}) {
                 const int a = native_mmvq_il_rows_for(86, type, nc, n_out);

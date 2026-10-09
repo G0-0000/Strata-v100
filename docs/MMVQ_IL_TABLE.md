@@ -4,7 +4,7 @@ The decode and verify windows run their dense projections (2 to 4 tokens at a ti
 interleaved copy of the q8_1 activations. Every choice it makes gives the same bits as the plain kernels
 (`STRATA_MMVQ_IL=0` turns the whole path off); only the speed differs. How many matrix rows one warp takes
 (1, 2 or 4, or 0 = use the plain kernel) is a table in `src/kernels/cuda/native_mmvq.cu`, indexed by the
-quantisation type (IQ4_XS, Q4_K, Q5_K, Q6_K), the token count (2-4) and the matrix's row count (five classes).
+quantisation type (IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0), the token count (2-4) and the matrix's row count (five classes).
 
 Which table a card gets:
 

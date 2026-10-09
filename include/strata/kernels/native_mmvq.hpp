@@ -142,7 +142,7 @@ std::size_t native_q8_1_il_bytes(int n_in, int ncols);
 // Writes the interleaved copy of 2..4 columns of plain q8_1 blocks (native_quantize_q8_1's, or a fused producer's)
 // to x_il (native_q8_1_il_bytes): the same values in the same bytes.
 void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols, void* stream);
-// True when native_mmvq_il runs its own kernel for this call (IQ4_XS, Q4_K, Q5_K, Q6_K, 2-4 columns, the exact layout).
+// True when native_mmvq_il runs its own kernel for this call (IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0, 2-4 columns, the exact layout).
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out);
 // native_mmvq for 2..4 columns whose copy native_q8_1_interleave wrote, bitwise native_mmvq's output: kernels in which a
 // warp takes 1, 2 or 4 rows and reads the columns from the interleaved copy; native_mmvq (x_q8_1) when not supported.

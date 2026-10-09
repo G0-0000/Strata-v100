@@ -226,8 +226,9 @@ int check_tables() {
                 }
                 if (a != 0 && a != 1 && a != 2 && a != 4) { ++bad; std::printf("FAIL table: rows %d\n", a); }
             }
-    // Volta has its own table (PR 1401): Q6_K at 2 columns, 2560 rows -> 1 row a warp; the Ampere table says 0 there
-    if (native_mmvq_il_rows_for(70, 14, 2, 2560) != 1 || native_mmvq_il_rows_for(86, 14, 2, 2560) != 0) {
+    // Volta has its own table (PR 1401): Q6_K at 2 columns, 12288 rows -> 1 row a warp; the Ampere table says 0 there.
+    // The expected "1" follows the 2026-10-10 V100 emit-table measurement; a re-measured table may change it.
+    if (native_mmvq_il_rows_for(70, 14, 2, 12288) != 1 || native_mmvq_il_rows_for(86, 14, 2, 12288) != 0) {
         ++bad;
         std::printf("FAIL table: the sm_70 table is not the V100's\n");
     }

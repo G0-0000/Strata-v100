@@ -2549,7 +2549,7 @@ constexpr IlArch kIlArch[] = {
     {70, kIlRows_70, sizeof(kIlRows_70) / sizeof(IlRows)},   // Volta: PR 1401, measured on a V100-SXM2
 };
 // STRATA_MMVQ_IL_ROWS="type:ncols:r0,r1,r2,r3,r4;..." overrides single rows of the table for every card (type = ggml
-// type 23/12/13/14, ncols 2-4, r* = rows a warp 0/1/2/4 for the five n_out classes).  Parsed once.
+// type 23/12/13/14/8, ncols 2-4, r* = rows a warp 0/1/2/4 for the five n_out classes).  Parsed once.
 struct IlEnvRow { int type, ncols; uint8_t r[5]; };
 const std::vector<IlEnvRow>& il_env_rows() {
     static const std::vector<IlEnvRow> v = [] {

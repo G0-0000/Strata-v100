@@ -2526,7 +2526,7 @@ constexpr IlRows kIlRowsShared[] = {   // sm_86 + sm_120, and the fallback for e
     {12, {{0, 0, 1, 1, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q4_K
     {13, {{0, 0, 1, 1, 1}, {0, 4, 1, 1, 1}, {0, 1, 1, 1, 2}}},   // Q5_K
     {14, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}}},   // Q6_K
-    {8, {{0, 0, 0, 0, 0}, {0, 0, 4, 2, 1}, {0, 2, 2, 2, 2}}},   // Q8_0 (the fork's measured row)
+    {8, {{0, 0, 4, 2, 1}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q8_0 (the fork's row: fork r[1..3], its ncols 2-4)
 };
 // Per-architecture tables (P10).  A card whose compute capability (major * 10 + minor) is listed here uses its own table;
 // every other sm_80+ card uses kIlRowsShared.  sm_89 (Ada) has none yet: nobody measured it (we have no such card), so
@@ -2541,9 +2541,8 @@ constexpr IlRows kIlRows_70[] = {
     {23, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 4, 2, 2, 2}}},   // IQ4_XS
     {12, {{0, 2, 2, 4, 4}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},   // Q4_K
     {13, {{0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 1, 2, 2, 2}}},   // Q5_K
-    {14, {{0, 1, 1, 1, 1}, {0, 2, 2, 2, 2}, {0, 2, 2, 4, 2}}},   // Q6_K
-    // Q8_0: provisional (the fork's row) until the V100 emit-table run; a wrong choice is only speed, never output
-    {8, {{0, 0, 0, 0, 0}, {0, 0, 4, 2, 1}, {0, 2, 2, 2, 2}}},    // Q8_0
+    {14, {{0, 0, 0, 1, 1}, {0, 2, 2, 2, 2}, {0, 2, 2, 4, 2}}},   // Q6_K
+    {8, {{0, 1, 4, 2, 4}, {0, 1, 1, 4, 2}, {0, 2, 2, 2, 2}}},    // Q8_0
 };
 struct IlArch { int cc; const IlRows* t; size_t n; };
 constexpr IlArch kIlArch[] = {

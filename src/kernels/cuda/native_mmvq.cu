@@ -2599,12 +2599,13 @@ constexpr IlRows kIlRows_60[] = {
 };
 // RTX 30-series (sm_86), 143-dense: read off mmvq_il_parity --bench --emit-table on an RTX A4000 with the engine's real
 // shapes (the output projections have 6144 inputs, not 4096), per cell the rows count whose worst measured shape is under
-// 0.97 of native_mmvq's time. The four older rows are the shared table's; Q3_K (the Q2_0 pack's main dense type) is new.
+// 0.97 of native_mmvq's time. The older rows are the shared table's; Q3_K (the Q2_0 pack's main dense type) is new.
 constexpr IlRows kIlRows_86[] = {
     {23, {{0, 0, 0, 0, 0}, {0, 0, 2, 4, 4}, {0, 1, 1, 1, 1}}},   // IQ4_XS
     {12, {{0, 0, 1, 1, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q4_K
     {13, {{0, 0, 1, 1, 1}, {0, 4, 1, 1, 1}, {0, 1, 1, 1, 2}}},   // Q5_K
     {14, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}}},   // Q6_K
+    {8, {{0, 0, 4, 2, 1}, {0, 2, 2, 2, 2}, {0, 2, 2, 2, 2}}},    // Q8_0: the shared row (nothing measured on the A4000)
     {11, {{1, 2, 2, 2, 2}, {1, 1, 1, 2, 2}, {1, 1, 1, 1, 1}}},   // Q3_K (two runs; 2560x10240 at 4 columns 120 -> 70 us)
 };
 // One column: rows a warp by n_out class, 0 = native_mmvq's single-column kernels (STRATA_MMVQ_IL_T1=0 turns this off).

@@ -28,6 +28,7 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/numa_policy.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -2459,6 +2460,26 @@ int main(int argc, char** argv) {
                                  "upper bound to size the complement's claim from\n");
             o.numa_hot_node = -1;
         }
+    }
+    // S2/S3: the same switch places the rest of the engine's pinned and malloc'd pools, which have no flag of their
+    // own.  S1's node is the hot one; the cold node is derived here as the FIRST node that is not the hot one, so on
+    // a two-node host the two pools sit on the two nodes and on a single-node host there is no cold node at all and
+    // S3 does nothing.  The nodes are published to the allocation paths (which run on other threads) and this is the
+    // only place they are set.  Off: `o.numa_hot_node < 0`, and then neither is set and every site below is skipped.
+    if (o.numa_hot_node >= 0) {
+        const int nodes = strata::core::detail::numa_node_count();
+        int cold = -1;
+        for (int node = 0; node < nodes; ++node) {
+            if (node != o.numa_hot_node) { cold = node; break; }
+        }
+        strata::core::detail::set_numa_hot_node(o.numa_hot_node);
+        strata::core::detail::set_numa_cold_node(cold);
+        if (cold >= 0)
+            std::fprintf(stderr, "strata generate: NUMA placement: hot pools on node %d, cold pools on node %d\n",
+                         o.numa_hot_node, cold);
+        else
+            std::fprintf(stderr, "strata generate: NUMA placement: hot pools on node %d, no cold node to split "
+                                 "them with (this host has %d NUMA node(s))\n", o.numa_hot_node, nodes);
     }
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order

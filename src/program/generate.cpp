@@ -253,8 +253,13 @@ bool refill_blocking() {
 // nothing else the engine needs, so the read is put in this scope: bound to the cold node, the refilled pages take
 // the node the engine keeps for what it does not hot-place, not the one the pinned complement and the pools sit on.
 // The scope is the blob_stable() call alone - the fill_slot call beside it is a cudaMemcpy into the VRAM arena and
-// allocates nothing host-side - because the binding is 4 syscalls, and one per lent slot (1817 of them in a big
-// prompt) is ~4-7 ms against a refill that costs 0.1-2 s.  The policy is put back when the scope ends
+// allocates nothing host-side - because the binding is 3 syscalls (get, then set, then set again to put the policy
+// back), and one per lent slot (1817 of them in a big prompt) is ~3-5 ms against a refill that costs 0.1-2 s.  Note
+// what this scope covers: blob_stable() reads the file itself only when the blob is STAGED (the GGUF in place, or an
+// unbuffered or io-prefetch tier), which is what the packs run with.  A pure mapping (experts.bin with no --native and
+// no STRATA_IO_PREFETCH) instead hands out a pointer INTO the mapping, and the fault then happens inside fill_slot,
+// outside this scope: there the binding is a no-op and the refilled pages land where they always did.  The policy is
+// put back when the scope ends
 // (ThreadNodeBinding), so nothing else this thread allocates is affected.  Gated by the switch and by a cold node
 // being set (--numa-hot-node on a host with a second node): otherwise this costs one atomic read and the pages land
 // where they always did.
@@ -7037,9 +7042,10 @@ int main(int argc, char** argv) {
             const double drop_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - drop_t0).count();
             if (freed > 0)
-                std::fprintf(stderr, "strata generate: --drop-file-cache: %.2f GiB of the model files' cached pages "
-                                     "handed back to the kernel in %.0f ms (every expert is in VRAM or in the RAM "
-                                     "copy; the lend-region refill reads them again)%s\n",
+                std::fprintf(stderr, "strata generate: --drop-file-cache: %.2f GiB of the model files' pages advised "
+                                     "back to the kernel in %.0f ms (the bytes advised, not a measurement of what the "
+                                     "kernel reclaimed; every expert is in VRAM or in the RAM copy, and the "
+                                     "lend-region refill reads them again)%s\n",
                              (double) freed / 1073741824.0, drop_ms,
                              why.empty() ? "" : "; see the lines above");
             else

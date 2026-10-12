@@ -250,11 +250,14 @@ bool refill_blocking() {
 // --drop-file-cache: the lent slots' experts are read back from the mapped files after a prompt, and a file page
 // lands on the node the READING thread faults it in on (measured 2026-10-13: 100% of new file pages follow the
 // faulting thread's set_mempolicy).  With the startup drop in place those pages come back to a page cache that holds
-// nothing else the engine needs, so the refill's scope binds this thread to the cold node: they land on the node the
-// engine keeps for what it does not hot-place, not on the one the pinned complement and the pools sit on.  The
-// policy is put back when the scope ends (ThreadNodeBinding), so nothing else this thread allocates is affected.
-// Gated by the switch and by a cold node being set (--numa-hot-node on a host with a second node): otherwise this
-// costs one atomic read and the pages land where they always did.
+// nothing else the engine needs, so the read is put in this scope: bound to the cold node, the refilled pages take
+// the node the engine keeps for what it does not hot-place, not the one the pinned complement and the pools sit on.
+// The scope is the blob_stable() call alone - the fill_slot call beside it is a cudaMemcpy into the VRAM arena and
+// allocates nothing host-side - because the binding is 4 syscalls, and one per lent slot (1817 of them in a big
+// prompt) is ~4-7 ms against a refill that costs 0.1-2 s.  The policy is put back when the scope ends
+// (ThreadNodeBinding), so nothing else this thread allocates is affected.  Gated by the switch and by a cold node
+// being set (--numa-hot-node on a host with a second node): otherwise this costs one atomic read and the pages land
+// where they always did.
 struct RefillNodeBinding {
     strata::core::detail::ThreadNodeBinding binding;
     explicit RefillNodeBinding(bool wanted) {
@@ -10991,9 +10994,15 @@ int main(int argc, char** argv) {
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
-                const RefillNodeBinding refill_node(o.drop_file_cache);   // --drop-file-cache: the refilled pages land cold
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                    // --drop-file-cache: the read faults the lost experts' pages back in on THIS thread, and a file
+                    // page follows the faulting thread's policy - bound to the cold node they take it, not the hot
+                    // one.  The scope is the read alone: the copy below allocates nothing host-side.
+                    const uint8_t* b = nullptr;
+                    {
+                        const RefillNodeBinding refill_node(o.drop_file_cache);
+                        b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                    }
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
@@ -12793,9 +12802,15 @@ int main(int argc, char** argv) {
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
-            const RefillNodeBinding refill_node(o.drop_file_cache);   // --drop-file-cache: the refilled pages land cold
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                // --drop-file-cache: the read faults the lost experts' pages back in on THIS thread, and a file page
+                // follows the faulting thread's policy - bound to the cold node they take it, not the hot one.  The
+                // scope is the read alone: the copy below allocates nothing host-side.
+                const uint8_t* b = nullptr;
+                {
+                    const RefillNodeBinding refill_node(o.drop_file_cache);
+                    b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                }
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
                                                         : xcache.fill_slot_queued(slot, b, err, nb))) {

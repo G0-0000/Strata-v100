@@ -7,6 +7,7 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/numa_policy.hpp"
 
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
@@ -483,70 +484,6 @@ bool free_memory_bytes(uint64_t& bytes) {
 #endif
 }
 
-#if defined(__linux__) && defined(SYS_mbind) && defined(SYS_set_mempolicy) && defined(SYS_get_mempolicy)
-// S1 (--numa-hot-node): the memory-policy calls go through syscall(2).  The engine links no libnuma (numaif.h is
-// that library's header) and these three are the kernel's own interface, as the io_submit path above already does.
-constexpr int kMpolDefault = 0, kMpolBind = 2;      // the values set_mempolicy/mbind take from user space
-constexpr unsigned long kNumaMaxNode = 1024;        // the node masks below are kNumaMaxNode / 64 unsigned longs
-
-void numa_node_mask(int node, unsigned long* mask) {
-    std::memset(mask, 0, sizeof(unsigned long) * (kNumaMaxNode / 64));
-    mask[node / 64] |= 1ul << (node % 64);
-}
-
-/// mbind(MPOL_BIND) on [addr, addr + bytes); the range must be page-aligned, and a mask no node satisfies (an
-/// out-of-range node) comes back as EINVAL.
-bool numa_bind_range(void* addr, uint64_t bytes, int node, int& error_number) {
-    unsigned long mask[kNumaMaxNode / 64];
-    numa_node_mask(node, mask);
-    errno = 0;
-    if (syscall(SYS_mbind, addr, (unsigned long) bytes, kMpolBind, mask, kNumaMaxNode, 0) == 0) return true;
-    error_number = errno;
-    return false;
-}
-
-/// The calling thread's memory policy, bound to one node for a scope and put back when the scope ends.  The VMA's
-/// own mbind is what decides where its pages go; the thread policy covers the faults that bring them in and
-/// anything this thread allocates meanwhile.  `bind` false (with `why`) = the caller goes on with mbind alone,
-/// which is the graceful degradation (the pages then follow the process's own policy, as they always did).
-struct ThreadNodeBinding {
-    bool bound = false, saved = false;
-    int saved_mode = kMpolDefault;
-    unsigned long saved_mask[kNumaMaxNode / 64] = {};
-
-    bool bind(int node, std::string& why) {
-        errno = 0;
-        if (syscall(SYS_get_mempolicy, &saved_mode, saved_mask, kNumaMaxNode, nullptr, 0) != 0) {
-            why = std::string("cannot read this thread's memory policy (") + std::strerror(errno) + ")";
-            return false;
-        }
-        saved = true;
-        unsigned long mask[kNumaMaxNode / 64];
-        numa_node_mask(node, mask);
-        errno = 0;
-        if (syscall(SYS_set_mempolicy, kMpolBind, mask, kNumaMaxNode) != 0) {
-            why = std::string("cannot bind this thread to node ") + std::to_string(node) + " (" + std::strerror(errno) + ")";
-            saved = false;
-            return false;
-        }
-        bound = true;
-        return true;
-    }
-
-    void restore() {
-        if (!bound || !saved) return;
-        bound = false;
-        errno = 0;
-        if (syscall(SYS_set_mempolicy, saved_mode, saved_mask, kNumaMaxNode) != 0)
-            std::fprintf(stderr, "FileExpertSource: WARNING: cannot put this thread's memory policy back (%s): "
-                                 "allocations on it may take the node it was bound to (--numa-hot-node)\n",
-                         std::strerror(errno));
-    }
-
-    ~ThreadNodeBinding() { restore(); }
-};
-#endif
-
 void log_complement_memory(const char* stage, uint64_t requested) {
 #if defined(_WIN32)
     MEMORYSTATUSEX status{};
@@ -656,6 +593,30 @@ bool pread_full(int fd, uint8_t* dst, uint64_t n, uint64_t off) {
     }
     return true;
 }
+
+/// --drop-file-cache, the half that decides WHERE the pages come back: binds the calling thread to the cold node for
+/// the scope of one mapped read, so the page that read faults in lands on it.  A file page lands on the node the
+/// READING thread is bound to (measured 2026-10-13: 100% of new file pages, both by mmap fault and by pread), and the
+/// read of an expert is NOT done by the thread that asked for it: the prompt path's stager, a `prefetch`'s fetch
+/// threads, a pool worker or the refill all end up in copy_from_files.  So the binding goes here, per blob, and
+/// covers all of them.  `on` false, or no cold node set (--numa-hot-node off, or a host with one node): nothing is
+/// bound and the read is exactly what it always was, at the cost of one bool.
+struct ColdReadBinding {
+    strata::core::detail::ThreadNodeBinding binding;
+    bool bound = false, failed = false;
+    explicit ColdReadBinding(bool on) {
+        if (!on) return;
+        const int cold = strata::core::detail::numa_cold_node();
+        if (cold < 0) return;
+        std::string why;
+        bound = binding.bind(cold, why);
+        if (!bound) {
+            failed = true;
+            std::fprintf(stderr, "FileExpertSource: --drop-file-cache: %s; this read's pages take the node their "
+                                 "fault does\n", why.c_str());
+        }
+    }
+};
 }  // namespace
 #endif
 
@@ -1278,6 +1239,14 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
         if (read_direct(&f, 1)) return true;
         direct_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     }
+    // --drop-file-cache: the ONLY place a mapped read happens (the demand fill of a stage buffer, a prefetch's fetch
+    // threads, the stager's copy_blobs, the pool's copy_blob, the refill's blob_stable all come through here), and it
+    // runs on whichever thread does the work - so the cold-node binding for the pages this read brings in goes here
+    // and not at the call sites.  Off: one bool, no syscall.  (The unbuffered reads above allocate no page cache
+    // page and are left alone.)
+    const ColdReadBinding cold_read(reads_cold_);
+    if (cold_read.bound) cold_reads_.fetch_add(1, std::memory_order_relaxed);
+    else if (cold_read.failed) cold_read_failures_.fetch_add(1, std::memory_order_relaxed);
 #if defined(__linux__)
     if (io_pf_ || io_stats_) {   // count what the page cache holds; with io prefetch, read what it does not with pread
         Span sp[3];
@@ -2683,6 +2652,72 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 #endif
 }
 
+// --drop-file-cache (Linux): the mapped model files' cached pages, given back in one go once the startup reads are
+// done.  Every expert is in VRAM or in the RAM copy by then, and the file tier serves none of them, so the page cache
+// holds a third copy of the same bytes - the copy the kernel cannot take back cheaply, because the pages belong to
+// files this process still maps.  #1250 makes the same two calls when a page-locked complement needs the room; here
+// it is asked for by name.  madvise(MADV_DONTNEED) first unmaps the pages (posix_fadvise(DONTNEED) alone skips a
+// page that is still mapped) and posix_fadvise(DONTNEED) then drops them from the page cache (madvise alone leaves
+// them on the LRU): measured on this host, the pair took all 512 MiB of a probe file with mincore back at 0, and
+// either call alone took none.  The pages are clean and file-backed, so a later read faults them back in - the
+// prompt path's lend-region refill reads the drive once after this, and no answer changes.
+//
+// The whole mapping goes, with no lend-region exclusion: the loan is sized at request time (plan_lend, --prefill),
+// so there is no exclusion to compute here, and the bytes at stake are ~4 GiB of a ~55 GiB reclaim.  The refill that
+// reads those pages back is bound to the cold node (generate.cpp's RefillNodeBinding) and does not drop them again
+// (a second drop after a refill would read the drive per prompt: the drop happens once, from generate.cpp).
+uint64_t FileExpertSource::drop_file_cache(std::string& why) {
+    why.clear();
+#if !defined(__linux__)
+    why = "dropping the file cache is Linux only (Windows hands a VRAM expert's pages back per expert, "
+          "STRATA_FILE_RELEASE)";
+    return 0;
+#else
+    if (base_ == nullptr) { why = "the mapped experts are not open"; return 0; }
+    if (unmapped_) { why = "the mapped view of the experts is closed (drop_mapping)"; return 0; }
+    uint64_t bytes = 0;
+    int failures = 0;
+    auto drop = [&](const uint8_t* at, uint64_t len, int fd, const char* path) {
+        if (at == nullptr || len == 0) return;
+        if (madvise((void*) at, (size_t) len, MADV_DONTNEED) != 0) {
+            ++failures;
+            std::fprintf(stderr, "FileExpertSource: --drop-file-cache: madvise of %s failed (%s)\n", path,
+                         std::strerror(errno));
+            return;
+        }
+        bytes += len;
+        // Best effort, and the pages that were unmapped above are the ones it can take: the pages of a file someone
+        // else still maps, or a dirty one, stay (the caller's own check makes them redundant either way).
+        if (fd >= 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0) {
+            ++failures;
+            std::fprintf(stderr, "FileExpertSource: --drop-file-cache: posix_fadvise of %s failed (%s)\n", path,
+                         std::strerror(errno));
+        }
+        // A/B arm for the window: STRATA_DROP_CACHE_RANDOM=1 also turns the file's readahead off, so every page the
+        // later reads bring back is faulted by the reading thread itself (readahead is submitted with the pages it
+        // fills, and whether those are accounted to the faulting thread is the one part of the mechanism this host
+        // has not measured at engine scale).  Off by default: readahead is what makes the refill read at SSD speed.
+        static const bool random_after = [] {
+            const char* v = std::getenv("STRATA_DROP_CACHE_RANDOM");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (random_after && fd >= 0) (void) posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    };
+    if (maps_.empty()) drop(base_, mapped_bytes_, fd_, "the mapped experts");
+    else
+        for (size_t i = 0; i < maps_.size(); ++i)
+            drop(maps_[i].closed ? nullptr : maps_[i].base, maps_[i].bytes, maps_[i].fd,
+                 i < paths_.size() ? paths_[i].c_str() : "a mapped file");
+    if (failures > 0) {
+        char note[96];
+        std::snprintf(note, sizeof note, "%d of the mapped file%s could not be advised", failures,
+                      failures == 1 ? "" : "s");
+        why = note;
+    }
+    return bytes;
+#endif
+}
+
 void FileExpertSource::release_reserved_arena() {
 #if defined(__linux__)
     if (arena_preclaim_ != nullptr) (void) munmap(arena_preclaim_, (size_t) arena_preclaim_bytes_);
@@ -2750,7 +2785,7 @@ bool FileExpertSource::reserve_resident_arena(uint64_t requested_bytes, uint64_t
         return false;
     }
     int bind_error = 0;
-    if (!numa_bind_range(arena, bytes, node, bind_error)) {
+    if (!detail::numa_bind_range(arena, bytes, node, bind_error)) {
         const int failed_errno = bind_error;
         (void) munmap(arena, (size_t) bytes);
         err = "cannot bind " + std::to_string(bytes >> 20) + " MiB to NUMA node " + std::to_string(node) +
@@ -2761,7 +2796,7 @@ bool FileExpertSource::reserve_resident_arena(uint64_t requested_bytes, uint64_t
     {
         // The thread's policy for the touch only, and put back at the end of the scope: a thread left bound to a
         // node that is full fails its later allocations.  mbind on the arena decides the placement either way.
-        ThreadNodeBinding binding;
+        detail::ThreadNodeBinding binding;
         std::string why;
         if (!binding.bind(node, why))
             std::fprintf(stderr, "FileExpertSource: --numa-hot-node %d: %s; the arena's own bind stands\n",

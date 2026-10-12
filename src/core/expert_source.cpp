@@ -2629,6 +2629,11 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 // them on the LRU): measured on this host, the pair took all 512 MiB of a probe file with mincore back at 0, and
 // either call alone took none.  The pages are clean and file-backed, so a later read faults them back in - the
 // prompt path's lend-region refill reads the drive once after this, and no answer changes.
+//
+// The whole mapping goes, with no lend-region exclusion: the loan is sized at request time (plan_lend, --prefill),
+// so there is no exclusion to compute here, and the bytes at stake are ~4 GiB of a ~55 GiB reclaim.  The refill that
+// reads those pages back is bound to the cold node (generate.cpp's RefillNodeBinding) and does not drop them again
+// (a second drop after a refill would read the drive per prompt: the drop happens once, from generate.cpp).
 uint64_t FileExpertSource::drop_file_cache(std::string& why) {
     why.clear();
 #if !defined(__linux__)

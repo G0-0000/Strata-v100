@@ -7,6 +7,7 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/numa_policy.hpp"
 
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
@@ -482,70 +483,6 @@ bool free_memory_bytes(uint64_t& bytes) {
     return false;
 #endif
 }
-
-#if defined(__linux__) && defined(SYS_mbind) && defined(SYS_set_mempolicy) && defined(SYS_get_mempolicy)
-// S1 (--numa-hot-node): the memory-policy calls go through syscall(2).  The engine links no libnuma (numaif.h is
-// that library's header) and these three are the kernel's own interface, as the io_submit path above already does.
-constexpr int kMpolDefault = 0, kMpolBind = 2;      // the values set_mempolicy/mbind take from user space
-constexpr unsigned long kNumaMaxNode = 1024;        // the node masks below are kNumaMaxNode / 64 unsigned longs
-
-void numa_node_mask(int node, unsigned long* mask) {
-    std::memset(mask, 0, sizeof(unsigned long) * (kNumaMaxNode / 64));
-    mask[node / 64] |= 1ul << (node % 64);
-}
-
-/// mbind(MPOL_BIND) on [addr, addr + bytes); the range must be page-aligned, and a mask no node satisfies (an
-/// out-of-range node) comes back as EINVAL.
-bool numa_bind_range(void* addr, uint64_t bytes, int node, int& error_number) {
-    unsigned long mask[kNumaMaxNode / 64];
-    numa_node_mask(node, mask);
-    errno = 0;
-    if (syscall(SYS_mbind, addr, (unsigned long) bytes, kMpolBind, mask, kNumaMaxNode, 0) == 0) return true;
-    error_number = errno;
-    return false;
-}
-
-/// The calling thread's memory policy, bound to one node for a scope and put back when the scope ends.  The VMA's
-/// own mbind is what decides where its pages go; the thread policy covers the faults that bring them in and
-/// anything this thread allocates meanwhile.  `bind` false (with `why`) = the caller goes on with mbind alone,
-/// which is the graceful degradation (the pages then follow the process's own policy, as they always did).
-struct ThreadNodeBinding {
-    bool bound = false, saved = false;
-    int saved_mode = kMpolDefault;
-    unsigned long saved_mask[kNumaMaxNode / 64] = {};
-
-    bool bind(int node, std::string& why) {
-        errno = 0;
-        if (syscall(SYS_get_mempolicy, &saved_mode, saved_mask, kNumaMaxNode, nullptr, 0) != 0) {
-            why = std::string("cannot read this thread's memory policy (") + std::strerror(errno) + ")";
-            return false;
-        }
-        saved = true;
-        unsigned long mask[kNumaMaxNode / 64];
-        numa_node_mask(node, mask);
-        errno = 0;
-        if (syscall(SYS_set_mempolicy, kMpolBind, mask, kNumaMaxNode) != 0) {
-            why = std::string("cannot bind this thread to node ") + std::to_string(node) + " (" + std::strerror(errno) + ")";
-            saved = false;
-            return false;
-        }
-        bound = true;
-        return true;
-    }
-
-    void restore() {
-        if (!bound || !saved) return;
-        bound = false;
-        errno = 0;
-        if (syscall(SYS_set_mempolicy, saved_mode, saved_mask, kNumaMaxNode) != 0)
-            std::fprintf(stderr, "FileExpertSource: WARNING: cannot put this thread's memory policy back (%s): "
-                                 "allocations on it may take the node it was bound to (--numa-hot-node)\n",
-                         std::strerror(errno));
-    }
-
-    ~ThreadNodeBinding() { restore(); }
-};
-#endif
 
 void log_complement_memory(const char* stage, uint64_t requested) {
 #if defined(_WIN32)
@@ -2750,7 +2687,7 @@ bool FileExpertSource::reserve_resident_arena(uint64_t requested_bytes, uint64_t
         return false;
     }
     int bind_error = 0;
-    if (!numa_bind_range(arena, bytes, node, bind_error)) {
+    if (!detail::numa_bind_range(arena, bytes, node, bind_error)) {
         const int failed_errno = bind_error;
         (void) munmap(arena, (size_t) bytes);
         err = "cannot bind " + std::to_string(bytes >> 20) + " MiB to NUMA node " + std::to_string(node) +
@@ -2761,7 +2698,7 @@ bool FileExpertSource::reserve_resident_arena(uint64_t requested_bytes, uint64_t
     {
         // The thread's policy for the touch only, and put back at the end of the scope: a thread left bound to a
         // node that is full fails its later allocations.  mbind on the arena decides the placement either way.
-        ThreadNodeBinding binding;
+        detail::ThreadNodeBinding binding;
         std::string why;
         if (!binding.bind(node, why))
             std::fprintf(stderr, "FileExpertSource: --numa-hot-node %d: %s; the arena's own bind stands\n",

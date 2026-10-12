@@ -39,6 +39,9 @@
 #define PSAPI_VERSION 2
 #include <windows.h>
 #include <psapi.h>
+#elif defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -48,6 +51,15 @@ namespace {
 void require(bool ok, const std::string& message) {
     if (!ok) throw std::runtime_error(message);
 }
+
+#if defined(__linux__) && defined(SYS_get_mempolicy)
+/// The NUMA node the page at `p` is allocated on (get_mempolicy, MPOL_F_NODE|MPOL_F_ADDR); -1 when unanswerable.
+int page_node_of(const void* p) {
+    int node = -1;
+    if (syscall(SYS_get_mempolicy, &node, nullptr, 0, p, 1 | 2 /*MPOL_F_NODE|MPOL_F_ADDR*/) != 0) return -1;
+    return node;
+}
+#endif
 
 struct TempDirectory {
     fs::path path;
@@ -442,6 +454,68 @@ void test_numa_slice_ranges() {
     require(b[0].first <= 435200 + P && 435200 + P < b[0].second, "a slice-1 gate byte not in slice 1's gate range");
     require(a[1].first <= 870400 && 870400 < a[1].second, "the gate/up boundary page was not slice 0's up range");
     require(!(b[0].first <= 870400 && 870400 < b[0].second), "the gate/up boundary page was in slice 1's gate range");
+}
+
+// S1 (--numa-hot-node): the resident complement's pages are claimed on one node BEFORE the startup reads - mmap,
+// mbind(MPOL_BIND) and the pages faulted in while the node is still empty - and `pin_cache_complement` registers
+// and locks that arena instead of allocating one.  Only the claim itself is testable without a GPU (the
+// complement's use of it needs a real ExpertCache: the --rotation-gpu path).
+void test_numa_hot_node() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+#if defined(__linux__) && defined(SYS_mbind) && defined(SYS_get_mempolicy)
+    const int nodes = strata::core::detail::numa_node_count();
+    require(nodes >= 1, "a host with /sys/devices/system/node/node* has at least one node");
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 2, err), err);
+    create_pack(dir.path, 2 * BLOB);
+    FileExpertSource source;
+    require(!source.reserve_resident_arena(32ull << 20, 0, 0, err) && !err.empty(),
+            "a claim before the mapped experts were opened was accepted");
+    require(source.open(dir.path.string(), 1, 2, err), err);
+    require(!source.reserve_resident_arena(0, 0, 0, err), "a claim with no resident budget was accepted");
+    if (nodes < 2) {
+        std::cout << "file_expert_source_test: --numa-hot-node placement skipped (one NUMA node here)\n";
+        source.close();
+        return;
+    }
+    const uint64_t want = 32ull << 20;
+    require(source.reserve_resident_arena(want, 0, 1, err), err);
+    require(source.reserved_arena_bytes() == want, "the claim was not sized by the requested budget");
+    uint8_t* arena = (uint8_t*) source.reserved_arena();
+    require(arena != nullptr, "a successful claim has no arena");
+    for (uint64_t at = 0; at < want; at += 1ull << 20) {
+        require(page_node_of(arena + at) == 1, "a page claimed for node 1 is not on node 1");
+        arena[at] = (uint8_t) (at >> 20);
+        require(arena[at] == (uint8_t) (at >> 20), "the claimed arena is not writable memory");
+    }
+    // one claim per source, and close() gives it back
+    require(!source.reserve_resident_arena(want, 0, 0, err), "a second claim on one source was accepted");
+    require(source.reserved_arena_bytes() == want && source.reserved_arena() == arena,
+            "the refused second claim touched the first");
+    source.close();
+    require(source.reserved_arena_bytes() == 0 && source.reserved_arena() == nullptr, "close() kept the claim");
+    // 0 is a node number, not "off": a node-0 claim lives on node 0
+    require(source.open(dir.path.string(), 1, 2, err), err);
+    require(source.reserve_resident_arena(want, 0, 0, err), err);
+    uint8_t* zero = (uint8_t*) source.reserved_arena();
+    require(zero != nullptr, "a node-0 claim has no arena");
+    zero[0] = 1;
+    zero[want - 4096] = 1;
+    require(page_node_of(zero) == 0 && page_node_of(zero + want - 4096) == 0,
+            "node 0 is a node number: its claim must be placed on node 0");
+    source.close();
+    // a node this host does not have is refused (mbind EINVAL), not silently placed somewhere else
+    require(source.open(dir.path.string(), 1, 2, err), err);
+    require(!source.reserve_resident_arena(want, 0, nodes + 1, err) && !err.empty(),
+            "a claim on a node this host does not have was accepted");
+    require(source.reserved_arena() == nullptr, "a refused claim left an arena behind");
+    source.close();
+    std::cout << "numa hot node: " << nodes << " nodes, claims on 1 and 0 placed there: PASS\n";
+#else
+    std::cout << "file_expert_source_test: --numa-hot-node test skipped (not a Linux host with mbind)\n";
+#endif
 }
 
 void test_resident_memory_budget() {
@@ -993,6 +1067,7 @@ int main(int argc, char** argv) {
         test_resident_memory_budget();
         test_pin_pacing();
         test_numa_slice_ranges();
+        test_numa_hot_node();
         test_cgroup_memory_budget();
         test_host_memory();
         test_canonical_layout();

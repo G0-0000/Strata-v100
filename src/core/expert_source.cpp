@@ -593,6 +593,30 @@ bool pread_full(int fd, uint8_t* dst, uint64_t n, uint64_t off) {
     }
     return true;
 }
+
+/// --drop-file-cache, the half that decides WHERE the pages come back: binds the calling thread to the cold node for
+/// the scope of one mapped read, so the page that read faults in lands on it.  A file page lands on the node the
+/// READING thread is bound to (measured 2026-10-13: 100% of new file pages, both by mmap fault and by pread), and the
+/// read of an expert is NOT done by the thread that asked for it: the prompt path's stager, a `prefetch`'s fetch
+/// threads, a pool worker or the refill all end up in copy_from_files.  So the binding goes here, per blob, and
+/// covers all of them.  `on` false, or no cold node set (--numa-hot-node off, or a host with one node): nothing is
+/// bound and the read is exactly what it always was, at the cost of one bool.
+struct ColdReadBinding {
+    strata::core::detail::ThreadNodeBinding binding;
+    bool bound = false, failed = false;
+    explicit ColdReadBinding(bool on) {
+        if (!on) return;
+        const int cold = strata::core::detail::numa_cold_node();
+        if (cold < 0) return;
+        std::string why;
+        bound = binding.bind(cold, why);
+        if (!bound) {
+            failed = true;
+            std::fprintf(stderr, "FileExpertSource: --drop-file-cache: %s; this read's pages take the node their "
+                                 "fault does\n", why.c_str());
+        }
+    }
+};
 }  // namespace
 #endif
 
@@ -1215,6 +1239,14 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
         if (read_direct(&f, 1)) return true;
         direct_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     }
+    // --drop-file-cache: the ONLY place a mapped read happens (the demand fill of a stage buffer, a prefetch's fetch
+    // threads, the stager's copy_blobs, the pool's copy_blob, the refill's blob_stable all come through here), and it
+    // runs on whichever thread does the work - so the cold-node binding for the pages this read brings in goes here
+    // and not at the call sites.  Off: one bool, no syscall.  (The unbuffered reads above allocate no page cache
+    // page and are left alone.)
+    const ColdReadBinding cold_read(reads_cold_);
+    if (cold_read.bound) cold_reads_.fetch_add(1, std::memory_order_relaxed);
+    else if (cold_read.failed) cold_read_failures_.fetch_add(1, std::memory_order_relaxed);
 #if defined(__linux__)
     if (io_pf_ || io_stats_) {   // count what the page cache holds; with io prefetch, read what it does not with pread
         Span sp[3];
@@ -2661,6 +2693,15 @@ uint64_t FileExpertSource::drop_file_cache(std::string& why) {
             std::fprintf(stderr, "FileExpertSource: --drop-file-cache: posix_fadvise of %s failed (%s)\n", path,
                          std::strerror(errno));
         }
+        // A/B arm for the window: STRATA_DROP_CACHE_RANDOM=1 also turns the file's readahead off, so every page the
+        // later reads bring back is faulted by the reading thread itself (readahead is submitted with the pages it
+        // fills, and whether those are accounted to the faulting thread is the one part of the mechanism this host
+        // has not measured at engine scale).  Off by default: readahead is what makes the refill read at SSD speed.
+        static const bool random_after = [] {
+            const char* v = std::getenv("STRATA_DROP_CACHE_RANDOM");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (random_after && fd >= 0) (void) posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
     };
     if (maps_.empty()) drop(base_, mapped_bytes_, fd_, "the mapped experts");
     else

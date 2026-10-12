@@ -690,6 +690,18 @@ public:
     /// faults them back in from the drive.  Returns the bytes whose pages were advised - not a measurement of what
     /// the kernel reclaimed; 0 (and `why`) where the platform or the state does not apply.  Opt-in, off by default.
     uint64_t drop_file_cache(std::string& why);
+    /// --drop-file-cache, the second half (see generate.cpp's RefillNodeBinding note): the pages a mapped read brings
+    /// in are the ones the startup drop handed back, and a file page lands on the node the READING thread is bound to
+    /// (measured 2026-10-13: 100% of new file pages).  With this on, `copy_from_files` binds the thread that performs
+    /// the read to the cold node for that one blob - whichever thread it is (the prompt path's stager, a prefetch's
+    /// fetch threads, a pool worker, the refill), because the read of an expert is not done by the caller that asked
+    /// for it.  Off (the default): the read runs byte for byte as it always did.  No cold node set (--numa-hot-node
+    /// off, or a host with one node): nothing is bound.
+    void set_reads_cold(bool on) { reads_cold_ = on; }
+    bool reads_cold() const { return reads_cold_; }
+    /// For the per-request line: mapped reads whose thread was bound to the cold node, and bindings that failed.
+    int64_t cold_reads() const { return cold_reads_.load(std::memory_order_relaxed); }
+    int64_t cold_read_failures() const { return cold_read_failures_.load(std::memory_order_relaxed); }
     /// Windows, experts.bin, a file tier that reads through the file cache (--resident-experts): the startup reads -
     /// the GPU cache's fill from the profile and the RAM copy (pin_cache_complement) - go unbuffered (read_direct)
     /// with the view closed meanwhile.  Through the mapping they put the file's pages in the working set beside the
@@ -926,6 +938,10 @@ private:
 #endif
     bool unmapped_ = false;   ///< pp-opt: drop_mapping closed the view (base_ stays as the "opened" mark only)
     bool startup_ub_ = false;                 ///< begin_startup_unbuffered: until end_startup_unbuffered
+    // --drop-file-cache: the second half's own state (set_reads_cold).  The counters are for the per-request line,
+    // so they are relaxed atomics fetched from every mapped read, on any thread.
+    bool reads_cold_ = false;                 ///< bind the reading thread to the cold node, per mapped read
+    mutable std::atomic<int64_t> cold_reads_{0}, cold_read_failures_{0};
     uint64_t startup_blob_bytes_ = 0, startup_us_ = 0;   ///< the staged reads' counters at its begin (put back at the end)
 };
 

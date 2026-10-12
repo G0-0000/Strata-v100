@@ -247,34 +247,18 @@ bool refill_blocking() {
     return v;
 }
 
-// --drop-file-cache: the lent slots' experts are read back from the mapped files after a prompt, and a file page
-// lands on the node the READING thread faults it in on (measured 2026-10-13: 100% of new file pages follow the
-// faulting thread's set_mempolicy).  With the startup drop in place those pages come back to a page cache that holds
-// nothing else the engine needs, so the read is put in this scope: bound to the cold node, the refilled pages take
-// the node the engine keeps for what it does not hot-place, not the one the pinned complement and the pools sit on.
-// The scope is the blob_stable() call alone - the fill_slot call beside it is a cudaMemcpy into the VRAM arena and
-// allocates nothing host-side - because the binding is 3 syscalls (get, then set, then set again to put the policy
-// back), and one per lent slot (1817 of them in a big prompt) is ~3-5 ms against a refill that costs 0.1-2 s.  Note
-// what this scope covers: blob_stable() reads the file itself only when the blob is STAGED (the GGUF in place, or an
-// unbuffered or io-prefetch tier), which is what the packs run with.  A pure mapping (experts.bin with no --native and
-// no STRATA_IO_PREFETCH) instead hands out a pointer INTO the mapping, and the fault then happens inside fill_slot,
-// outside this scope: there the binding is a no-op and the refilled pages land where they always did.  The policy is
-// put back when the scope ends
-// (ThreadNodeBinding), so nothing else this thread allocates is affected.  Gated by the switch and by a cold node
-// being set (--numa-hot-node on a host with a second node): otherwise this costs one atomic read and the pages land
-// where they always did.
-struct RefillNodeBinding {
-    strata::core::detail::ThreadNodeBinding binding;
-    explicit RefillNodeBinding(bool wanted) {
-        if (!wanted) return;
-        const int cold = strata::core::detail::numa_cold_node();
-        if (cold < 0) return;
-        std::string why;
-        if (!binding.bind(cold, why))
-            std::fprintf(stderr, "strata generate: --drop-file-cache: %s; the refilled pages take the node their "
-                                 "faults do\n", why.c_str());
-    }
-};
+// --drop-file-cache, the second half: a file page lands on the node the READING thread is bound to (measured
+// 2026-10-13: 100% of new file pages follow the faulting thread's set_mempolicy, by mmap fault and by pread both),
+// and the pages the drop handed back come back when the prompt path reads the experts it lent out.  The binding for
+// that is NOT here: the window measurement of 2026-10-13 showed the pages landing on the hot node anyway, and the
+// reason is in the read path - the read of an expert is done by whichever thread reaches copy_from_files (the prompt
+// path's stager, a prefetch's fetch threads, a pool worker, the refill), not by the caller that asked for it.  So it
+// lives in FileExpertSource::copy_from_files, per blob (set_reads_cold below), and covers all of them.
+//
+// (Kept as a note for the record: binding the two refill loops here was tried first - e86b98f4 - and it did not move
+// a single page, because in the GGUF-in-place tier the refill's blob_stable() usually finds the stage buffer already
+// filled by the prompt path's own read, and returns it without touching the file.  The refill only COPIES it to the
+// VRAM slot then.)
 
 using Clock = std::chrono::steady_clock;
 
@@ -484,10 +468,11 @@ struct Options {
     /// **0 is a node number**, so only `off` says off.
     int numa_hot_node = -1;
     /// `--drop-file-cache` (Linux): once the startup reads are done, hand the mapped model files' cached pages back
-    /// to the kernel (FileExpertSource::drop_file_cache), and place the pages the prompt path's refill reads back
-    /// afterwards on the cold node (RefillNodeBinding - the pages of a file faulted in by a bound thread take that
-    /// node).  Every expert is in VRAM or in the RAM copy by then, so the file cache holds a third copy of the same
-    /// bytes - 55 GiB of them on the 48-layer packs - and it is the copy the kernel cannot take back cheaply.
+    /// to the kernel (FileExpertSource::drop_file_cache), and place the pages that come back afterwards on the cold
+    /// node (FileExpertSource::set_reads_cold: the pages of a file faulted in by a bound thread take that node, and
+    /// the binding sits on the read itself - copy_from_files - because the thread that reads is not the caller).
+    /// Every expert is in VRAM or in the RAM copy by then, so the file cache holds a third copy of the same bytes -
+    /// 55 GiB of them on the 48-layer packs - and it is the copy the kernel cannot take back cheaply.
     /// **Off by default, and off is byte-identical to before.**
     bool drop_file_cache = false;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
@@ -973,9 +958,9 @@ void usage() {
                  "                       then, so the file cache holds a third copy of the same bytes (55 GiB on the\n"
                  "                       48-layer packs), and it is the copy the kernel cannot take back cheaply.\n"
                  "                       Needs a resident mode that holds the whole complement in RAM: with experts\n"
-                 "                       left in the files, their reads go through this cache.  The prompt path's\n"
-                 "                       lend-region refill reads them back from the drive once, and its scope is bound\n"
-                 "                       to the cold node (--numa-hot-node; without one the pages land where they\n"
+                 "                       left in the files, their reads go through this cache.  The pages that come\n"
+                 "                       back afterwards land on the cold node: the thread that performs each mapped\n"
+                 "                       read is bound to it (--numa-hot-node; without one the pages land where they\n"
                  "                       always did).  Off by default.\n");
 }
 
@@ -7016,8 +7001,9 @@ int main(int argc, char** argv) {
     // one that fills a machine that pages under load.  Opt-in, and only when no expert's reads go through the files:
     // with experts left in them the file cache IS the tier that serves those reads, and dropping it would put every
     // one of them on the drive.  The check below is the same question the startup's own read-ahead asks, same grid.
-    // The other half of the switch - the refill's pages taking the cold node - is RefillNodeBinding, at the two
-    // places the lent slots are refilled (its scope is bound there; nothing is bound when this is off).
+    // The switch's second half - the pages that come back land on the cold node - is armed with the drop itself:
+    // FileExpertSource::set_reads_cold binds the thread that performs each mapped read (the window of 2026-10-13
+    // showed the read is not done by the thread the refill runs on, so the binding sits on the read, not here).
     if (o.drop_file_cache) {
         int64_t from_files = 0;
         if (srcp == &src)
@@ -7051,12 +7037,21 @@ int main(int argc, char** argv) {
             else
                 std::fprintf(stderr, "strata generate: --drop-file-cache off: %s\n",
                              why.empty() ? "the model files hold no cached pages" : why.c_str());
+            // the second half is armed only with a drop that happened: with nothing dropped the file cache is the
+            // tier that serves the reads, and placing those pages on the cold node would be the opposite of hot
+            if (freed > 0 && strata::core::detail::numa_cold_node() >= 0) {
+                src.set_reads_cold(true);
+                std::fprintf(stderr, "strata generate: --drop-file-cache: the reads that bring those pages back are "
+                                     "bound to node %d (any of the threads that perform them)\n",
+                             strata::core::detail::numa_cold_node());
+            }
         }
-        // the switch's second half: where the refill's pages go.  A file page follows the faulting thread's policy,
-        // and the cold node is derived from --numa-hot-node, so without that flag there is no node to place them on.
+        // the switch's second half needs a cold node: a file page follows the faulting thread's policy, and the cold
+        // node is derived from --numa-hot-node, so without that flag there is no node to place them on.
         if (strata::core::detail::numa_cold_node() < 0)
-            std::fprintf(stderr, "strata generate: --drop-file-cache: the refill reads take the node their faults do "
-                                 "(--numa-hot-node is off or this host has one node: no cold node to place them on)\n");
+            std::fprintf(stderr, "strata generate: --drop-file-cache: the reads that bring those pages back take the "
+                                 "node their faults do (--numa-hot-node is off or this host has one node: no cold node "
+                                 "to place them on)\n");
     }
     // 0.1.42 (H11): the default CPU share is armed only when the host has the memory for it.  One line says why not;
     // an explicit STRATA_PREFILL_CPU_SHARE (other than 0) is armed anyway, with a warning when memory is short.
@@ -11001,14 +10996,10 @@ int main(int argc, char** argv) {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                    // --drop-file-cache: the read faults the lost experts' pages back in on THIS thread, and a file
-                    // page follows the faulting thread's policy - bound to the cold node they take it, not the hot
-                    // one.  The scope is the read alone: the copy below allocates nothing host-side.
-                    const uint8_t* b = nullptr;
-                    {
-                        const RefillNodeBinding refill_node(o.drop_file_cache);
-                        b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
-                    }
+                    // (the read below may or may not touch the file: usually the prompt path has already brought this
+                    //  expert's pages in and this picks up its stage buffer.  Either way the pages of that read were
+                    //  placed by copy_from_files's own binding - see set_reads_cold - not by this loop.)
+                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
@@ -12597,6 +12588,19 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
+            // --drop-file-cache: the pages the request brought back, and the evidence of where their threads were
+            // bound when they were faulted in (the counter is taken across this request only; a read done on a thread
+            // that could not be bound counts as a failure, and its pages take the node its fault lands on).
+            if (o.drop_file_cache && srcp == &src && src.reads_cold()) {
+                static int64_t cold_reads_prev = 0, cold_failures_prev = 0;
+                const int64_t cold_now = src.cold_reads(), fail_now = src.cold_read_failures();
+                std::fprintf(stderr, "strata generate: --drop-file-cache: %lld mapped reads this request, their pages "
+                                     "bound to node %d (%lld could not be bound so far)\n",
+                             (long long) (cold_now - cold_reads_prev), strata::core::detail::numa_cold_node(),
+                             (long long) (fail_now - cold_failures_prev));
+                cold_reads_prev = cold_now;
+                cold_failures_prev = fail_now;
+            }
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
                                      "start\n", (long long) drive.d.tail_experts, (long long) drive.d.tail_skipped);
@@ -12809,14 +12813,9 @@ int main(int argc, char** argv) {
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                // --drop-file-cache: the read faults the lost experts' pages back in on THIS thread, and a file page
-                // follows the faulting thread's policy - bound to the cold node they take it, not the hot one.  The
-                // scope is the read alone: the copy below allocates nothing host-side.
-                const uint8_t* b = nullptr;
-                {
-                    const RefillNodeBinding refill_node(o.drop_file_cache);
-                    b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
-                }
+                // (as in the serve path's refill: the read, when there is one, is placed by copy_from_files's own
+                //  binding - set_reads_cold - because it is not always this thread that performs it)
+                const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
                                                         : xcache.fill_slot_queued(slot, b, err, nb))) {

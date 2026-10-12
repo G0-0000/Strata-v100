@@ -14,6 +14,7 @@
 #include "gguf_fixture.hpp"
 
 #include "strata/core/expert_source.hpp"
+#include "strata/core/numa_policy.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -33,6 +34,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 #endif
@@ -97,6 +99,31 @@ bool on_tmpfs(const fs::path& file) {
     struct statfs st{};
     return statfs(file.c_str(), &st) == 0 && (uint64_t) st.f_type == 0x01021994u;   // TMPFS_MAGIC
 }
+
+#if defined(SYS_get_mempolicy)
+/// The NUMA node the page at `p` sits on (get_mempolicy, MPOL_F_NODE|MPOL_F_ADDR); -1 when unanswerable.
+int page_node_of(const void* p) {
+    int node = -1;
+    if (syscall(SYS_get_mempolicy, &node, nullptr, 0, p, 1 | 2 /*MPOL_F_NODE|MPOL_F_ADDR*/) != 0) return -1;
+    return node;
+}
+/// The node of the file page at `off`: a private read-only view faults that page in (it is in the page cache - the
+/// engine's own read put it there - so nothing is allocated) and the kernel is asked where the page lives.
+int file_page_node(const fs::path& file, uint64_t off) {
+    const int fd = ::open(file.c_str(), O_RDONLY);
+    if (fd < 0) return -1;
+    int node = -1;
+    void* view = mmap(nullptr, 4096, PROT_READ, MAP_SHARED, fd, (off_t) (off & ~(uint64_t) 4095));
+    if (view != MAP_FAILED) {
+        volatile uint8_t byte = ((const uint8_t*) view)[(size_t) (off & 4095)];
+        (void) byte;
+        node = page_node_of(view);
+        (void) munmap(view, 4096);
+    }
+    ::close(fd);
+    return node;
+}
+#endif
 #endif
 
 bool load(const fs::path& dir, int64_t n_layers, int64_t n_expert, std::string& err) {
@@ -342,6 +369,50 @@ void arena() {
                                            (size_t) L.blob_bytes(l)) == 0;
                 check(back, "the experts read back byte for byte after their pages were dropped");
             }
+#if defined(SYS_get_mempolicy)
+            // --drop-file-cache, the second half: the thread that performs a mapped read is bound to the cold node,
+            // so the page that read faults in lands there.  The window of 2026-10-13 could not show this in the engine
+            // (the read runs on a thread its caller never sees), so it is shown here: read one expert's gate slice
+            // with the cold node set to the OTHER node, then ask the kernel where the file page went.  The offsets are
+            // the manifest's own - layer 0's gate is the first tensor of shard A.
+            if (strata::core::detail::numa_node_count() < 2) {
+                check(true, "--drop-file-cache: the cold-node read test is skipped (this host has one NUMA node)");
+            } else {
+                std::vector<uint8_t> buf((size_t) std::max(f0.bytes, f1.bytes));
+                write_back(A);
+                write_back(B);
+                const uint64_t gate = wa.data_start + wa.offsets[0];
+                const uint64_t per_expert = (uint64_t) L.fmt[0].up_off;
+                const uint64_t where = gate + per_expert;   // layer 0, expert 1, first row of gate
+                std::string node_why;
+                (void) fs.drop_file_cache(node_why);
+                const bool plain_ok = fs.copy_blob(0, 1, buf.data());
+                const int home = plain_ok ? file_page_node(A, where) : -1;
+                if (home < 0) {
+                    check(true, "--drop-file-cache: the cold-node read test is skipped (the kernel would not say "
+                                "which node that page is on)");
+                } else {
+                    const int cold = home == 0 ? 1 : 0;
+                    (void) fs.drop_file_cache(node_why);   // those pages go again: the bound read allocates its own
+                    strata::core::detail::set_numa_cold_node(cold);
+                    fs.set_reads_cold(true);
+                    const int64_t reads_before = fs.cold_reads();
+                    const bool bound_ok = fs.copy_blob(0, 1, buf.data());
+                    const int64_t bound = fs.cold_reads() - reads_before;
+                    const int moved = bound_ok ? file_page_node(A, where) : -1;
+                    fs.set_reads_cold(false);                 // off again: the read is the plain one, the counter quiet
+                    strata::core::detail::set_numa_cold_node(-1);
+                    (void) fs.drop_file_cache(node_why);
+                    const int64_t quiet_before = fs.cold_reads();
+                    (void) fs.copy_blob(0, 1, buf.data());
+                    const int64_t quiet = fs.cold_reads() - quiet_before;
+                    check(bound_ok && bound >= 1 && moved == cold && quiet == 0,
+                          "the mapped read is bound to the cold node and its page lands there (node " +
+                              std::to_string(home) + " -> " + std::to_string(moved) + ", " + std::to_string(bound) +
+                              " bound, " + std::to_string(quiet) + " with the switch off)");
+                }
+            }
+#endif
 #else
             {
                 std::string why;

@@ -1,4 +1,5 @@
 #include "strata/core/expert_source.hpp"
+#include "strata/core/numa_policy.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -454,6 +455,21 @@ void test_numa_slice_ranges() {
     require(b[0].first <= 435200 + P && 435200 + P < b[0].second, "a slice-1 gate byte not in slice 1's gate range");
     require(a[1].first <= 870400 && 870400 < a[1].second, "the gate/up boundary page was not slice 0's up range");
     require(!(b[0].first <= 870400 && 870400 < b[0].second), "the gate/up boundary page was in slice 1's gate range");
+}
+
+// S2/S3: the two node accessors every placement site tests BEFORE it does anything.  They are process-wide and -1
+// is "off" - the state a run that never passed --numa-hot-node leaves them in, and the reason such a run takes no
+// placement branch and issues not one syscall.
+void test_numa_node_accessors() {
+    using namespace strata::core::detail;
+    require(numa_hot_node() == -1 && numa_cold_node() == -1, "-1 (off) is the default of both node accessors");
+    set_numa_hot_node(1);
+    set_numa_cold_node(0);
+    require(numa_hot_node() == 1 && numa_cold_node() == 0, "a node set is read back from the same accessor");
+    set_numa_hot_node(-1);
+    set_numa_cold_node(-1);
+    require(numa_hot_node() == -1 && numa_cold_node() == -1, "off can be set back");
+    std::cout << "numa node accessors: off by default, round-trip: PASS\n";
 }
 
 // S1 (--numa-hot-node): the resident complement's pages are claimed on one node BEFORE the startup reads - mmap,
@@ -1067,6 +1083,7 @@ int main(int argc, char** argv) {
         test_resident_memory_budget();
         test_pin_pacing();
         test_numa_slice_ranges();
+        test_numa_node_accessors();
         test_numa_hot_node();
         test_cgroup_memory_budget();
         test_host_memory();

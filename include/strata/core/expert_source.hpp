@@ -94,6 +94,8 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
                            const std::string& self_cgroup = "/proc/self/cgroup",
                            const std::string& cgroup_root = "/sys/fs/cgroup");
 
+/// Add back the unused preclaimed arena when judging the resident-budget RAM reading; saturates at UINT64_MAX.
+uint64_t resident_budget_physical_bytes(uint64_t physical, bool arena_active, uint64_t arena_bytes);
 /// Bound a resident budget by RAM and commit capacity after headroom; leave 256 MiB more when clamping.
 /// Pass UINT64_MAX for commit when the platform does not report it.
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom);

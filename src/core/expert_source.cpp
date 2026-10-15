@@ -464,23 +464,70 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
 #endif
 }
 
-int numa_node_count() {
+std::vector<int> numa_node_ids() {
 #if defined(__linux__)
-    // The sysfs index IS the node number, so the entries are COUNTED and the last number is not the count.
+    // The sysfs index IS the node number, so the entries are the nodes that EXIST: firmware PXM ids can leave
+    // holes (a hot-removed or offline node), and then a node number is a set to test membership against, never
+    // the 0..count-1 range its count would suggest.
     const std::filesystem::path root("/sys/devices/system/node");
     std::error_code ec;
-    if (!std::filesystem::is_directory(root, ec)) return 0;
-    int count = 0;
+    if (!std::filesystem::is_directory(root, ec)) return {};
+    std::vector<int> ids;
     for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
         const std::string name = it->path().filename().string();
-        if (name.size() > 4 && name.compare(0, 4, "node") == 0 &&
-            std::all_of(name.begin() + 4, name.end(), [](char c) { return c >= '0' && c <= '9'; }))
-            ++count;
+        if (name.size() <= 4 || name.compare(0, 4, "node") != 0 ||
+            !std::all_of(name.begin() + 4, name.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            continue;
+        errno = 0;
+        const long id = std::strtol(name.c_str() + 4, nullptr, 10);
+        if (errno == ERANGE || id > std::numeric_limits<int>::max()) continue;   // not a node number this host can have
+        ids.push_back((int) id);
     }
-    return count;
+    std::sort(ids.begin(), ids.end());
+    return ids;
 #else
-    return 0;   // no sysfs: the caller skips its range check
+    return {};   // no sysfs: the caller skips its range check
 #endif
+}
+
+int numa_node_count() { return (int) numa_node_ids().size(); }
+
+bool numa_node_memfree_from_text(const std::string& meminfo_text, uint64_t& bytes) {
+    std::istringstream in(meminfo_text);
+    std::string line;
+    while (std::getline(in, line)) {
+        // "Node 1 MemFree: 52428800 kB" - four fields, so a /proc/meminfo line ("MemFree: ... kB", no node
+        // prefix) does not pass for a node's own reading.
+        std::istringstream fields(line);
+        std::string node_word, id, key;
+        uint64_t kb = 0;
+        if (fields >> node_word >> id >> key >> kb && key == "MemFree:") {
+            // A reading past this bound would wrap in the scaling below, and a wrapped figure reads as a nearly
+            // empty node (or a huge one): refuse the line instead, leaving the caller to refuse the claim.
+            if (kb > std::numeric_limits<uint64_t>::max() / 1024) return false;
+            bytes = kb * 1024;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool numa_node_memfree_bytes(int node, uint64_t& bytes) {
+#if defined(__linux__)
+    std::ifstream info("/sys/devices/system/node/node" + std::to_string(node) + "/meminfo");
+    if (!info) return false;
+    std::stringstream text;
+    text << info.rdbuf();
+    return numa_node_memfree_from_text(text.str(), bytes);
+#else
+    (void) node;
+    (void) bytes;
+    return false;
+#endif
+}
+
+bool node_claim_fits(uint64_t node_free, uint64_t bytes, uint64_t reserve) {
+    return bytes <= node_free && node_free - bytes >= reserve;
 }
 
 }  // namespace detail
@@ -3638,6 +3685,33 @@ bool FileExpertSource::reserve_resident_arena(uint64_t requested_bytes, uint64_t
     }
     const uint64_t bytes = detail::clamp_resident_budget(requested_bytes, physical, commit, headroom_bytes);
     if (bytes == 0) { err = "no room for the complement's claim after the resident headroom"; return false; }
+    // The clamp above sizes the claim from the WHOLE host's available memory, but the claim itself is placed
+    // STRICTLY on one node (the mbind below, and the fault loop after it: when that node runs out, the kernel's
+    // only answer left is the OOM killer).  So before a page is mapped, ask the node itself: its OWN MemFree -
+    // not the host's MemAvailable, and not the reclaimable cache the readings above lean on, since these pages
+    // are page-locked later - must carry the claim plus the reserve the caller keeps free (the resident headroom,
+    // the same figure the global clamp already withholds; STRATA_RESIDENT_HEADROOM_GIB tunes both).  A node whose
+    // meminfo cannot be read, is memoryless, or cannot carry the claim with that reserve turns the claim down,
+    // and the caller starts as before.
+    uint64_t node_free = 0;
+    if (!detail::numa_node_memfree_bytes(node, node_free)) {
+        err = "cannot read NUMA node " + std::to_string(node) + "'s own free memory (/sys/devices/system/node/node" +
+              std::to_string(node) + "/meminfo)";
+        return false;
+    }
+    if (node_free == 0) {
+        err = "NUMA node " + std::to_string(node) + " is memoryless or has nothing free";
+        return false;
+    }
+    if (!detail::node_claim_fits(node_free, bytes, headroom_bytes)) {
+        char msg[224];
+        std::snprintf(msg, sizeof msg, "the %.2f GiB claim plus %.2f GiB of headroom does not fit node %d's %.2f GiB "
+                      "of free memory",
+                      (double) bytes / 1073741824.0, (double) headroom_bytes / 1073741824.0, node,
+                      (double) node_free / 1073741824.0);
+        err = msg;
+        return false;
+    }
     const long page = sysconf(_SC_PAGESIZE);
     if (page <= 0) { err = "cannot determine the page size for --numa-hot-node"; return false; }
     void* arena = mmap(nullptr, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

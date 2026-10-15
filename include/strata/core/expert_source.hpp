@@ -116,8 +116,8 @@ uint64_t meminfo_bytes(const std::string& meminfo_text, const std::string& key);
 /// SMALLEST node's free), i.e. what an even spread would find.  Only lowers the figure, so the pages are then taken in
 /// steps (which reclaim cache as they fault) instead of in one driver call; it never refuses and never caps.
 uint64_t numa_pin_free(uint64_t global_free, const std::vector<uint64_t>& node_free);
-/// S1 (`--numa-hot-node`): this host's NUMA nodes, counted under /sys/devices/system/node.  0 when the host cannot
-/// be asked at all (a platform without sysfs), and the caller then skips its range check.
+/// S1 (`--numa-hot-node`): this host's NUMA nodes, counted under /sys/devices/system/node (numa_node_ids().size()).
+/// 0 when the host cannot be asked at all (a platform without sysfs), and the caller then skips its range check.
 int numa_node_count();
 /// Byte ranges [first, second) of slice `slice` of 2 inside one complement slot at arena offset `slot_off`, whose roles
 /// (gate, up, down) are `role_bytes[0..2]` long and back to back. Role r's slice-0 bytes are [start_r, start_r + role_r/2),
@@ -128,6 +128,19 @@ int numa_node_count();
 /// caller coalesces them).
 std::array<std::pair<uint64_t, uint64_t>, 3> numa_slice_ranges(uint64_t slot_off, const uint64_t role_bytes[3],
                                                                int slice, uint64_t page = 4096);
+/// S1: the node NUMBERS themselves, the sysfs entries in ascending order.  The entries are what the host HAS, not
+/// 0..count-1: firmware PXM ids can leave holes (a hot-removed or offline node), so an id is a member of this list
+/// or the host does not have that node.  Empty when the host cannot be asked at all.
+std::vector<int> numa_node_ids();
+/// S1: one node's OWN free memory - the MemFree line of /sys/devices/system/node/node<N>/meminfo (the line reads
+/// "Node N MemFree: <kB> kB") - false when that file cannot be read or has no MemFree line (a memoryless or
+/// offline node: nothing there to place pages on).
+bool numa_node_memfree_bytes(int node, uint64_t& bytes);
+/// S1: the parse above, over the text of such a file (the tests feed it a string).
+bool numa_node_memfree_from_text(const std::string& meminfo_text, uint64_t& bytes);
+/// S1: whether a claim of `bytes` fits what a node really has free: the claim PLUS `reserve`, which must stay free
+/// on the node besides it.  A strict fit: MemFree is a point-in-time reading.
+bool node_claim_fits(uint64_t node_free, uint64_t bytes, uint64_t reserve);
 /// The sentence appended to a "not enough RAM" start failure: how much of the RAM is file cache (Cached + Buffers of
 /// `meminfo_text`, mapped pages included) and what to do about it; "" when under 1 GiB of cache (nothing to say).
 std::string page_cache_hint(const std::string& meminfo_text);

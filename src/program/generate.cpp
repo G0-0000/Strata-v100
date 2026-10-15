@@ -3042,10 +3042,15 @@ int main(int argc, char** argv) {
     // S1 (--numa-hot-node): the resident complement's pages, claimed on one node before the startup reads.  Only
     // the resident RAM mode has that complement, and its size is the --resident-budget-gib upper bound.
     if (o.numa_hot_node >= 0) {
-        const int nodes = strata::core::detail::numa_node_count();
-        if (nodes > 0 && o.numa_hot_node >= nodes) {
-            std::fprintf(stderr, "strata generate: --numa-hot-node %d: this host has %d NUMA node(s)\n",
-                         o.numa_hot_node, nodes);
+        // The nodes this host HAS, not a 0..count-1 range: firmware PXM ids can leave holes, and then a high node
+        // number is legal while a low one names nothing.
+        const std::vector<int> nodes = strata::core::detail::numa_node_ids();
+        if (!nodes.empty() && std::find(nodes.begin(), nodes.end(), o.numa_hot_node) == nodes.end()) {
+            std::string have;
+            for (int node : nodes) have += (have.empty() ? "" : ", ") + std::to_string(node);
+            std::fprintf(stderr, "strata generate: --numa-hot-node %d: this host has no such NUMA node (its nodes: "
+                                 "%s)\n",
+                         o.numa_hot_node, have.c_str());
             return 2;
         }
         if (o.resident_budget == 0) {
@@ -3060,9 +3065,9 @@ int main(int argc, char** argv) {
     // S3 does nothing.  The nodes are published to the allocation paths (which run on other threads) and this is the
     // only place they are set.  Off: `o.numa_hot_node < 0`, and then neither is set and every site below is skipped.
     if (o.numa_hot_node >= 0) {
-        const int nodes = strata::core::detail::numa_node_count();
+        const std::vector<int> nodes = strata::core::detail::numa_node_ids();
         int cold = -1;
-        for (int node = 0; node < nodes; ++node) {
+        for (int node : nodes) {
             if (node != o.numa_hot_node) { cold = node; break; }
         }
         strata::core::detail::set_numa_hot_node(o.numa_hot_node);
@@ -3072,7 +3077,7 @@ int main(int argc, char** argv) {
                          o.numa_hot_node, cold);
         else
             std::fprintf(stderr, "strata generate: NUMA placement: hot pools on node %d, no cold node to split "
-                                 "them with (this host has %d NUMA node(s))\n", o.numa_hot_node, nodes);
+                                 "them with (this host has %zu NUMA node(s))\n", o.numa_hot_node, nodes.size());
     }
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order

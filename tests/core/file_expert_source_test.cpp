@@ -491,6 +491,10 @@ void test_numa_hot_node() {
     require(source.open(dir.path.string(), 1, 2, err), err);
     require(!source.reserve_resident_arena(0, 0, node_ids.front(), err),
             "a claim with no resident budget was accepted");
+    constexpr uint64_t sample_physical = 1000;
+    require(detail::resident_budget_physical_bytes(sample_physical, source.reserved_arena() != nullptr,
+                                                    source.reserved_arena_bytes()) == sample_physical,
+            "an inactive arena received resident-budget credit");
     if (node_ids.size() < 2) {
         std::cout << "file_expert_source_test: --numa-hot-node placement skipped (one NUMA node here)\n";
         source.close();
@@ -498,8 +502,21 @@ void test_numa_hot_node() {
     }
     const uint64_t want = 32ull << 20;
     const int hot = node_ids[1], first = node_ids.front();
+    // S1's own guard turns down a node whose OWN MemFree cannot carry the claim plus the reserve kept free (0
+    // here).  A host whose second node is that tight is a low-memory host, not a regression: skip the placement
+    // checks rather than fail it.
+    uint64_t hot_free = 0;
+    if (!detail::numa_node_memfree_bytes(hot, hot_free) || !detail::node_claim_fits(hot_free, want, 0)) {
+        std::cout << "file_expert_source_test: --numa-hot-node placement skipped (node " << hot
+                  << " has no room for the " << (want >> 20) << " MiB claim)\n";
+        source.close();
+        return;
+    }
     require(source.reserve_resident_arena(want, 0, hot, err), err);
     require(source.reserved_arena_bytes() == want, "the claim was not sized by the requested budget");
+    require(detail::resident_budget_physical_bytes(sample_physical, source.reserved_arena() != nullptr,
+                                                    source.reserved_arena_bytes()) == sample_physical + want,
+            "an active preclaim was not credited back to the resident-budget reading");
     uint8_t* arena = (uint8_t*) source.reserved_arena();
     require(arena != nullptr, "a successful claim has no arena");
     for (uint64_t at = 0; at < want; at += 1ull << 20) {
@@ -513,6 +530,9 @@ void test_numa_hot_node() {
             "the refused second claim touched the first");
     source.close();
     require(source.reserved_arena_bytes() == 0 && source.reserved_arena() == nullptr, "close() kept the claim");
+    require(detail::resident_budget_physical_bytes(sample_physical, source.reserved_arena() != nullptr,
+                                                    source.reserved_arena_bytes()) == sample_physical,
+            "close() left resident-budget preclaim credit behind");
     // the first node id is a node number, not "off" (node 0 on every host that has a node 0)
     require(source.open(dir.path.string(), 1, 2, err), err);
     require(source.reserve_resident_arena(want, 0, first, err), err);
@@ -583,8 +603,19 @@ void test_numa_slice_ranges() {
 
 void test_resident_memory_budget() {
     using strata::core::detail::clamp_resident_budget;
+    using strata::core::detail::resident_budget_physical_bytes;
     constexpr uint64_t GiB = 1ull << 30, margin = 256ull << 20, headroom = 4 * GiB;
     constexpr uint64_t unlimited = std::numeric_limits<uint64_t>::max();
+    // The pre-claimed arena's credit: no claim (or no active arena) is the identity, and a claim that reaches past
+    // UINT64_MAX saturates instead of wrapping the reading down to a tiny budget.
+    require(resident_budget_physical_bytes(1000, false, 0) == 1000, "an inactive arena received resident-budget credit");
+    require(resident_budget_physical_bytes(1000, true, 0) == 1000, "an empty active arena received resident-budget credit");
+    require(resident_budget_physical_bytes(1000, true, 24) == 1024, "an active preclaim was not credited back");
+    require(resident_budget_physical_bytes(unlimited - 8, true, 8) == unlimited,
+            "a credit to exactly UINT64_MAX did not land");
+    require(resident_budget_physical_bytes(unlimited - 1, true, 2) == unlimited,
+            "a credit past UINT64_MAX wrapped instead of saturating");
+    require(resident_budget_physical_bytes(unlimited, true, unlimited) == unlimited, "a full credit wrapped");
     // #730: RAM can hold the requested cache, but Windows cannot commit it.
     require(clamp_resident_budget(66 * GiB, 69 * GiB, 47 * GiB, headroom) == 43 * GiB - margin,
             "a RAM budget exceeded available commit capacity");

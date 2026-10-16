@@ -2,6 +2,7 @@
 
 #include "strata/core/numa_policy.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/vma_alloc.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -89,7 +90,10 @@ public:
             while (size_ < n) {
                 const size_t count = std::min(segment_bytes, n - size_);
                 const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
-                Segment segment;
+                // The segment's whole life is one mmap named for the parked class (vma_alloc.hpp): a reader
+                // attributes its resident pages by that name.  mmap takes no page (the resize below is the first
+                // touch, under the binding above), and the name is set before the zero fill, as it should be.
+                Segment segment{VmaAllocator<uint8_t>(vma_class::conv_cache)};
                 segment.reserve(segment_capacity(count, previous, growing));
                 segment.resize(count, value);
                 segments_.push_back(std::move(segment));
@@ -136,7 +140,8 @@ public:
     }
 
 private:
-    using Segment = std::vector<uint8_t>;
+    // One segment is one mmap named `strata/conv_cache` (vma_alloc.hpp); the directory stays ordinary heap.
+    using Segment = std::vector<uint8_t, VmaAllocator<uint8_t>>;
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.

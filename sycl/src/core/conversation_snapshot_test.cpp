@@ -149,7 +149,7 @@ void full_session(int fmt, int mode, int experts) {
     main.alloc(ss.gdn_state,sizes.gdn); main.alloc(ss.ple_hist,sizes.ple);
     main.alloc(main.state.idx_tail,sizes.tail); main.alloc(main.state.idx_dead,sizes.dead);
     main.alloc(main.state.idx_block_pos,sizes.block_pos);
-    std::vector<int32_t> ids(65);
+    ConversationIds ids(65, VmaAllocator<int32_t>(vma_class::conv_cache));
     for (size_t i=0;i<ids.size();++i) ids[i]=(int32_t)i+1;
     std::vector<ConversationImageKey> images;
     std::vector<ConversationCheckpoint> checkpoints;
@@ -211,7 +211,7 @@ void full_session(int fmt, int mode, int experts) {
         check(slurp(p1)==slurp(p2),"streamed file is byte-identical to the captured file");
         std::error_code ec;
         fs::remove_all(dir,ec);
-        auto empty_ids=std::vector<int32_t>{};
+        ConversationIds empty_ids;
         const ConversationView none{empty_ids,images,checkpoints,true};
         check(!conversation_snapshot_sources(meta,sources,none,ss,g,draft.state,err),"empty session refused");
     }

@@ -3,6 +3,8 @@
 #pragma once
 
 #include "strata/core/conversation_buffer.hpp"
+#include "strata/core/numa_policy.hpp"
+#include "strata/core/vma_alloc.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,10 +22,18 @@ struct ConversationImageKey {
     bool operator==(const ConversationImageKey&) const = default;
 };
 
+/// A checkpoint's token list: named storage like the running-state payloads below (see vma_alloc.hpp), so the
+/// tokens of a parked image are attributed to the class their container belongs to.
+using ConversationIds = std::vector<int32_t, VmaAllocator<int32_t>>;
+
 struct ConversationCheckpoint {
-    std::vector<int32_t> ids;
+    ConversationIds ids;
     std::vector<ConversationImageKey> imgs;
-    std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
+    // What a checkpoint IS, in bytes: the running state (gdn ~112.2 MiB at the production context, ple ~360 KiB).
+    // Named storage, the class chosen per construction site; tails/dead/block_pos (under 20 KiB each) and imgs
+    // (<=128 KiB) keep the default allocator: the reader's residual can have them.
+    std::vector<uint8_t, VmaAllocator<uint8_t>> gdn, ple;
+    std::vector<uint8_t> tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
@@ -33,6 +43,11 @@ struct ConversationCheckpoint {
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
 
+    /// Default (`strata/conv_cache`): what a parked image holds - its live state and its checkpoint chain.
+    /// The active chain and the running-state copies that feed it pass `vma_class::session_active` instead.
+    ConversationCheckpoint() : ConversationCheckpoint(vma_class::conv_cache) {}
+    explicit ConversationCheckpoint(const char* class_name) : ids(class_name), gdn(class_name), ple(class_name) {}
+
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
                gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
@@ -41,6 +56,40 @@ struct ConversationCheckpoint {
         return n;
     }
 };
+
+/// Re-tag a checkpoint's named buffers in place (see vma_alloc.hpp): a parked image moved into the active session
+/// keeps its pages - only the class they are reported under follows the container.  Recurses into the layer-split
+/// stage parts.
+inline void conversation_checkpoint_rename(ConversationCheckpoint& c, const char* class_name) {
+    vma_rename(c.ids, class_name);
+    vma_rename(c.gdn, class_name);
+    vma_rename(c.ple, class_name);
+    for (auto& part : c.stage_parts) conversation_checkpoint_rename(part, class_name);
+}
+
+/// Move a checkpoint's named buffers onto `node` - the companion of the rename above, for the handover that needs
+/// more than a name.  A parked image's pages are faulted on the COLD node (that is what park's binding is for) and
+/// the rename only re-tags the mappings, so a restored conversation would carry cold pages into the active session
+/// unless they are migrated: detail::numa_move_range is that migration (mbind with MPOL_MF_MOVE, the pages already
+/// present included - a plain bind leaves them where they are).  Returns 0 when every mapping moved, else the errno
+/// of the first buffer the kernel could not move in full (what it could move stays moved); an empty buffer has no
+/// mapping to move and never fails.  Recurses into the layer-split stage parts, as the rename does.
+inline int conversation_checkpoint_move(ConversationCheckpoint& c, int node) {
+    auto move = [&](auto& buf) -> int {
+        if (buf.capacity() == 0) return 0;
+        int error_number = 0;
+        return detail::numa_move_range((void*) buf.data(), buf.capacity() * sizeof(*buf.data()), node, error_number)
+                   ? 0
+                   : error_number;
+    };
+    int err = 0;
+    auto note = [&err](int e) { if (err == 0) err = e; };   // the first error is the one the caller reports
+    note(move(c.ids));
+    note(move(c.gdn));
+    note(move(c.ple));
+    for (auto& part : c.stage_parts) note(conversation_checkpoint_move(part, node));
+    return err;
+}
 
 // Identity-layout K/V pages and completed indexer rows. For streamed layers the
 // source is the authoritative host pool, NOT the replaceable VRAM slots.
@@ -98,7 +147,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
     for (const auto& c : checks) {
         if (c.stage_parts.size() != stages) continue;
         for (size_t k = 0; k < stages; ++k) {
-            ConversationCheckpoint part;
+            ConversationCheckpoint part(vma_class::session_active);   // split/merge only run on the ACTIVE chain
             part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
             out.parts[k].push_back(std::move(part));
         }
@@ -309,7 +358,7 @@ public:
     // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
     // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
-    size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+    size_t drop_superseded(const ConversationIds& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
         auto held = [&](const ConversationCheckpoint& c) {
             if (c.ids == ids && c.imgs == images) return true;

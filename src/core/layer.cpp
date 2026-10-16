@@ -4,6 +4,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/numa_policy.hpp"
+#include "strata/core/vma_alloc.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -822,6 +823,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                      (double) g_kv_host_bytes / 1073741824.0);
                 return 0;
             }
+            // VMA naming (vma_alloc.hpp): this pinned copy is the active session's authoritative K/V - the RAM
+            // reader attributes its resident pages by [anon_shmem:...].  The cudaHostAlloc mapping is nameable on
+            // this kernel (measured 2026-10-16); a refusal is logged once and only leaves the bytes unnamed.
+            vma_name_warn(h, (size_t) bytes, vma_class::session_active);
         }
         g_kv_host_bytes += bytes;
         Cursor hc{d};

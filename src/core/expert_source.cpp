@@ -8,6 +8,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/numa_policy.hpp"
+#include "strata/core/vma_alloc.hpp"
 
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
@@ -2821,6 +2822,11 @@ bool FileExpertSource::reserve_resident_arena(uint64_t requested_bytes, uint64_t
         err = "mmap of " + std::to_string(bytes >> 20) + " MiB failed (" + std::strerror(errno) + ")";
         return false;
     }
+    // VMA naming (vma_alloc.hpp): the claim IS the cold experts' arena - take_reserved_arena hands this mapping
+    // over as complement_arena_, and it lives to munmap - so one call here names the whole life of that RAM,
+    // before a page is touched.  A naming failure is logged once and changes nothing: mbind and the touch below,
+    // and a tail given back by take_reserved_arena (the name stays on the kept part), are unaffected.
+    vma_name_warn(arena, (size_t) bytes, vma_class::cold_experts);
     int bind_error = 0;
     if (!detail::numa_bind_range(arena, bytes, node, bind_error)) {
         const int failed_errno = bind_error;

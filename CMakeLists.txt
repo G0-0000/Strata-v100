@@ -505,6 +505,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(exchange_storage_test PROPERTIES TIMEOUT 60)
   endif()
 
+  # VMA names: a mapping the process owns shows as [anon:<name>] in /proc/self/maps, the one identity the RAM
+  # reader attributes pages by.  The test names a self-mmap, round-trips the named allocator, flips a name (and
+  # grows the buffer after it: the class follows), and sweeps an injected mapping failure over the checkpoint
+  # split - CPU only, no device, a few pages of RAM.
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/vma_alloc_test.cpp")
+    add_executable(vma_alloc_test tests/core/vma_alloc_test.cpp)
+    target_include_directories(vma_alloc_test PRIVATE include)
+    add_test(NAME vma_alloc_test COMMAND vma_alloc_test)
+    set_tests_properties(vma_alloc_test PROPERTIES TIMEOUT 30)
+  endif()
+
   # available_host_bytes(): MemAvailable, cgroup limits and the operator's --memory-limit-mib cap on fixture directories
   # - no GPU, no CUDA
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/memory_guard_test.cpp")

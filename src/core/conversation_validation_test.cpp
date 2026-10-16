@@ -89,7 +89,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(conversation_state_sizes(g, z, error), "checked canonical/pruned/zero-QSA sizing");
     Pools first(g, format), last(g, format), draft(g, format);
     std::array<QsaState, 2> layers{first.st, last.st};
-    std::vector<uint8_t> gdn(z.gdn, 0xa5), history(ple ? z.ple : 0, 0xa5);
+    std::vector<uint8_t, VmaAllocator<uint8_t>> gdn(z.gdn, 0xa5), history(ple ? z.ple : 0, 0xa5);
     SessionState ss;
     ss.max_cells = 96; ss.gdn_state = (float*) gdn.data();
     // the whole-model carve, as session_init leaves a one-GPU session

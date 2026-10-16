@@ -50,9 +50,9 @@ inline long test_slow_copy_us() {
     return v;
 }
 
-template<class T>
-inline std::vector<T> copy_beating(const std::vector<T>& src) {
-    std::vector<T> out;
+template<class T, class A>
+inline std::vector<T, A> copy_beating(const std::vector<T, A>& src, const A& alloc) {
+    std::vector<T, A> out(alloc);
     out.reserve(src.size());
     const size_t step = std::max<size_t>(1, ((size_t) 1 << 20) / sizeof(T));
     for (size_t at = 0; at < src.size(); at += step) {
@@ -64,26 +64,29 @@ inline std::vector<T> copy_beating(const std::vector<T>& src) {
     return out;
 }
 
-inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoint& c) {
-    ConversationCheckpoint o;
-    o.ids = copy_beating(c.ids);
-    o.imgs = copy_beating(c.imgs);
-    o.gdn = copy_beating(c.gdn);
-    o.ple = copy_beating(c.ple);
-    o.tails = copy_beating(c.tails);
-    o.dead = copy_beating(c.dead);
-    o.block_pos = copy_beating(c.block_pos);
+// `class_name`: the parked class the copies belong to (a captured image is parked storage whatever it came from),
+// which seeds the named-allocator members (see vma_alloc.hpp).
+inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoint& c, const char* class_name) {
+    ConversationCheckpoint o(class_name);
+    o.ids = copy_beating(c.ids, o.ids.get_allocator());
+    o.imgs = copy_beating(c.imgs, o.imgs.get_allocator());
+    o.gdn = copy_beating(c.gdn, o.gdn.get_allocator());
+    o.ple = copy_beating(c.ple, o.ple.get_allocator());
+    o.tails = copy_beating(c.tails, o.tails.get_allocator());
+    o.dead = copy_beating(c.dead, o.dead.get_allocator());
+    o.block_pos = copy_beating(c.block_pos, o.block_pos.get_allocator());
     o.used = c.used;
     o.pinned = c.pinned;
     o.stage_parts.reserve(c.stage_parts.size());
-    for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part));
+    for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part, class_name));
     return o;
 }
 
-inline std::vector<ConversationCheckpoint> copy_checkpoints_beating(const std::vector<ConversationCheckpoint>& cs) {
+inline std::vector<ConversationCheckpoint> copy_checkpoints_beating(const std::vector<ConversationCheckpoint>& cs,
+                                                                   const char* class_name) {
     std::vector<ConversationCheckpoint> out;
     out.reserve(cs.size());
-    for (const auto& c : cs) out.push_back(copy_checkpoint_beating(c));
+    for (const auto& c : cs) out.push_back(copy_checkpoint_beating(c, class_name));
     return out;
 }
 

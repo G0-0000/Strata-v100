@@ -62,7 +62,7 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, S
                                      const ModelGeometry& g, std::string& error);
 
 struct ConversationView {
-    const std::vector<int32_t>& ids;
+    const ConversationIds& ids;
     const std::vector<ConversationImageKey>& images;
     const std::vector<ConversationCheckpoint>& checkpoints;
     bool cvec;

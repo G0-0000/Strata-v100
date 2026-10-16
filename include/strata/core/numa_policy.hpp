@@ -49,6 +49,10 @@ inline int numa_cold_node() { return numa_cold_node_storage().load(std::memory_o
 /// The values set_mempolicy/mbind take from user space, and the width of the node masks below - each one is
 /// kNumaMaxNode / 64 unsigned longs.
 constexpr int kMpolDefault = 0, kMpolBind = 2;
+/// mbind's MPOL_MF_MOVE: the bind also MIGRATES the pages already resident in the range to the node mask, not only
+/// the faults that come after it (numa_move_range below; numa_bind_range's arena is bound before its first touch,
+/// so the policy it sets is what places its pages - there is nothing to move yet).
+constexpr int kMpolMove = 1 << 1;
 constexpr unsigned long kNumaMaxNode = 1024;
 
 /// One bit set for `node`, the rest cleared; `mask` holds kNumaMaxNode / 64 unsigned longs.
@@ -60,6 +64,23 @@ inline void numa_node_mask(int node, unsigned long* mask) {
 /// mbind(MPOL_BIND) on [addr, addr + bytes); the range must be page-aligned, and a mask no node satisfies (an
 /// out-of-range node) comes back as EINVAL.  On false, `error_number` is the errno the call set.
 bool numa_bind_range(void* addr, uint64_t bytes, int node, int& error_number);
+
+/// Move the pages ALREADY RESIDENT in [addr, addr + bytes) onto `node` - the same page-aligned range
+/// numa_bind_range takes, with the one flag that migrates them instead of only deciding their future faults.  A
+/// restored conversation's checkpoints were faulted on the cold node when the conversation was parked, and moving
+/// them back into the active session re-tags their mappings but moves no page, so this is what puts them where an
+/// active checkpoint's pages live (conversation_checkpoint_move, conversation_cache.hpp).  False (with
+/// `error_number`) when the kernel could not move every page: the ones it could not move stay where they were,
+/// which is the graceful degradation the caller logs and goes on from.  Inline, unlike the bind above, because a
+/// header-only class calls it (conversation_cache.hpp is built with its own test, which links no library).
+inline bool numa_move_range(void* addr, uint64_t bytes, int node, int& error_number) {
+    unsigned long mask[kNumaMaxNode / 64];
+    numa_node_mask(node, mask);
+    errno = 0;
+    if (syscall(SYS_mbind, addr, (unsigned long) bytes, kMpolBind, mask, kNumaMaxNode, kMpolMove) == 0) return true;
+    error_number = errno;
+    return false;
+}
 
 /// The calling thread's memory policy, bound to one node for a scope and put back when the scope ends.  The VMA's
 /// own mbind is what decides where its pages go; the thread policy covers the faults that bring them in and
@@ -112,6 +133,10 @@ struct ThreadNodeBinding {
     bool bind(int, std::string& why) { why = "this platform has no set_mempolicy"; return false; }
     void restore() {}
 };
+
+/// A platform without mbind has no second node to move a page to: false, and the caller goes on with the pages
+/// where they are.  `error_number` stays 0, so a caller that warns only on a real errno stays quiet here.
+inline bool numa_move_range(void*, uint64_t, int, int& error_number) { error_number = 0; return false; }
 
 #endif
 

@@ -1399,6 +1399,7 @@ private:
 // just the checkpoints that are prefixes of the tokens the session holds now.
 using ImgKey = strata::core::ConversationImageKey;
 using ConvCheckpoint = strata::core::ConversationCheckpoint;
+using ConvIds = strata::core::ConversationIds;
 
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
     const uint8_t* p = (const uint8_t*) data;
@@ -7493,7 +7494,11 @@ int main(int argc, char **argv) try {
         // chain's root is the deepest point every request so far shared (the end of the system prompt, in
         // practice); the retention policy pins it and rotates the rest LRU (conv_cache.hpp), so a NEW chat that
         // shares that prefix mounts through it instead of reading it again.
-        std::vector<int32_t> live;
+        // `live` is what the session holds right now: the tokens it has consumed, so a request that starts with
+        // exactly them continues without any copy.  Named storage of the active class (vma_alloc.hpp): a restore
+        // COPIES an image's tokens in (never moves them) so this allocator - not the image's - keeps naming the
+        // growth, and the buffer is not renamed behind its allocator's back.
+        ConvIds live{strata::core::vma_class::session_active};
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
         std::vector<ConvCheckpoint> checks;
@@ -7671,21 +7676,35 @@ int main(int argc, char **argv) try {
                 }
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                        std::move(reuse), &reused_bytes)) return false;
-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
-                    auto& st = stages[k];
-                    const strata::core::OnDevice on(st->dev);
-                    if (DPCT_CHECK_ERROR(dpct::get_current_device()
-                                             .queues_wait_and_throw()) != 0) {
-                        err = "stage sync failed"; return false;
+                // S2/S3: a parked image is cold-class storage (`strata/conv_cache`), and its checkpoints (the
+                // copied chain and `live`) are first touched by THIS thread - copy_checkpoints_beating's memcpy
+                // and conversation_checkpoint_save's resize zero fill.  Without the binding those faults follow
+                // the process's own policy and the parked chain lands hot; bind the thread for the capture only,
+                // the way ConversationBuffer binds its own segments.
+                {
+                    const int park_cold = strata::core::detail::numa_cold_node();
+                    strata::core::detail::ThreadNodeBinding park_nb;
+                    std::string park_bind_why;
+                    if (park_cold >= 0 && !park_nb.bind(park_cold, park_bind_why))
+                        std::fprintf(stderr, "strata serve: conversation cache: WARNING: cannot bind this thread to "
+                                             "NUMA node %d (%s): the parked image's pages take the process's "
+                                             "memory policy\n", park_cold, park_bind_why.c_str());
+                    if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                            std::move(reuse), &reused_bytes)) return false;
+                    for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        if (DPCT_CHECK_ERROR(dpct::get_current_device()
+                                                 .queues_wait_and_throw()) != 0) {
+                            err = "stage sync failed"; return false;
+                        }
+                        const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                        strata::core::SavedConversation part;
+                        if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                                std::move(stage_reuse[k]), &reused_bytes))
+                            return false;
+                        image.stage_images.push_back(std::move(part));
                     }
-                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
-                    strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
-                        return false;
-                    image.stage_images.push_back(std::move(part));
                 }
                 if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(), 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
@@ -7766,7 +7785,18 @@ int main(int argc, char **argv) try {
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
                     return true;
                 }
-            ConvCheckpoint c;
+            // S2/S3: the active chain is hot-class storage (`strata/session_active`): THIS thread faults the new
+            // checkpoint's state arrays in (conversation_checkpoint_save's resize zero fill) and each stage part
+            // with it, so bind it here - without the binding those faults follow the process's own policy and leak
+            // to the cold node.
+            const int ckpt_hot = strata::core::detail::numa_hot_node();
+            strata::core::detail::ThreadNodeBinding ckpt_nb;
+            std::string ckpt_bind_why;
+            if (ckpt_hot >= 0 && !ckpt_nb.bind(ckpt_hot, ckpt_bind_why))
+                std::fprintf(stderr, "strata serve: conversation checkpoint: WARNING: cannot bind this thread to "
+                                     "NUMA node %d (%s): the checkpoint's pages take the process's memory policy\n",
+                             ckpt_hot, ckpt_bind_why.c_str());
+            ConvCheckpoint c(strata::core::vma_class::session_active);
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
             if (parts != nullptr) {
@@ -7781,7 +7811,7 @@ int main(int argc, char **argv) try {
                 if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
-                    ConvCheckpoint part;
+                    ConvCheckpoint part(strata::core::vma_class::session_active);
                     part.ids = c.ids;
                     if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g)) return false;
                     c.stage_parts.push_back(std::move(part));
@@ -7870,7 +7900,7 @@ int main(int argc, char **argv) try {
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
                     if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
                     part_next[i] = done + o.prompt_cache_every;
-                    ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
+                    ConvCheckpoint part(strata::core::vma_class::session_active);   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
                     if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
                     std::lock_guard<std::mutex> lk(part_mu);
@@ -8843,7 +8873,7 @@ int main(int argc, char **argv) try {
             // the slot's own conversation cache: the tokens its sessions hold (the prompt, then every token a window
             // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it
             // instead of reading its history again (see `slot_source` in the request path).
-            std::vector<int32_t> ids;
+            ConvIds ids{strata::core::vma_class::session_active};
             bool cached = false;           ///< idle, and its sessions still hold `ids`
             bool cvec = true;              ///< the control vector setting `ids` were read with
             bool img = false;              ///< the conversation has pictures (never reused from the slot)
@@ -8873,7 +8903,7 @@ int main(int argc, char **argv) try {
             return true;
         };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
-        auto copy_to_slot = [&](int b, const std::vector<int32_t> &ids,
+        auto copy_to_slot = [&](int b, const ConvIds &ids,
                                 std::string &e) -> bool {
             try {
         const int64_t upto = (int64_t)ids.size();
@@ -8886,7 +8916,7 @@ int main(int argc, char **argv) try {
                     0) {
                     e = "batch admission: device sync failed"; return false;
                 }
-                strata::core::ConversationCheckpoint ck;
+                strata::core::ConversationCheckpoint ck(strata::core::vma_class::session_active);
                 ck.ids = ids;
                 if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
                     !strata::core::conversation_checkpoint_restore(ck, to, g, e))
@@ -8954,7 +8984,7 @@ int main(int argc, char **argv) try {
                     if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
                         return false;
                 } else {
-                    strata::core::ConversationCheckpoint ck;
+                    strata::core::ConversationCheckpoint ck(strata::core::vma_class::session_active);
                     ck.ids = bs[(size_t) b].ids;
                     if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
                         !strata::core::conversation_checkpoint_restore(ck, to, g, e))
@@ -9480,9 +9510,22 @@ int main(int argc, char **argv) try {
                             continue;
                         }
                         strata::core::SessionStatus st;
-                        if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
-                            refuse(err, st.error);
-                            continue;
+                        // S2/S3: this load restores the file straight INTO the active session - get_payload
+                        // first-touches every checkpoint vector, then the handover below MOVES them into `checks`
+                        // and renames them `strata/session_active` (the pages do not move).  Placement must follow
+                        // that active class, so bind the HOT node, as checkpoint_at does.
+                        {
+                            const int load_hot = strata::core::detail::numa_hot_node();
+                            strata::core::detail::ThreadNodeBinding load_nb;
+                            std::string load_bind_why;
+                            if (load_hot >= 0 && !load_nb.bind(load_hot, load_bind_why))
+                                std::fprintf(stderr, "strata serve: session file: WARNING: cannot bind this thread to "
+                                                     "NUMA node %d (%s): the loaded image's pages take the "
+                                                     "process's memory policy\n", load_hot, load_bind_why.c_str());
+                            if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
+                                refuse(err, st.error);
+                                continue;
+                            }
                         }
                     } catch (const std::bad_alloc&) {
                         refuse("not enough RAM to read the session", strata::core::SessionError::memory);
@@ -9519,9 +9562,14 @@ int main(int argc, char **argv) try {
                         std::fflush(stdout);
                         return 1;
                     }
-                    live = std::move(image.live.ids);
+                    // Named storage of the active class (vma_alloc.hpp).  The tokens are COPIED in: the loaded
+                    // image's tokens live in `strata/conv_cache` storage, and a move would carry that allocator
+                    // (and the name) into a buffer this session keeps appending to.
+                    live.assign(image.live.ids.begin(), image.live.ids.end());
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);
+                    for (ConvCheckpoint& c : checks)   // the chain is the active session's now: the name follows
+                        strata::core::conversation_checkpoint_rename(c, strata::core::vma_class::session_active);
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
@@ -9756,7 +9804,7 @@ int main(int argc, char **argv) try {
             const Clock::time_point r0 = Clock::now();
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
-            auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
+            auto starts_with = [&](const ConvIds& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
                 const int64_t L = (int64_t) pre.size();
                 if (L < 1 || L > n - 1) return false;
                 for (int64_t i = 0; i < L; ++i)
@@ -9933,7 +9981,10 @@ int main(int argc, char **argv) try {
                                  mtp.kv_state().kv_mode, "ram",
                                  (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
                 }
-                live = std::move(incoming->live.ids);
+                // Same as the disk-load handover above: the moved buffers were captured into a parked image
+                // (`strata/conv_cache`); this session owns them now, so their name follows the container - no
+                // page moves, one prctl per named buffer (vma_alloc.hpp).
+                live.assign(incoming->live.ids.begin(), incoming->live.ids.end());
                 live_imgs = std::move(incoming->live.imgs);
                 if (stages.empty()) {
                     checks = std::move(incoming->checkpoints);
@@ -9943,6 +9994,8 @@ int main(int argc, char **argv) try {
                     for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
+                for (ConvCheckpoint& c : checks)
+                    strata::core::conversation_checkpoint_rename(c, strata::core::vma_class::session_active);
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
                 from_live = parked.live;
@@ -10400,7 +10453,7 @@ int main(int argc, char **argv) try {
                                          b0 - q > std::max<int64_t>(C, o.short_read);
                         std::string ye;
                         const auto ty = Clock::now();
-                        std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
+                        ConvIds pre(ids.begin(), ids.begin() + q, strata::core::vma_class::session_active);
                         if (can && copy_to_slot(ys, pre, ye)) {
                             BSlot& sl = bs[(size_t) ys];
                             sl = BSlot{};
@@ -10602,7 +10655,7 @@ int main(int argc, char **argv) try {
             static const bool chain_fixed = std::getenv("STRATA_LOOKUP_CHAIN_FIXED") != nullptr;   // no policy gate
             int64_t draft_offered = 0, draft_accepted = 0;
             // what the session holds once this request is done: the prompt read so far, then every committed token
-            std::vector<int32_t> consumed;
+            ConvIds consumed{strata::core::vma_class::session_active};
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";

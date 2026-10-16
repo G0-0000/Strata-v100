@@ -57,12 +57,19 @@ std::vector<uint8_t> bytes_of(size_t n, uint8_t seed) {
     return v;
 }
 
+// gdn/ple are named storage (see conversation_cache.hpp): the fixture fills that shape too.
+std::vector<uint8_t, VmaAllocator<uint8_t>> named_bytes_of(size_t n, uint8_t seed) {
+    std::vector<uint8_t, VmaAllocator<uint8_t>> v(n, 0, VmaAllocator<uint8_t>(vma_class::conv_cache));
+    for (size_t i = 0; i < n; ++i) v[i] = uint8_t(i * 7u + seed);
+    return v;
+}
+
 ConversationCheckpoint checkpoint(size_t tokens, uint8_t seed) {
     ConversationCheckpoint c;
     for (size_t i = 0; i < tokens; ++i) c.ids.push_back(int32_t(1000 + i));
     c.imgs = {{3, 0x1234567890abcdefull ^ seed}};
-    c.gdn = bytes_of(4099, seed);
-    c.ple = bytes_of(77, seed + 1);
+    c.gdn = named_bytes_of(4099, seed);
+    c.ple = named_bytes_of(77, seed + 1);
     c.tails = bytes_of(301, seed + 2);
     c.dead = bytes_of(64, seed + 3);
     c.block_pos = bytes_of(8, seed + 4);

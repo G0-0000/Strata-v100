@@ -90,7 +90,8 @@ int main() {
         auto match = cache.best(a, {}, true);
         check(match.tokens == 3 && match.live, "A/B/A: recover A");
         auto restored = cache.take(match.index);
-        check(restored.live.ids == std::vector<int32_t>({1, 2, 3}), "taking selected A preserves identity");
+        check(std::vector<int32_t>(restored.live.ids.begin(), restored.live.ids.end()) == std::vector<int32_t>({1, 2, 3}),
+              "taking selected A preserves identity");
         check(cache.size() == 1 && cache.best(b, {}, true).tokens == 3, "B remains parked");
         check(cache.bytes() == image({9,8,7}).bytes(), "byte accounting after take");
         check(cache.put(std::move(restored)), "park returned A as newest");
@@ -189,13 +190,14 @@ int main() {
         // #342: MAIN -> SUB (9 turns) -> MAIN with 4 slots.  Every SUB turn parks the previous turn's live state
         // (its reply as generated, which the next request re-rendered) with a chain that holds that turn's
         // boundary checkpoint; the copy a turn back adds only that stale tail and is dropped, so MAIN survives.
-        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids.assign(ids.begin(), ids.end()); return c; };
         auto with = [](std::vector<int32_t> prefix, std::initializer_list<int32_t> more) {
             prefix.insert(prefix.end(), more); return prefix;
         };
         const std::vector<int32_t> root = {1, 2, 3, 4};
         SavedConversation main = image({});
-        main.live.ids = with(with(root, {10, 11, 12}), {13, 14});
+        const std::vector<int32_t> main_ids = with(with(root, {10, 11, 12}), {13, 14});
+        main.live.ids.assign(main_ids.begin(), main_ids.end());
         main.checkpoints = {cp(root), cp(with(root, {10, 11, 12}))};
         const size_t big = 1 << 20;
         ConversationCache cache(big, 4);
@@ -205,7 +207,8 @@ int main() {
         for (int turn = 1; turn <= 9; ++turn) {
             chain.push_back(cp(history));                        // the turn boundary the next request resumes from
             SavedConversation sub = image({});
-            sub.live.ids = with(history, {900, (int32_t) turn});   // + the reply with its thinking (stale tail)
+            sub.live.ids.assign(history.begin(), history.end());
+            sub.live.ids.push_back(900); sub.live.ids.push_back((int32_t) turn);   // + the reply with its thinking (stale tail)
             sub.checkpoints = chain;
             check(cache.put(std::move(sub)), "park SUB turn");
             check(cache.size() <= 2, "one parked copy of SUB at a time");
@@ -220,7 +223,7 @@ int main() {
     {
         // what is NOT superseded: another conversation sharing only the root, an entry without checkpoints, the
         // other steering mode, a branch whose deepest checkpoint the new chain does not hold
-        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids.assign(ids.begin(), ids.end()); return c; };
         ConversationCache cache(1 << 20, 8);
         SavedConversation other = image({1, 2, 3, 4, 50, 51, 52});
         other.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 50, 51})};

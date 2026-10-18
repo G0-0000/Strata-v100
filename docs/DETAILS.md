@@ -1258,6 +1258,45 @@ A disk hit is read into host RAM before it is restored: it must fit the configur
 engine logs spill, restore, stale-file and disk-budget events. The disk tier keeps the existing single-GPU parking
 limit: with `--layer-split` the disk tier stays off.
 
+<<<<<<< ours
+=======
+**The conversation cache on disk only (`--conversation-cache-disk-only`).** With `--conversation-cache-spill-dir DIR`
+and this flag, the conversation cache needs no RAM budget (`--conversation-cache-mib` is not used). When a request
+switches to another conversation, the outgoing one is written to DIR the way a session SAVE writes it: the running
+state and the deepest checkpoint are copied, the K/V is streamed from its pools into the file. When a conversation
+comes back, it is read the way a streaming RESTORE reads it: a read pass checks the whole file before anything on the
+GPU changes (a bad file is dropped and the prompt is read as usual), then the K/V goes into the pools 16 MiB at a
+time. The new file is written before the conversation's older copies are removed, so a failed write loses nothing,
+and no conversation is refused for its size: `--conversation-cache-disk-mib` is the only limit. The agent's next
+turn of the same conversation (it resumes at the newest turn checkpoint) writes nothing. A clean shutdown saves the
+live conversation (flushed), so the next start continues it. Single GPU, without `--batch` or `--peer-device`.
+
+Measured on a Ryzen AI Max+ 395 (gfx1151, the iGPU alone, internal NVMe; Qwen3.8-Flash-Next with K-quant experts,
+`--spec 4 --mtp --lookup-chain 3 --kv int8`). Three agent conversations take turns, each a 9-12K-token first prompt
+plus ~1.1K tokens a turn, with an engine restart after 9 requests:
+
+| | prompt read per later turn | turns resumed (of 12) |
+|---|---:|---:|
+| no conversation cache | 11.4-22.3 s (nothing reused) | 0 |
+| `--conversation-cache-disk-only` | 2.3-3.6 s (88-94% reused) | 12 |
+
+A switch wrote 360-443 MiB in 181-196 ms; a return read it back in 291-351 ms (the read pass ~150 ms of it), and in
+275-361 ms with every spill file pushed out of the page cache first (`fincore`: 0 bytes resident). Process
+memory (RssAnon) peaked 0.6 GiB above a run without the cache during a switch and ended 0.15 GiB above it; no
+conversation stays in RAM. Greedy replies matched the run without the cache for 13 of 15 turns; the other two
+match the RAM cache's restore of the same state (a restore and a full read of the prompt round differently).
+
+Disk-only mode also keeps **prefix entries** (`strata-conv-prefix-N`): when a conversation is saved, its shared
+opening is saved once more on its own, once per distinct opening. That is the deepest `"strata_prefix"` checkpoint on
+the live path when the request pinned one, else the root (the first turn boundary at least `--prompt-cache-root`
+tokens in). A new conversation that opens the same way - a coding agent's next session - resumes from it instead of
+reading its system prompt and tools again. Prefix entries are never removed as superseded, the disk budget evicts
+every ordinary conversation before one of them, and they survive a restart. With a client that sends
+`"strata_prefix"` at the end of Claude Code's `<system-reminder>` blocks, a new session's first turn reused 13,434
+of 15,924 tokens and took 4.7 s instead of 15.7 s; after an engine restart, 5.1 s (the 420 MiB entry restored in
+326 ms).
+
+>>>>>>> theirs
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
 requests of llama-server's slot API, for its single slot 0, when started with `--slot-save-path DIR` (also

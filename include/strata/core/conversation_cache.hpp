@@ -345,12 +345,16 @@ ConversationMatch conversation_metadata_match(const ConversationCheckpoint& live
 class ConversationCache {
 public:
 <<<<<<< ours
+<<<<<<< ours
     struct Match {
         size_t index = 0;
         int64_t tokens = 0;
         bool live = false;
         uint64_t serial = 0;   // the entry's identity; its index shifts when entries before it go
     };
+=======
+    using Match = ConversationMatch;
+>>>>>>> theirs
 =======
     using Match = ConversationMatch;
 >>>>>>> theirs
@@ -404,6 +408,7 @@ public:
         for (size_t i = entries_.size(); i-- > 0;) {
             const auto& e = entries_[i];
 <<<<<<< ours
+<<<<<<< ours
             if (e.cvec != cvec) continue;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
@@ -411,6 +416,10 @@ public:
             };
             consider(e.live, true);
             for (const auto& c : e.checkpoints) consider(c, false);
+=======
+            Match candidate = conversation_saved_match(e, prompt, images, cvec, similarity, n_min);
+            if (candidate.tokens > best.tokens) { candidate.index = i; best = candidate; }
+>>>>>>> theirs
 =======
             Match candidate = conversation_saved_match(e, prompt, images, cvec, similarity, n_min);
             if (candidate.tokens > best.tokens) { candidate.index = i; best = candidate; }
@@ -500,6 +509,7 @@ public:
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
 <<<<<<< ours
+<<<<<<< ours
     bool evict_oldest() {
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
@@ -511,6 +521,8 @@ public:
         }
         return false;
 =======
+=======
+>>>>>>> theirs
     bool evict_oldest() { return evict_oldest([](const SavedConversation&) {}); }
 
     // The spill callback sees the conversation before it is dropped, so a durable disk tier keeps what the
@@ -594,6 +606,22 @@ public:
             if (holds) longest = std::max(longest, deepest->ids.size());
         }
         return longest;
+    }
+
+    // Spill every parked conversation (oldest first) and empty the cache: the shutdown path, so a restart finds
+    // them on disk. Returns how many were handed to the callback.
+    template<class Spill>
+    size_t spill_all(Spill&& spill) {
+        size_t count = 0;
+        while (!entries_.empty()) {
+            spill(entries_.front());
+            bytes_ -= entries_.front().bytes();
+            entries_.pop_front();
+            ++evictions_;
+            ++count;
+        }
+        reuse_ = {};
+        return count;
     }
 
     // Spill every parked conversation (oldest first) and empty the cache: the shutdown path, so a restart finds

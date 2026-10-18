@@ -29,6 +29,7 @@ bool conversation_kv_validate_meta(const ConversationKv& image, const QsaState& 
                                    int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                              int64_t upto, bool include_index, std::string& error);
+<<<<<<< ours
 // conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout.
 // The copies are complete on return; the residency refresh is queued on the legacy stream like the restore's.
 // `queued`: the copies are only queued on the private copy stream, the refresh is ordered after them on the device,
@@ -41,6 +42,8 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
 // restore followed by a rewind to a checkpoint.
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                     int64_t captured, int64_t upto, bool include_index, std::string& error);
+=======
+>>>>>>> theirs
 // One K/V layer of a streaming restore (conversation_file.hpp): conversation_kv_targets binds every layer's
 // authoritative pool after validating its header; `apply` copies one block into it (cudaMemcpyDefault, so a device
 // pool and a device-mapped host pool both work), in offset order; `finish` refills what the layer's K/V mode keeps
@@ -135,12 +138,15 @@ enum class ConversationRestore { restored, invalid, transfer_failed };
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState& draft,
                                                    std::string& error);
+<<<<<<< ours
 // The K/V of the image's first `upto` tokens (main layers and the draft layer), not its running state: the caller
 // mounts a checkpoint taken at `upto`.  For a checkpoint of a parked conversation that a new conversation starts
 // with, while the parked one stays where it is (ConversationCache::borrows).  Same failure contract as above.
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& session, const ModelGeometry& g,
                                                           const QsaState& draft, std::string& error);
+=======
+>>>>>>> theirs
 // The streaming form of the same checks: the image's K/V is a set of headers (conversation_file.hpp), so every
 // layer is checked by conversation_kv_validate_meta.  As strict otherwise: geometry, layer range, the live state and
 // every checkpoint are validated without any CUDA call or device write.

@@ -1258,8 +1258,6 @@ A disk hit is read into host RAM before it is restored: it must fit the configur
 engine logs spill, restore, stale-file and disk-budget events. The disk tier keeps the existing single-GPU parking
 limit: with `--layer-split` the disk tier stays off.
 
-<<<<<<< ours
-=======
 **The conversation cache on disk only (`--conversation-cache-disk-only`).** With `--conversation-cache-spill-dir DIR`
 and this flag, the conversation cache needs no RAM budget (`--conversation-cache-mib` is not used). When a request
 switches to another conversation, the outgoing one is written to DIR the way a session SAVE writes it: the running
@@ -1296,7 +1294,6 @@ every ordinary conversation before one of them, and they survive a restart. With
 of 15,924 tokens and took 4.7 s instead of 15.7 s; after an engine restart, 5.1 s (the 420 MiB entry restored in
 326 ms).
 
->>>>>>> theirs
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
 requests of llama-server's slot API, for its single slot 0, when started with `--slot-save-path DIR` (also

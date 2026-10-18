@@ -298,6 +298,7 @@ struct ConversationMatch {
     size_t index = 0;
     int64_t tokens = 0;
     bool live = false;
+    uint64_t serial = 0;   // the entry's identity; its index shifts when entries before it go
 };
 
 // The best resume a parked image offers for this prompt. similarity is the least LCP/new-prompt fraction accepted
@@ -344,20 +345,7 @@ ConversationMatch conversation_metadata_match(const ConversationCheckpoint& live
 
 class ConversationCache {
 public:
-<<<<<<< ours
-<<<<<<< ours
-    struct Match {
-        size_t index = 0;
-        int64_t tokens = 0;
-        bool live = false;
-        uint64_t serial = 0;   // the entry's identity; its index shifts when entries before it go
-    };
-=======
     using Match = ConversationMatch;
->>>>>>> theirs
-=======
-    using Match = ConversationMatch;
->>>>>>> theirs
 
     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
         : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
@@ -407,23 +395,8 @@ public:
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
             const auto& e = entries_[i];
-<<<<<<< ours
-<<<<<<< ours
-            if (e.cvec != cvec) continue;
-            auto consider = [&](const ConversationCheckpoint& c, bool live) {
-                const int64_t n = conversation_prefix(c, prompt, images);
-                if (n > best.tokens) best = {i, n, live, serials_[i]};
-            };
-            consider(e.live, true);
-            for (const auto& c : e.checkpoints) consider(c, false);
-=======
             Match candidate = conversation_saved_match(e, prompt, images, cvec, similarity, n_min);
-            if (candidate.tokens > best.tokens) { candidate.index = i; best = candidate; }
->>>>>>> theirs
-=======
-            Match candidate = conversation_saved_match(e, prompt, images, cvec, similarity, n_min);
-            if (candidate.tokens > best.tokens) { candidate.index = i; best = candidate; }
->>>>>>> theirs
+            if (candidate.tokens > best.tokens) { candidate.index = i; candidate.serial = serials_[i]; best = candidate; }
         }
         return best;
     }
@@ -508,35 +481,22 @@ public:
     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
-<<<<<<< ours
-<<<<<<< ours
-    bool evict_oldest() {
-        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
-        for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            bytes_ -= entries_[i].bytes();
-            erase(i);
-            ++evictions_;
-            return true;
-        }
-        return false;
-=======
-=======
->>>>>>> theirs
     bool evict_oldest() { return evict_oldest([](const SavedConversation&) {}); }
 
     // The spill callback sees the conversation before it is dropped, so a durable disk tier keeps what the
     // physical-RAM gate evicts and not only what make_room() pushes out.
     template<class Spill>
     bool evict_oldest(Spill&& spill) {
-        auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
-        if (victim == entries_.end()) return false;
-        spill(*victim);
-        bytes_ -= victim->bytes();
-        entries_.erase(victim);
-        ++evictions_;
-        return true;
->>>>>>> theirs
+        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            spill(entries_[i]);
+            bytes_ -= entries_[i].bytes();
+            erase(i);
+            ++evictions_;
+            return true;
+        }
+        return false;
     }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
@@ -606,22 +566,6 @@ public:
             if (holds) longest = std::max(longest, deepest->ids.size());
         }
         return longest;
-    }
-
-    // Spill every parked conversation (oldest first) and empty the cache: the shutdown path, so a restart finds
-    // them on disk. Returns how many were handed to the callback.
-    template<class Spill>
-    size_t spill_all(Spill&& spill) {
-        size_t count = 0;
-        while (!entries_.empty()) {
-            spill(entries_.front());
-            bytes_ -= entries_.front().bytes();
-            entries_.pop_front();
-            ++evictions_;
-            ++count;
-        }
-        reuse_ = {};
-        return count;
     }
 
     // Spill every parked conversation (oldest first) and empty the cache: the shutdown path, so a restart finds

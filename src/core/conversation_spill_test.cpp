@@ -3,17 +3,11 @@
 // Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no CUDA, no model.
 #include "strata/core/conversation_spill.hpp"
 
-<<<<<<< ours
-#include <cstdio>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
-=======
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
->>>>>>> theirs
+#include <fstream>
 #include <string>
 #include <vector>
 #include <chrono>
@@ -101,7 +95,7 @@ int main() {
     check(spill.spill(a, error), "spill first");
     check(spill.size() == 1, "one entry");
     // the prompt continues the conversation (one token past its end): the whole live state resumes.
-    std::vector<int32_t> continuing = a.live.ids;
+    std::vector<int32_t> continuing(a.live.ids.begin(), a.live.ids.end());
     continuing.push_back(int32_t(7777));
     const auto first = spill.best(continuing, a.live.imgs, false, 0.0, 0);
     check(bool(first), "match own conversation");
@@ -121,7 +115,7 @@ int main() {
     check(kv_same, "kv bytes round-trip");
 
     // a different prompt sharing a prefix resumes at the common prefix, not the whole thing
-    std::vector<int32_t> other = a.live.ids;
+    std::vector<int32_t> other(a.live.ids.begin(), a.live.ids.end());
     other.resize(400);
     for (size_t i = 400; i < a.live.ids.size(); ++i) other.push_back(int32_t(9000 + i));
     check(other.size() == a.live.ids.size(), "other same length, diverges at 400");
@@ -167,7 +161,6 @@ int main() {
     check(small.size() == 1, "budget keeps one");
     check(small.disk_evictions() >= 1, "budget evicted the oldest");
 
-<<<<<<< ours
     // a process killed mid-write leaves the writer's hidden temporary beside the spill file (a 6 GB one here, on
     // the user's PC): the scan at open is the only thing that removes it, and it must not touch anyone else's.
     const fs::path abandoned = dir / ".strata-conv-99.sess.0123456789abcdef.tmp";
@@ -182,8 +175,7 @@ int main() {
     check(wiped.size() == 1, "the temp is not indexed as a conversation");
     fs::remove(foreign_temp);
 
-=======
->>>>>>> theirs
+
     // the RAM cache handing its evictions to the disk tier: make_room's spill callback writes what it drops.
     fs::remove_all(dir);
     ConversationSpillCache tier;
@@ -200,7 +192,11 @@ int main() {
     check(spilled == 1, "one conversation handed to the spill callback");
     check(tier.size() == 1, "the evicted conversation reached disk");
     // the disk copy resumes the same conversation the RAM cache dropped.
-    std::vector<int32_t> cont1 = sample(1000).live.ids;
+    std::vector<int32_t> cont1;
+    {
+        const SavedConversation probe = sample(1000);
+        cont1.assign(probe.live.ids.begin(), probe.live.ids.end());
+    }
     cont1.push_back(int32_t(7777));
     const auto from_disk = tier.best(cont1, sample(1000).live.imgs, false, 0.0, 0);
     check(bool(from_disk) && from_disk.tokens == 1000, "disk resumes the evicted conversation");
@@ -212,8 +208,6 @@ int main() {
     check(tier.size() == 2, "both conversations now on disk");
 
     fs::remove_all(dir);
-<<<<<<< ours
-=======
     // --conversation-cache-disk-only: a conversation streamed from its sources (no host K/V image) is written as the
     // same file the image spill writes, indexed the same way, and reads back with the same K/V bytes.
     {
@@ -254,7 +248,7 @@ int main() {
         check(written > 0 && str_dir.bytes() == written, "streamed: size accounted");
         check(slurp(img_dir.newest_path()) == slurp(str_dir.newest_path()), "streamed: file equals the image spill's");
         // it matches and reads back like any spilled conversation
-        std::vector<int32_t> next_prompt = c.live.ids;
+        std::vector<int32_t> next_prompt(c.live.ids.begin(), c.live.ids.end());
         next_prompt.push_back(7);
         const auto hit = str_dir.best(next_prompt, {}, c.cvec, 0.0, 0);
         check(bool(hit) && hit.tokens == (int64_t) c.live.ids.size() && hit.live, "streamed: full live match");
@@ -332,7 +326,7 @@ int main() {
         conv.checkpoints.clear();
         conv.checkpoints.push_back(checkpoint(600, 8));
         check(sp.spill_streamed(meta_of(conv), sources_of(conv), written, error), "prefix: save a conversation");
-        std::vector<int32_t> new_chat(root.live.ids);
+        std::vector<int32_t> new_chat(root.live.ids.begin(), root.live.ids.end());
         new_chat.push_back(99999);                // a new conversation: same root, different first message
         const auto hit = sp.best(new_chat, {}, root.cvec, 0.0, 0);
         check(bool(hit) && hit.tokens == 600, "prefix: a new conversation resumes at the root");
@@ -352,7 +346,6 @@ int main() {
         fs::remove_all(pdir);
     }
 
->>>>>>> theirs
     std::printf("conversation_spill_test: %d checks passed\n", checks);
     return 0;
 }

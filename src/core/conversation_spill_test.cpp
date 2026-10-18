@@ -39,7 +39,10 @@ std::vector<uint8_t> bytes_of(size_t n, uint8_t seed) {
 ConversationCheckpoint checkpoint(size_t tokens, uint8_t seed) {
     ConversationCheckpoint c;
     for (size_t i = 0; i < tokens; ++i) c.ids.push_back(int32_t(1000 + i));
-    c.gdn = bytes_of(4099, seed); c.ple = bytes_of(77, seed + 1);
+    const std::vector<uint8_t> gdn = bytes_of(4099, seed);
+    c.gdn.assign(gdn.begin(), gdn.end());
+    const std::vector<uint8_t> ple = bytes_of(77, seed + 1);
+    c.ple.assign(ple.begin(), ple.end());
     c.tails = bytes_of(301, seed + 2); c.dead = bytes_of(64, seed + 3); c.block_pos = bytes_of(8, seed + 4);
     c.used = 42 + seed;
     return c;
@@ -132,7 +135,8 @@ int main() {
     check(!bool(short_hit), "n_min filters short hit");
 
     // cvec mismatch never matches
-    const auto wrong_cvec = spill.best(a.live.ids, a.live.imgs, true, 0.0, 0);
+    const auto wrong_cvec = spill.best(std::vector<int32_t>(a.live.ids.begin(), a.live.ids.end()),
+                                       a.live.imgs, true, 0.0, 0);
     check(!bool(wrong_cvec), "cvec mismatch refused");
 
     // reopen the directory: the sidecar is reindexed without reading the session file

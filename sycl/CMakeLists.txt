@@ -18,6 +18,17 @@ if(CMAKE_MATCH_1)
 else()
   set(STRATA_SYCL_VERSION 0.1.40.2)
 endif()
+# fork-local revision: the same rule as the top-level build - a numeric LOCAL_REVISION at the repo root
+# appends a 4th segment. Applied here too because this file is also configured standalone (cmake -S sycl),
+# where there is no parent PROJECT_VERSION to inherit.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../LOCAL_REVISION")
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../LOCAL_REVISION" _strata_local_rev)
+  string(STRIP "${_strata_local_rev}" _strata_local_rev)
+  if(NOT _strata_local_rev MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "LOCAL_REVISION must contain exactly one numeric segment (digits only), got '${_strata_local_rev}'")
+  endif()
+  set(STRATA_SYCL_VERSION "${STRATA_SYCL_VERSION}.${_strata_local_rev}")
+endif()
 project(strata_sycl VERSION ${STRATA_SYCL_VERSION} LANGUAGES C CXX)
 set(STRATA_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(CMAKE_CXX_STANDARD 20)

@@ -9,6 +9,19 @@
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.45 LANGUAGES CXX)
+# Fork-local revision (G0-0000/Strata-v100): a numeric LOCAL_REVISION at the repo root appends a 4th
+# version segment (0.1.45 -> 0.1.45.4). Upstream never ships the file, so merges leave it untouched.
+# Runs before the STRATA_ENABLE_SYCL branch below so that early-return path sees the revised
+# PROJECT_VERSION too; sycl/CMakeLists.txt re-parses this file's literal project() line and applies
+# the same LOCAL_REVISION itself (it is also configured standalone, with no parent scope).
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LOCAL_REVISION")
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/LOCAL_REVISION" STRATA_LOCAL_REVISION)
+  string(STRIP "${STRATA_LOCAL_REVISION}" STRATA_LOCAL_REVISION)
+  if(NOT STRATA_LOCAL_REVISION MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "LOCAL_REVISION must contain exactly one numeric segment (digits only), got '${STRATA_LOCAL_REVISION}'")
+  endif()
+  set(PROJECT_VERSION "${PROJECT_VERSION}.${STRATA_LOCAL_REVISION}")
+endif()
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
 option(STRATA_ENABLE_SYCL "EXPERIMENTAL: build the Intel Arc (SYCL) engine from sycl/ - docs/INTEL_ARC.md" OFF)

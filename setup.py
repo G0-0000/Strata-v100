@@ -4754,9 +4754,17 @@ def installed_configs():
 
 
 def source_version() -> str:
-    """The engine version the source tree builds (CMakeLists.txt's project version)."""
+    """The engine version the source tree builds (CMakeLists.txt's project version, with the fork-local
+    LOCAL_REVISION appended as a 4th segment when that file exists at the repo root)."""
     m = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
-    return m.group(1) if m else "0"
+    version = m.group(1) if m else "0"
+    rev_file = ROOT / "LOCAL_REVISION"
+    if rev_file.exists():
+        rev = rev_file.read_text(encoding="utf-8").strip()
+        if not re.fullmatch(r"\d+", rev):
+            fail(f"LOCAL_REVISION must contain exactly one numeric segment (digits only), got {rev!r}")
+        version = f"{version}.{rev}"
+    return version
 
 
 def binary_engine_version(exe) -> str | None:

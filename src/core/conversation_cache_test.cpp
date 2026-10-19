@@ -447,6 +447,49 @@ int main() {
         check(!disabled_min.enabled() && disabled_min.wants(1 << 20), "a disabled cache still answers for length");
     }
     {
+        ConversationCacheTokenLimits legacy, explicit_zero, pair, defaults;
+        check(parse_conversation_cache_min_tokens("6000", legacy), "单值 WRITE 阈值可解析");
+        check(parse_conversation_cache_min_tokens("6000,0", explicit_zero), "显式 READ=0 可解析");
+        check(parse_conversation_cache_min_tokens("6000,5000", pair), "WRITE,READ 双阈值可解析");
+        check(legacy.write_min_tokens == 6000 && legacy.read_min_tokens == 0 &&
+              legacy.write_min_tokens == explicit_zero.write_min_tokens &&
+              legacy.read_min_tokens == explicit_zero.read_min_tokens,
+              "旧单值等同 WRITE,0");
+        check(pair.write_min_tokens == 6000 && pair.read_min_tokens == 5000, "双值按 WRITE,READ 顺序保存");
+        check(defaults.write_min_tokens == 0 && defaults.read_min_tokens == 0, "默认阈值不限制读写");
+        ConversationCacheTokenLimits maximum;
+        check(parse_conversation_cache_min_tokens("2147483647,2147483647", maximum) &&
+              maximum.write_min_tokens == 2147483647 && maximum.read_min_tokens == 2147483647,
+              "两个阈值均可取原有整数上限");
+
+        const char* invalid[] = {"", "-1,2", "1,-2", ",2", "1,", "1,2,3", "6000x", "6000,5000x",
+                                 "6000, 5000", "2147483648", "9223372036854775808"};
+        for (const char* value : invalid) {
+            ConversationCacheTokenLimits rejected;
+            check(!parse_conversation_cache_min_tokens(value, rejected), "拒绝非法或越界阈值");
+        }
+
+        check(!conversation_cache_should_read_parked(4999, 5000), "4999 低于 READ 门槛时跳过自动候选");
+        check(conversation_cache_should_read_parked(5000, 5000), "5000 达到 READ 门槛时查找自动候选");
+        check(conversation_cache_should_read_parked(4999, 0), "READ=0 保持自动候选读取");
+        const int64_t cached_history_tokens = 25967;
+        const int64_t new_message_tokens = 33;
+        check(conversation_cache_should_read_parked(cached_history_tokens + new_message_tokens, 26000) &&
+              !conversation_cache_should_read_parked(new_message_tokens, 26000),
+              "READ 按含缓存历史的完整 26000-token 输入判断，而非 33-token 新消息");
+
+        ConversationCache writable(1024, 4, 6000);
+        check(!conversation_cache_should_read_parked(33, 5000) && writable.wants(6000),
+              "短 incoming 跳过读取但不抑制符合 WRITE 的长 outgoing 保存");
+        ConversationCheckpoint active;
+        active.ids = {1, 2, 3, 4};
+        const std::vector<int64_t> active_prompt{1, 2, 3, 4, 5};
+        const std::vector<ConversationImageKey> no_images;
+        check(!conversation_cache_should_read_parked(4, 5000) &&
+              conversation_prefix(active, active_prompt, no_images) == 4,
+              "READ 门槛以下仍可复用活动会话前缀");
+    }
+    {
         // layer-split parking: checkpoints moved apart into stage parts and put back, no running state copied
         auto running = [](std::initializer_list<int32_t> ids, uint8_t salt, size_t parts) {
             ConversationCheckpoint c;

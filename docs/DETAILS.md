@@ -1246,8 +1246,9 @@ whose own checksum fails, is removed when the directory is scanned. The identity
 configuration fingerprint the session files below are bound to, so a spilled conversation and a hand-saved session
 file are interchangeable.
 
-The identity fingerprint follows the resolved configuration, so an engine rebuild or a config change (new flags, a
-different `--kv` or rope setting) makes every file already in the directory a foreign identity. Those files are
+The identity fingerprint covers the engine version and the resolved configuration, so changing either one - a
+Strata upgrade, or a config change (new flags, a different `--kv` or rope setting) - makes every file already in
+the directory a foreign identity. Rebuilding the same version with the same config does not orphan anything. Those files are
 **kept** — never auto-deleted, not indexed, and outside `--conversation-cache-disk-mib`'s budget, so the disk
 space they hold is invisible to the eviction and only the startup warning (`spill file(s) ... belong to another
 model/config identity`) reports their count and bytes. Use one spill directory per model **and** config, and when

@@ -13,7 +13,16 @@
 #include <sstream>
 #include <system_error>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <climits>
+#else
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -26,6 +35,29 @@ namespace {
 constexpr char kMetaMagic[4] = {'S', 'C', 'S', 'M'};   // Strata conversation-spill metadata
 constexpr uint32_t kMetaVersion = 1;
 constexpr size_t kMaxSidecarEntries = 256;
+
+#if defined(_WIN32)
+// the session files' helpers (conversation_file.cpp, same anonymous-namespace shape): paths reach the engine as
+// UTF-8 - invalid UTF-8 is refused, not replaced - and API errors become a message without trailing whitespace
+bool wide(const std::string& s, std::wstring& w) {
+    w.clear();
+    if (s.empty()) return true;
+    if (s.size() > (size_t) INT_MAX) return false;
+    const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int) s.size(), nullptr, 0);
+    if (n <= 0) return false;
+    w.assign((size_t) n, L'\0');
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int) s.size(), w.data(), n) == n;
+}
+
+std::string last_error(DWORD code = GetLastError()) {
+    char msg[256] = {};
+    const DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, code, 0, msg,
+                                   sizeof msg, nullptr);
+    std::string s(msg, n);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '.')) s.pop_back();
+    return s.empty() ? "error " + std::to_string(code) : s;
+}
+#endif
 
 // A small length-delimited writer/reader for the sidecar, with a trailing hash of the payload (the same
 // SessionHasher the session file uses) so a truncated or edited sidecar is refused rather than trusted.
@@ -146,13 +178,24 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
     // are (conversation_file.cpp RawFile::create_new) - exclusive, never following a link, owner-only (0600) -
     // not by truncating whatever a name happens to point at.
 #if defined(_WIN32)
-    {   // Windows: permissions follow the containing directory
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) { error = "cannot create spill sidecar"; return false; }
-        out.write(bytes.data(), (std::streamsize) bytes.size());
-        out.flush();
-        if (!out) { error = "cannot write spill sidecar"; return false; }
+    // the session files' safe creation (conversation_file.cpp RawFile::create_new): CREATE_NEW never truncates an
+    // existing file or follows a link - the path is converted UTF-8 -> UTF-16 first
+    std::wstring w;
+    if (!wide(temporary.string(), w)) { error = "cannot create spill sidecar: the path is not valid UTF-8"; return false; }
+    const HANDLE h = CreateFileW(w.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { error = "cannot create spill sidecar: " + last_error(); return false; }
+    bool ok = true;
+    size_t off = 0;
+    while (ok && off < bytes.size()) {
+        DWORD wrote = 0;
+        const DWORD want = (DWORD) std::min<size_t>(bytes.size() - off, size_t(1) << 30);
+        if (!WriteFile(h, bytes.data() + off, want, &wrote, nullptr) || wrote == 0) ok = false;
+        else off += (size_t) wrote;
     }
+    if (!ok) error = "cannot write spill sidecar: " + last_error();
+    if (CloseHandle(h) == 0 && ok) { ok = false; error = "cannot write spill sidecar: " + last_error(); }
+    if (!ok) { std::error_code rm; std::filesystem::remove(temporary, rm); return false; }
 #else
     const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) { error = std::string("cannot create spill sidecar: ") + std::strerror(errno); return false; }

@@ -1212,14 +1212,11 @@ keeps one conversation holding the pin. When the outgoing conversation fits only
 in the parked one's room, it keeps its place and the parked one is moved in
 whole, as before.
 Oversized snapshots or host allocation failures fall back to ordinary prompt processing.
-`--conversation-cache-min-tokens N` (default 0 = park every conversation) parks only conversations of at least N
-tokens. A parked conversation costs one of the slots whatever its length, and parking is a switch-time decision, so a
-client that interleaves short side requests with one long conversation spends the cache on the side requests and, once
-it is full, evicts the long one oldest-first - exactly the reuse it wanted. Setting the minimum above the side
-requests' length keeps the long conversation parked. The check runs before `make_room()`, so a skipped park evicts
-nothing and stores nothing; the log line is `conversation cache: skip parking (N tokens, below the M minimum;
-parked=P)`. 0 is the pre-flag behaviour and the flag leaves the answers untouched - it only decides which
-conversations keep a slot.
+`--conversation-cache-min-tokens WRITE[,READ]` 分别设置会话离开时的最小保存长度（WRITE）与自动读取驻留会话的最小输入长度（READ）。WRITE 延续原有规则：0 不设下限；否则仅当离开的会话达到阈值才保存，因此短输入不会阻止符合 WRITE 的长会话保存。
+
+READ 为 0 时不限制自动读取；非 0 时，按请求完整 token 序列计数（含已缓存历史），达到阈值才搜索驻留 RAM/磁盘候选。低于阈值时不查自动 RAM/磁盘候选，不扫描磁盘索引或根前缀，也不做磁盘失败后的 RAM 重试；活动会话、检查点和批处理槽复用不受影响。READ 不影响满足 WRITE 的离开会话保存，n-min、相似度等候选匹配规则保持不变。
+
+单值 `N` 等同 `N,0`，旧配置行为不变；默认仍为 `0,0`。例如 `6000,5000` 表示离开的会话至少 6000 tokens 才保存，完整输入达到 5000 tokens 才搜索驻留会话。WRITE 与 READ 各自判断，互不短路。
 `--conversation-cache-park-gain N` (opt-in, default 0 = park every turn) parks a conversation again only after it
 advanced N tokens past the copy it would supersede; a turn that grew by a few hundred tokens keeps the older copy
 instead of writing a whole snapshot that the next turn drops. The cost is that a resume from the older copy reads up
@@ -1367,11 +1364,12 @@ comes back, it is read the way a streaming RESTORE reads it: a read pass checks 
 GPU changes (a bad file is dropped and the prompt is read as usual), then the K/V goes into the pools 16 MiB at a
 time. The new file is written before the conversation's older copies are removed, so a failed write loses nothing,
 and no conversation is refused for its size: `--conversation-cache-disk-mib` is the only limit. The agent's next
-turn of the same conversation (it resumes at the newest turn checkpoint) writes nothing. `--conversation-cache-min-tokens`
-gates the disk writes too: a conversation shorter than N tokens is never written to the spill directory (the switch
-save and the clean-shutdown flush are both skipped). A clean shutdown saves the
-live conversation (flushed), so the next start continues it. Single GPU, without `--batch` or `--peer-device`.
-
+turn of the same conversation (it resumes at the newest turn checkpoint) writes nothing. `WRITE` in
+`--conversation-cache-min-tokens WRITE[,READ]` gates switch-time disk saves and the clean-shutdown flush using the
+outgoing conversation length. `READ` gates only automatic parked-session lookup: below its threshold the engine does
+not search or restore disk/RAM candidates, while active-session reuse and eligible outgoing saves remain independent.
+A clean shutdown saves the live conversation when it meets WRITE, so the next start continues it. Single GPU, without
+`--batch` or `--peer-device`.
 Measured on a Ryzen AI Max+ 395 (gfx1151, the iGPU alone, internal NVMe; Qwen3.8-Flash-Next with K-quant experts,
 `--spec 4 --mtp --lookup-chain 3 --kv int8`). Three agent conversations take turns, each a 9-12K-token first prompt
 plus ~1.1K tokens a turn, with an engine restart after 9 requests:

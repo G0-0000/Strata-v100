@@ -785,6 +785,7 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) 
     disk_only = info.get("conversation_cache_disk_only") == 1
     last = hist[-1] if hist else None
     return {"enabled": disk_only or (isinstance(mib, int) and mib > 0), "disk_only": disk_only,
+            "disk_delta": info.get("conversation_cache_disk_delta") == 1,
             "disk_budget_mib": info.get("conversation_cache_disk_mib"),
             "budget_mib": mib if isinstance(mib, int) else None,
             "slots": info.get("conversation_cache_slots"), **parked,

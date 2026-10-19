@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -232,9 +233,9 @@ struct SavedConversation {
     }
 };
 
-template<class Token>
-int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
-                            const std::vector<ConversationImageKey>& images) {
+template<class Token, class TokenAllocator, class ImageAllocator = std::allocator<ConversationImageKey>>
+int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token, TokenAllocator>& prompt,
+                            const std::vector<ConversationImageKey, ImageAllocator>& images) {
     const size_t n = c.ids.size();
     // The last prompt token always starts the next verify window.
     if (n == 0 || n >= prompt.size() || !std::equal(c.ids.begin(), c.ids.end(), prompt.begin())) return 0;
@@ -249,9 +250,9 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
 
 // The same prefix test against only the first n ids of the checkpoint: a parked conversation's checkpoints are
 // prefixes of its live ids, so a shorter resume point is checked without copying the ids.
-template<class Token>
-int64_t conversation_prefix_at(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
-                               const std::vector<ConversationImageKey>& images, size_t n) {
+template<class Token, class TokenAllocator, class ImageAllocator = std::allocator<ConversationImageKey>>
+int64_t conversation_prefix_at(const ConversationCheckpoint& c, const std::vector<Token, TokenAllocator>& prompt,
+                               const std::vector<ConversationImageKey, ImageAllocator>& images, size_t n) {
     // The last prompt token always starts the next verify window.
     if (n == 0 || n >= prompt.size() || n > c.ids.size() ||
         !std::equal(c.ids.begin(), c.ids.begin() + n, prompt.begin())) return 0;
@@ -268,9 +269,9 @@ int64_t conversation_prefix_at(const ConversationCheckpoint& c, const std::vecto
 
 // The longest common prefix of a cached conversation and the prompt, in tokens. Unlike conversation_prefix this
 // does not require the whole cached ids to match: it is the resume point a similarity hit would give.
-template<class Token>
-int64_t conversation_lcp(const ConversationCheckpoint& cached, const std::vector<Token>& prompt,
-                         const std::vector<ConversationImageKey>& images) {
+template<class Token, class TokenAllocator, class ImageAllocator = std::allocator<ConversationImageKey>>
+int64_t conversation_lcp(const ConversationCheckpoint& cached, const std::vector<Token, TokenAllocator>& prompt,
+                         const std::vector<ConversationImageKey, ImageAllocator>& images) {
     size_t n = std::min(cached.ids.size(), prompt.size());
     size_t i = 0;
     while (i < n && cached.ids[i] == prompt[i]) ++i;
@@ -303,10 +304,10 @@ struct ConversationMatch {
 
 // The best resume a parked image offers for this prompt. similarity is the least LCP/new-prompt fraction accepted
 // (0 keeps every exact-prefix hit); n_min the least common-prefix tokens. A hit longer than the LCP is never offered.
-template<class Token>
+template<class Token, class TokenAllocator, class ImageAllocator = std::allocator<ConversationImageKey>>
 ConversationMatch conversation_saved_match(const SavedConversation& saved,
-                                           const std::vector<Token>& prompt,
-                                           const std::vector<ConversationImageKey>& images,
+                                           const std::vector<Token, TokenAllocator>& prompt,
+                                           const std::vector<ConversationImageKey, ImageAllocator>& images,
                                            bool cvec, double similarity, int64_t n_min) {
     ConversationMatch best;
     if (saved.cvec != cvec || prompt.empty() || similarity < 0.0 || similarity >= 1.0) return best;
@@ -323,11 +324,12 @@ ConversationMatch conversation_saved_match(const SavedConversation& saved,
 
 // The same match from a spill directory's metadata only (no K/V read): the live ids and images plus each
 // checkpoint's length, exactly what a parked image's checkpoints are prefixes of.
-template<class Token>
+template<class Token, class LengthAllocator, class TokenAllocator,
+         class ImageAllocator = std::allocator<ConversationImageKey>>
 ConversationMatch conversation_metadata_match(const ConversationCheckpoint& live,
-                                              const std::vector<size_t>& checkpoint_lengths,
-                                              const std::vector<Token>& prompt,
-                                              const std::vector<ConversationImageKey>& images,
+                                               const std::vector<size_t, LengthAllocator>& checkpoint_lengths,
+                                               const std::vector<Token, TokenAllocator>& prompt,
+                                               const std::vector<ConversationImageKey, ImageAllocator>& images,
                                               bool cvec, bool cached_cvec,
                                               double similarity, int64_t n_min) {
     ConversationMatch best;
@@ -387,8 +389,9 @@ public:
                entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
     }
 
-    template<class Token>
-    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
+    template<class Token, class TokenAllocator, class ImageAllocator = std::allocator<ConversationImageKey>>
+    Match best(const std::vector<Token, TokenAllocator>& prompt,
+               const std::vector<ConversationImageKey, ImageAllocator>& images, bool cvec,
                double similarity = 0.0, int64_t n_min = 0) const {
         Match best;
         // Ties prefer the most recently parked branch. The caller prefers its

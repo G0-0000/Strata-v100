@@ -5,12 +5,14 @@
 #include "strata/core/conversation_spill.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <new>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 
 #if defined(_WIN32)
@@ -33,8 +35,20 @@ namespace strata::core {
 namespace {
 
 constexpr char kMetaMagic[4] = {'S', 'C', 'S', 'M'};   // Strata conversation-spill metadata
-constexpr uint32_t kMetaVersion = 1;
+constexpr uint32_t kMetaVersion = 2;                   // v1 (read for compatibility) has no last_used field
+constexpr uint32_t kMetaVersionMin = 1;
 constexpr size_t kMaxSidecarEntries = 256;
+
+// The last-use stamp: wall-clock milliseconds, so the order survives a restart (a steady clock would start over).
+uint64_t now_ms() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// The chain manifest beside a delta log: base file size, committed log length, and a hash over both.
+constexpr char kChainMagic[8] = {'S', 'C', 'D', 'C', 'H', 'A', 'I', '\x01'};
+constexpr uint64_t kChainVersion = 1;
+constexpr uint64_t kChainFile = 40;                     // magic + version + base + committed + hash
 
 #if defined(_WIN32)
 // the session files' helpers (conversation_file.cpp, same anonymous-namespace shape): paths reach the engine as
@@ -117,24 +131,82 @@ bool valid_meta_chain(const ConversationCheckpoint& live, const std::vector<size
     return true;
 }
 
+struct PathInfo {
+    bool inspected = true;
+    bool exists = false;
+    bool regular = false;
+    uint64_t bytes = 0;
+};
+
+// symlink_status is deliberate: cache artifacts must be regular files, and accounting must never follow a link to
+// somebody else's file.  A non-regular path is reported as existing but has no target size attributed to it.
+PathInfo inspect_path_nofollow(const std::filesystem::path& path) {
+    PathInfo info;
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory) {
+        ec.clear();
+        return info;
+    }
+    if (ec) { info.inspected = false; return info; }
+    if (status.type() == std::filesystem::file_type::not_found) return info;
+    info.exists = true;
+    if (!std::filesystem::is_regular_file(status)) return info;
+    info.regular = true;
+    info.bytes = std::filesystem::file_size(path, ec);
+    if (ec) { info.inspected = false; info.regular = false; info.bytes = 0; }
+    return info;
+}
+
+bool read_chain_header(const std::filesystem::path& chain, uint64_t& base_size, uint64_t& committed,
+                       std::string& error) {
+    error.clear();
+    const PathInfo info = inspect_path_nofollow(chain);
+    if (!info.inspected || !info.regular || info.bytes != kChainFile) {
+        error = "spill chain manifest is missing, non-regular or malformed";
+        return false;
+    }
+    std::ifstream in(chain, std::ios::binary);
+    if (!in) { error = "cannot open the spill chain manifest"; return false; }
+    uint8_t buf[kChainFile];
+    in.read(reinterpret_cast<char*>(buf), (std::streamsize) kChainFile);
+    if (in.gcount() != (std::streamsize) kChainFile) { error = "truncated spill chain manifest"; return false; }
+    if (std::memcmp(buf, kChainMagic, 8) != 0) { error = "unknown spill chain manifest"; return false; }
+    uint64_t version = 0, hash = 0;
+    std::memcpy(&version, buf + 8, 8);
+    std::memcpy(&base_size, buf + 16, 8);
+    std::memcpy(&committed, buf + 24, 8);
+    std::memcpy(&hash, buf + 32, 8);
+    if (version != kChainVersion || hash != session_hash64(buf, 32, 0) || committed == 0) {
+        error = "spill chain manifest checksum or length mismatch";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity,
-                                          std::string& error) const {
+                                           bool& stamped, std::string& error) const {
     other_identity = false;
-    std::error_code ec;
-    const uint64_t file_bytes = std::filesystem::file_size(meta, ec);
-    if (ec || file_bytes < 4 + 4 + 16 + 8) { error = "spill sidecar is missing or too short"; return false; }
+    stamped = false;
+    const PathInfo meta_info = inspect_path_nofollow(meta);
+    const uint64_t file_bytes = meta_info.bytes;
+    if (!meta_info.inspected || !meta_info.regular || file_bytes < 4 + 4 + 16 + 8) {
+        error = "spill sidecar is missing, non-regular or too short";
+        return false;
+    }
     std::ifstream in(meta, std::ios::binary);
     if (!in) { error = "cannot open spill sidecar"; return false; }
     MetaReader r(in, file_bytes);
     char magic[4];
     uint64_t version = 0;
     uint64_t model = 0, config = 0;
-    if (!r.raw(magic, 4) || std::memcmp(magic, kMetaMagic, 4) != 0 || !r.u64(version) || version != kMetaVersion ||
-        !r.u64(model) || !r.u64(config)) {
+    if (!r.raw(magic, 4) || std::memcmp(magic, kMetaMagic, 4) != 0 || !r.u64(version) ||
+        version < kMetaVersionMin || version > kMetaVersion || !r.u64(model) || !r.u64(config)) {
         error = "unknown spill sidecar magic or version"; return false;
     }
+    stamped = version >= kMetaVersion;   // the v2 sidecar carries the persisted last-use stamp
     if (model != identity_.model || config != identity_.config) { other_identity = true; return false; }
     uint64_t cvec = 0;
     if (!r.u64(cvec) || cvec > 1) { error = "invalid cvec flag in sidecar"; return false; }
@@ -152,18 +224,22 @@ bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Ent
     if (!r.u64(n) || n > kMaxSidecarEntries) { error = "invalid checkpoint count in sidecar"; return false; }
     entry.checkpoint_lengths.reserve((size_t) n);
     for (uint64_t i = 0; i < n; ++i) { uint64_t len = 0; if (!r.u64(len)) { error = "truncated sidecar checkpoints"; return false; } entry.checkpoint_lengths.push_back((size_t) len); }
+    entry.last_used = 0;   // a v1 sidecar predates the stamp: the unknown age sorts as the oldest
+    if (version >= 2 && !r.u64(entry.last_used)) { error = "truncated sidecar last-use stamp"; return false; }
     if (!r.finish()) { error = "spill sidecar checksum or length mismatch"; return false; }
     if (!valid_meta_chain(entry.live_meta, entry.checkpoint_lengths)) { error = "spill sidecar is not a valid prefix chain"; return false; }
     return true;
 }
 
-bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, const Entry& entry, std::string& error) const {
+bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, const Entry& entry, std::string& error,
+                                           bool with_last_used) const {
     const std::filesystem::path temporary(meta.string() + ".tmp");
     std::ostringstream payload;
     {
         MetaWriter w(payload);
-        if (!w.raw(kMetaMagic, 4) || !w.u64(kMetaVersion) || !w.u64(identity_.model) || !w.u64(identity_.config) ||
-            !w.u64(entry.cvec ? 1 : 0) || !w.u64(entry.live_meta.ids.size())) {
+        if (!w.raw(kMetaMagic, 4) ||
+            !w.u64(with_last_used ? kMetaVersion : kMetaVersionMin) || !w.u64(identity_.model) ||
+            !w.u64(identity_.config) || !w.u64(entry.cvec ? 1 : 0) || !w.u64(entry.live_meta.ids.size())) {
             error = "cannot write spill sidecar"; return false;
         }
         for (int32_t id : entry.live_meta.ids) if (!w.i64(id)) { error = "cannot write spill sidecar ids"; return false; }
@@ -171,6 +247,7 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
         for (const auto& k : entry.live_meta.imgs) if (!w.i64(k.start) || !w.u64(k.hash)) { error = "cannot write spill sidecar images"; return false; }
         if (!w.u64(entry.checkpoint_lengths.size())) { error = "cannot write spill sidecar"; return false; }
         for (size_t len : entry.checkpoint_lengths) if (!w.u64(len)) { error = "cannot write spill sidecar checkpoints"; return false; }
+        if (with_last_used && !w.u64(entry.last_used)) { error = "cannot write spill sidecar last-use stamp"; return false; }
         if (!w.finish()) { error = "cannot finish spill sidecar"; return false; }
     }
     const std::string bytes = payload.str();
@@ -222,13 +299,14 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
 }
 
 bool ConversationSpillCache::open(const std::filesystem::path& directory, SessionFileIdentity identity,
-                                  uint64_t budget_bytes, std::string& error) {
+                                  uint64_t budget_bytes, std::string& error, bool delta_chains) {
     enabled_ = false;
     stale_files_wiped_ = 0;
     disk_evictions_ = 0;
     entries_.clear();
     bytes_ = 0;
     pinned_path_.clear();
+    delta_ = delta_chains;
     directory_ = directory;
     identity_ = identity;
     budget_ = budget_bytes;
@@ -253,64 +331,163 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
         }
         std::vector<std::filesystem::path> metas;
         for (std::filesystem::directory_iterator it(directory_, ec), end; !ec && it != end; it.increment(ec)) {
-            const auto status = it->symlink_status(ec);
-            if (ec) break;
             const std::string name = it->path().filename().string();
-            // the writer's temporary beside a spill file is hidden (".<name>.<hex>.tmp", conversation_file.cpp),
-            // and a process killed mid-write leaves it behind: this scan is the only thing that removes it.
             const bool ours = name.rfind("strata-conv-", 0) == 0 || name.rfind(".strata-conv-", 0) == 0;
             if (!ours) continue;
-            if (!std::filesystem::is_regular_file(status)) continue;
-            if (it->path().extension() == ".meta") metas.push_back(it->path());
-            else if (it->path().extension() == ".tmp") { std::filesystem::remove(it->path(), ec); if (!ec) ++stale_files_wiped_; ec.clear(); }
+            const PathInfo info = inspect_path_nofollow(it->path());
+            if (!info.inspected) { ec = std::make_error_code(std::errc::io_error); break; }
+            // the session writer's hidden temp and our fixed sidecar/manifest temps are only removed when they are
+            // regular files; a symlink is never followed or mistaken for one of our files.
+            if (it->path().extension() == ".meta" && info.regular) metas.push_back(it->path());
+            else if (it->path().extension() == ".tmp" && info.regular) {
+                std::error_code rm;
+                if (std::filesystem::remove(it->path(), rm) && !rm) ++stale_files_wiped_;
+            }
         }
         if (ec) { error = "cannot scan spill directory " + directory_.string(); return false; }
         std::sort(metas.begin(), metas.end());
         size_t stale = stale_files_wiped_;
-        size_t foreign = 0;                 // sidecars naming another model/config identity: kept, not indexed
+        size_t foreign = 0;
         uint64_t foreign_bytes = 0;
+        auto initialize_unparsed_entry = [&](Entry& entry, const PathInfo& meta_info) {
+            const PathInfo session = inspect_path_nofollow(entry.session_path());
+            const PathInfo dlog = inspect_path_nofollow(entry.delta_path());
+            const PathInfo chain = inspect_path_nofollow(entry.chain_path());
+            entry.file_bytes = session.regular ? session.bytes : 0;
+            entry.delta_accounted_bytes = dlog.regular ? dlog.bytes : 0;
+            entry.meta_bytes = meta_info.regular ? meta_info.bytes : 0;
+            entry.chain_file_bytes = chain.regular ? chain.bytes : 0;
+            entry.has_chain = dlog.exists || chain.exists;
+            entry.complete = false;
+        };
+        auto clean_or_retain = [&](Entry& entry) {
+            uint64_t removed = 0;
+            std::vector<std::string> left;
+            if (remove_group(entry, removed, left)) {
+                ++stale;
+                return;
+            }
+            entry.complete = false;
+            bytes_ += entry.total_bytes();
+            std::fprintf(stderr, "strata serve: conversation cache: incomplete owned spill entry retained for cleanup: %s\n",
+                         entry.stem.string().c_str());
+            for (const auto& path : left)
+                std::fprintf(stderr, "  retained spill artifact: %s\n", path.c_str());
+            entries_.push_back(std::move(entry));
+        };
         for (const auto& meta : metas) {
             Entry entry;
             entry.stem = meta;
-            entry.stem.replace_extension();   // drop ".meta" -> the shared stem
+            entry.stem.replace_extension();
             entry.prefix = entry.stem.filename().string().rfind("strata-conv-prefix-", 0) == 0;
+            const PathInfo meta_info = inspect_path_nofollow(meta);
             bool other_identity = false;
+            bool stamped = false;
             std::string parse_error;
-            if (!read_sidecar(meta, entry, other_identity, parse_error)) {
+            if (!read_sidecar(meta, entry, other_identity, stamped, parse_error)) {
                 if (other_identity) {
-                    // Kept (never deleted), not indexed and outside the disk budget - but counted, so a rebuild or a
-                    // config change does not leave the operator guessing where the disk space went.
+                    // A foreign identity is kept, not indexed and outside this identity's budget. Count only regular
+                    // files without following links so the warning never attributes an external target to this cache.
                     ++foreign;
-                    std::error_code fec;
-                    if (const auto s = std::filesystem::file_size(entry.session_path(), fec); !fec) foreign_bytes += s;
-                    if (const auto s = std::filesystem::file_size(meta, fec); !fec) foreign_bytes += s;
+                    for (const auto& path : {entry.session_path(), meta.string(), entry.delta_path(), entry.chain_path()}) {
+                        const PathInfo info = inspect_path_nofollow(path);
+                        if (info.regular) foreign_bytes += info.bytes;
+                    }
                     continue;
                 }
-                std::filesystem::remove(meta, ec); ec.clear();
-                std::filesystem::remove(entry.session_path(), ec); ec.clear();
-                ++stale;
+                initialize_unparsed_entry(entry, meta_info);
+                clean_or_retain(entry);
                 continue;
             }
-            std::error_code sec;
-            const uint64_t session_bytes = std::filesystem::file_size(entry.session_path(), sec);
-            if (sec) { std::filesystem::remove(meta, ec); ec.clear(); ++stale; continue; }   // session file gone: sidecar is useless
-            entry.file_bytes = session_bytes;
-            if (session_bytes > budget_) { std::filesystem::remove(meta, ec); ec.clear(); std::filesystem::remove(entry.session_path(), ec); ec.clear(); ++stale; continue; }
+
+            const PathInfo session = inspect_path_nofollow(entry.session_path());
+            const PathInfo dlog = inspect_path_nofollow(entry.delta_path());
+            const PathInfo chain = inspect_path_nofollow(entry.chain_path());
+            if (!session.inspected || !dlog.inspected || !chain.inspected || !meta_info.regular) {
+                initialize_unparsed_entry(entry, meta_info);
+                clean_or_retain(entry);
+                continue;
+            }
+            entry.file_bytes = session.regular ? session.bytes : 0;
+            // v1 sidecars were never part of the baseline disk budget; only a stamped v2 sidecar is charged.
+            entry.meta_bytes = stamped ? meta_info.bytes : 0;
+            entry.has_chain = dlog.exists || chain.exists;
+            entry.complete = session.regular;
+
+            if (entry.has_chain) {
+                uint64_t manifest_base = 0, manifest_committed = 0;
+                std::string chain_error;
+                const bool header_valid = chain.regular &&
+                    read_chain_header(entry.chain_path(), manifest_base, manifest_committed, chain_error);
+                if (header_valid) {
+                    entry.delta_bytes = manifest_committed;
+                    entry.delta_accounted_bytes = dlog.regular ? dlog.bytes : (dlog.exists ? manifest_committed : 0);
+                    entry.chain_file_bytes = chain.bytes;
+                } else {
+                    entry.delta_accounted_bytes = dlog.regular ? dlog.bytes : 0;
+                    entry.chain_file_bytes = chain.regular ? chain.bytes : 0;
+                }
+                uint64_t committed = 0;
+                if (!entry.complete || !dlog.regular || !chain.regular ||
+                    !read_chain(entry.chain_path(), entry.file_bytes, entry.delta_path(), committed, chain_error)) {
+                    entry.complete = false;
+                } else {
+                    entry.delta_bytes = committed;
+                    entry.delta_accounted_bytes = dlog.bytes;
+                    entry.chain_file_bytes = chain.bytes;
+                }
+            }
+
+            if (!entry.complete) {
+                clean_or_retain(entry);
+                continue;
+            }
+            // A new-format entry that cannot fit alone is cleaned up. A v1/plain legacy entry stays on the original
+            // path: its sidecar is uncharged and the baseline eviction policy enforces the session-file budget.
+            if (!(entry.has_chain && !delta_) && (entry.has_chain || entry.meta_bytes != 0) &&
+                entry.total_bytes() > budget_) {
+                clean_or_retain(entry);
+                continue;
+            }
+            const uint64_t total = entry.total_bytes();
             entries_.push_back(std::move(entry));
-            bytes_ += session_bytes;
+            bytes_ += total;
             enforce_budget();
         }
-        // session files with no sidecar left behind (a crash between the two writes) go too.
+
+        // Artifacts without a sidecar cannot be hits. Clean regular owned leftovers as one group; if an item cannot
+        // be removed, retain an incomplete ledger entry so a later open/erase can report and retry it.
+        std::vector<std::filesystem::path> orphan_stems;
         for (std::filesystem::directory_iterator it(directory_, ec), end; !ec && it != end; it.increment(ec)) {
-            const auto status = it->symlink_status(ec);
-            if (ec) break;
             const std::string name = it->path().filename().string();
-            if (name.rfind("strata-conv-", 0) != 0 || it->path().extension() != ".sess") continue;
-            if (!std::filesystem::is_regular_file(status)) continue;
+            if (name.rfind("strata-conv-", 0) != 0) continue;
+            const auto ext = it->path().extension();
+            if (ext != ".sess" && ext != ".dlog" && ext != ".dchain") continue;
             std::filesystem::path meta = it->path();
             meta.replace_extension(".meta");
-            if (std::filesystem::exists(meta, ec) && !ec) continue;
-            std::filesystem::remove(it->path(), ec); ec.clear(); ++stale;
+            const PathInfo meta_info = inspect_path_nofollow(meta);
+            if (!meta_info.inspected) { ec = std::make_error_code(std::errc::io_error); break; }
+            if (meta_info.exists) continue;  // a symlink/invalid sidecar is not a plain snapshot either
+            std::filesystem::path stem = it->path();
+            stem.replace_extension();
+            orphan_stems.push_back(std::move(stem));
+        }
+        if (ec) { error = "cannot scan spill directory " + directory_.string(); return false; }
+        std::sort(orphan_stems.begin(), orphan_stems.end());
+        orphan_stems.erase(std::unique(orphan_stems.begin(), orphan_stems.end()), orphan_stems.end());
+        for (const auto& stem : orphan_stems) {
+            Entry entry;
+            entry.stem = stem;
+            entry.prefix = stem.filename().string().rfind("strata-conv-prefix-", 0) == 0;
+            entry.complete = false;
+            const PathInfo session = inspect_path_nofollow(entry.session_path());
+            const PathInfo dlog = inspect_path_nofollow(entry.delta_path());
+            const PathInfo chain = inspect_path_nofollow(entry.chain_path());
+            entry.file_bytes = session.regular ? session.bytes : 0;
+            entry.delta_accounted_bytes = dlog.regular ? dlog.bytes : 0;
+            entry.chain_file_bytes = chain.regular ? chain.bytes : 0;
+            entry.has_chain = dlog.exists || chain.exists;
+            clean_or_retain(entry);
         }
         if (foreign > 0)
             std::fprintf(stderr, "strata serve: conversation cache: WARNING: %zu spill file(s) (~%llu MiB) belong to "
@@ -332,9 +509,45 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
     }
 }
 
+void ConversationSpillCache::adjust_bytes(uint64_t before, uint64_t after) {
+    if (after >= before) {
+        bytes_ += after - before;
+        return;
+    }
+    const uint64_t debit = before - after;
+    if (debit > bytes_) throw std::logic_error("spill disk accounting underflow");
+    bytes_ -= debit;
+}
+
+bool ConversationSpillCache::entry_files_valid(const Entry& entry) const {
+    if (!entry.complete) return false;
+    const PathInfo session = inspect_path_nofollow(entry.session_path());
+    const PathInfo meta = inspect_path_nofollow(entry.meta_path());
+    if (!session.inspected || !session.regular || !meta.inspected || !meta.regular ||
+        session.bytes != entry.file_bytes) return false;
+    const PathInfo dlog = inspect_path_nofollow(entry.delta_path());
+    const PathInfo chain = inspect_path_nofollow(entry.chain_path());
+    if (!dlog.inspected || !chain.inspected) return false;
+    if (!entry.has_chain) return !dlog.exists && !chain.exists;
+    if (!dlog.regular || !chain.regular) return false;
+    uint64_t committed = 0;
+    std::string error;
+    return read_chain(entry.chain_path(), entry.file_bytes, entry.delta_path(), committed, error) &&
+           committed == entry.delta_bytes;
+}
+
 bool ConversationSpillCache::load(const std::string& path, SavedConversation& image, const SessionReadLimits& limits,
                                   std::string& error) const {
     if (!enabled_) { error = "spill cache is disabled"; return false; }
+    const size_t index = find(path);
+    if (index >= entries_.size()) {
+        error = "spill entry is missing, incomplete, or unsupported by this restore mode";
+        return false;
+    }
+    if (entries_[index].has_chain) {
+        error = "delta-chain entries require the streaming chain restore path";
+        return false;
+    }
     size_t bytes = 0;
     return session_file_read(path, identity_, image, bytes, error, limits);
 }
@@ -344,7 +557,8 @@ std::filesystem::path ConversationSpillCache::next_stem(bool prefix) {
     std::filesystem::path stem;
     do {
         stem = directory_ / ((prefix ? "strata-conv-prefix-" : "strata-conv-") + std::to_string(++serial_));
-    } while (std::filesystem::exists(stem.string() + ".sess", ec) || std::filesystem::exists(stem.string() + ".meta", ec));
+    } while (std::filesystem::exists(stem.string() + ".sess", ec) || std::filesystem::exists(stem.string() + ".meta", ec) ||
+             std::filesystem::exists(stem.string() + ".dlog", ec) || std::filesystem::exists(stem.string() + ".dchain", ec));
     return stem;
 }
 
@@ -357,20 +571,32 @@ bool ConversationSpillCache::index_written(const std::filesystem::path& stem, ui
     Entry entry;
     entry.stem = stem;
     entry.file_bytes = file_bytes;
+    entry.last_used = delta_ ? now_ms() : 0;   // a save is the newest use; delta-off writes the baseline v1 sidecar,
+                                               // which carries no stamp, so the entry stays at the unknown age
     entry.prefix = prefix;
     entry.cvec = meta.cvec;
     entry.live_meta.ids = meta.live.ids;
     entry.live_meta.imgs = meta.live.imgs;
     entry.checkpoint_lengths.reserve(meta.checkpoints.size());
     for (const auto& c : meta.checkpoints) entry.checkpoint_lengths.push_back(c.ids.size());
-    if (!write_sidecar(stem.string() + ".meta", entry, error)) { std::filesystem::remove(session, ec); return false; }
+    if (!write_sidecar(stem.string() + ".meta", entry, error, delta_)) { std::filesystem::remove(session, ec); return false; }
+    if (delta_) {
+        const PathInfo meta = inspect_path_nofollow(entry.meta_path());
+        if (!meta.inspected || !meta.regular) {
+            std::filesystem::remove(session, ec);
+            std::filesystem::remove(entry.meta_path(), ec);
+            error = "cannot account the written spill sidecar";
+            return false;
+        }
+        entry.meta_bytes = meta.bytes;
+    }
     try {
         entries_.push_back(std::move(entry));
     } catch (const std::bad_alloc&) {
         std::filesystem::remove(session, ec); std::filesystem::remove(stem.string() + ".meta", ec);
         error = "not enough RAM to index conversation spill file"; return false;
     }
-    bytes_ += file_bytes;
+    bytes_ += entries_.back().total_bytes();
     enforce_budget();
     return true;
 }
@@ -415,7 +641,8 @@ bool ConversationSpillCache::spill_streamed(const SavedConversation& meta, const
 bool ConversationSpillCache::has_prefix(const ConversationIds& ids, const std::vector<ConversationImageKey>& images,
                                         bool cvec) const {
     for (const Entry& e : entries_)
-        if (e.prefix && e.cvec == cvec && e.live_meta.ids == ids && e.live_meta.imgs == images) return true;
+        if (e.prefix && e.complete && !(e.has_chain && !delta_) && entry_files_valid(e) && e.cvec == cvec &&
+            e.live_meta.ids == ids && e.live_meta.imgs == images) return true;
     return false;
 }
 
@@ -425,18 +652,87 @@ size_t ConversationSpillCache::prefix_count() const {
     return n;
 }
 
+bool ConversationSpillCache::remove_group(Entry& entry, uint64_t& removed, std::vector<std::string>& left) {
+    const uint64_t accounted_before = entry.total_bytes();
+    removed = 0;
+    left.clear();
+    auto finish = [&](bool complete) {
+        if (removed > accounted_before || accounted_before - removed != entry.total_bytes())
+            throw std::logic_error("spill entry removal accounting mismatch");
+        return complete;
+    };
+    auto remove_one = [&](const std::string& path, uint64_t& accounted) {
+        const PathInfo before = inspect_path_nofollow(path);
+        if (!before.inspected) { left.push_back(path); return false; }
+        if (!before.exists) {
+            removed += accounted;
+            accounted = 0;
+            return true;
+        }
+        std::error_code ec;
+        std::filesystem::remove(path, ec);  // removes a symlink itself; never follows its target
+        const PathInfo after = inspect_path_nofollow(path);
+        if (after.inspected && !after.exists) {
+            removed += accounted;
+            accounted = 0;
+            return true;
+        }
+        left.push_back(path);
+        return false;
+    };
+    auto retain_or_forget = [&](const std::string& path, uint64_t& accounted) {
+        const PathInfo info = inspect_path_nofollow(path);
+        if (info.inspected && !info.exists) {
+            removed += accounted;
+            accounted = 0;
+        } else {
+            left.push_back(path);
+        }
+    };
+
+    // Remove data first, but keep the manifest and sidecar until both base and log are gone: they are the ownership
+    // ledger needed to recognize and account a survivor after a restart.
+    const bool session_gone = remove_one(entry.session_path(), entry.file_bytes);
+    const bool log_gone = remove_one(entry.delta_path(), entry.delta_accounted_bytes);
+    if (!session_gone || !log_gone) {
+        retain_or_forget(entry.chain_path(), entry.chain_file_bytes);
+        retain_or_forget(entry.meta_path(), entry.meta_bytes);
+        entry.complete = false;
+        return finish(false);
+    }
+    const bool chain_gone = remove_one(entry.chain_path(), entry.chain_file_bytes);
+    if (!chain_gone) {
+        retain_or_forget(entry.meta_path(), entry.meta_bytes);
+        entry.complete = false;
+        return finish(false);
+    }
+    const bool meta_gone = remove_one(entry.meta_path(), entry.meta_bytes);
+    entry.complete = meta_gone && left.empty();
+    if (entry.complete) {
+        entry.has_chain = false;
+        entry.delta_bytes = 0;
+    }
+    return finish(entry.complete);
+}
+
 bool ConversationSpillCache::erase(const std::string& path, std::string& error) {
     auto found = std::find_if(entries_.begin(), entries_.end(),
                               [&](const Entry& entry) { return entry.session_path() == path; });
     if (found == entries_.end()) return true;
-    std::error_code ec;
-    std::filesystem::remove(found->session_path(), ec);
-    if (ec) { error = "cannot remove spill file " + found->session_path(); return false; }
-    std::filesystem::remove(found->meta_path(), ec);
-    bytes_ -= found->file_bytes;
+    const uint64_t before = found->total_bytes();
+    uint64_t removed = 0;
+    std::vector<std::string> left;
+    const bool complete = remove_group(*found, removed, left);
+    if (removed > before) throw std::logic_error("spill entry removal exceeds its accounted bytes");
+    adjust_bytes(before, before - removed);
     if (pinned_path_ == path) pinned_path_.clear();
-    entries_.erase(found);
-    return true;
+    if (complete) {
+        entries_.erase(found);
+        return true;
+    }
+    for (const auto& p : left) error += (error.empty() ? "" : ", ") + p;
+    error = "some spill files could not be removed: " + error;
+    return false;
 }
 
 void ConversationSpillCache::pin(const std::string& path) { pinned_path_ = path; }
@@ -451,7 +747,7 @@ size_t ConversationSpillCache::drop_superseded(const ConversationIds& ids,
                                                const std::string& keep) {
     size_t dropped = 0;
     for (size_t i = 0; i < entries_.size();) {
-        const Entry& entry = entries_[i];
+        Entry& entry = entries_[i];
         size_t deepest = 0;
         for (size_t length : entry.checkpoint_lengths) deepest = std::max(deepest, length);
         auto same_saved_prefix = [&](size_t length, const ConversationIds& candidate_ids,
@@ -473,13 +769,15 @@ size_t ConversationSpillCache::drop_superseded(const ConversationIds& ids,
         bool held = same_saved_prefix(deepest, ids, images);
         for (const auto& checkpoint : checkpoints)
             if (!held && same_saved_prefix(deepest, checkpoint.ids, checkpoint.imgs)) held = true;
-        if (!entry.prefix && entry.cvec == cvec && deepest && held && entry.session_path() != pinned_path_ &&
-            (keep.empty() || entry.session_path() != keep)) {
-            std::error_code ec;
-            std::filesystem::remove(entry.session_path(), ec);
-            std::filesystem::remove(entry.meta_path(), ec);
-            if (ec) { ++i; continue; }
-            bytes_ -= entry.file_bytes;
+        if (!entry.prefix && !(entry.complete && entry.has_chain && !delta_) && entry.cvec == cvec && deepest && held &&
+            entry.session_path() != pinned_path_ && (keep.empty() || entry.session_path() != keep)) {
+            const uint64_t before = entry.total_bytes();
+            uint64_t removed = 0;
+            std::vector<std::string> left;
+            const bool complete = remove_group(entry, removed, left);
+            if (removed > before) throw std::logic_error("spill entry removal exceeds its accounted bytes");
+            adjust_bytes(before, before - removed);
+            if (!complete) { ++i; continue; }
             entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
             ++dropped;
             continue;
@@ -490,18 +788,324 @@ size_t ConversationSpillCache::drop_superseded(const ConversationIds& ids,
 }
 
 void ConversationSpillCache::enforce_budget() {
-    // oldest first, ordinary conversations before prefix entries: a prefix serves every new conversation
-    for (int pass = 0; pass < 2; ++pass)
-    for (size_t i = 0; (bytes_ > budget_ || entries_.size() > kMaxSidecarEntries) && i < entries_.size();) {
-        if (entries_[i].session_path() == pinned_path_ || entries_[i].prefix != (pass == 1)) { ++i; continue; }
-        std::error_code ec;
-        std::filesystem::remove(entries_[i].session_path(), ec);
-        std::filesystem::remove(entries_[i].meta_path(), ec);
-        if (ec) { ++i; continue; }
-        bytes_ -= entries_[i].file_bytes;
-        entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
-        ++disk_evictions_;
+    if (!delta_) {
+        // the baseline policy: first-spilled first out, ordinary conversations before prefix entries, the pinned one
+        // (being restored) held - an engine without --conversation-cache-disk-delta keeps the pre-feature eviction
+        // order, and the removal takes a delta chain's files together when one is there
+        for (int pass = 0; pass < 2; ++pass)
+            for (size_t i = 0; (bytes_ > budget_ || entries_.size() > kMaxSidecarEntries) && i < entries_.size();) {
+                if (entries_[i].session_path() == pinned_path_ || entries_[i].prefix != (pass == 1) ||
+                    (entries_[i].complete && entries_[i].has_chain && !delta_)) { ++i; continue; }
+                const uint64_t before = entries_[i].total_bytes();
+                uint64_t removed = 0;
+                std::vector<std::string> left;
+                const bool complete = remove_group(entries_[i], removed, left);
+                if (removed > before) throw std::logic_error("spill entry removal exceeds its accounted bytes");
+                adjust_bytes(before, before - removed);
+                if (!complete) { ++i; continue; }
+                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+                ++disk_evictions_;
+            }
+        return;
     }
+    // Least recently used first.  A save or a successful restore stamps an entry (persisted in its sidecar, so the
+    // order survives a restart); a v1 sidecar's unknown age (0) sorts as the oldest.  Ordinary conversations come
+    // before prefix entries - a prefix serves every new conversation - and the pinned one (being restored) is held.
+    // An entry whose files cannot be removed (in use) is not retried within this call.
+    std::vector<size_t> tried;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (;;) {
+            if (bytes_ <= budget_ && entries_.size() <= kMaxSidecarEntries) return;
+            size_t victim = entries_.size();
+            for (size_t i = 0; i < entries_.size(); ++i) {
+                const Entry& e = entries_[i];
+                if (e.prefix != (pass == 1) || e.session_path() == pinned_path_ ||
+                    (e.complete && e.has_chain && !delta_)) continue;
+                if (std::find(tried.begin(), tried.end(), i) != tried.end()) continue;
+                if (victim == entries_.size() || e.last_used < entries_[victim].last_used) victim = i;
+            }
+            if (victim == entries_.size()) break;   // nothing left this pass may remove
+            const uint64_t before = entries_[victim].total_bytes();
+            uint64_t removed = 0;
+            std::vector<std::string> left;
+            const bool complete = remove_group(entries_[victim], removed, left);
+            if (removed > before) throw std::logic_error("spill entry removal exceeds its accounted bytes");
+            adjust_bytes(before, before - removed);
+            if (!complete) {
+                tried.push_back(victim);
+                continue;
+            }
+            entries_.erase(entries_.begin() + (std::ptrdiff_t) victim);
+            ++disk_evictions_;
+            tried.clear();   // the indices shifted
+        }
+    }
+}
+
+bool ConversationSpillCache::read_chain(const std::filesystem::path& chain, uint64_t base_size,
+                                        const std::filesystem::path& dlog, uint64_t& committed,
+                                        std::string& error) const {
+    uint64_t recorded_base = 0;
+    if (!read_chain_header(chain, recorded_base, committed, error)) return false;
+    if (recorded_base != base_size) { error = "spill chain base size mismatch"; return false; }
+    const PathInfo log = inspect_path_nofollow(dlog);
+    if (!log.inspected || !log.regular || committed > log.bytes) {
+        error = "spill chain log is missing, non-regular or shorter than its manifest";
+        return false;
+    }
+    return true;
+}
+
+bool ConversationSpillCache::write_chain(const std::filesystem::path& chain, uint64_t base_size, uint64_t committed,
+                                         std::string& error) const {
+    uint8_t buf[kChainFile];
+    std::memcpy(buf, kChainMagic, 8);
+    const uint64_t version = kChainVersion, base = base_size, at = committed;
+    std::memcpy(buf + 8, &version, 8);
+    std::memcpy(buf + 16, &base, 8);
+    std::memcpy(buf + 24, &at, 8);
+    const uint64_t hash = session_hash64(buf, 32, 0);
+    std::memcpy(buf + 32, &hash, 8);
+    const std::filesystem::path tmp(chain.string() + ".tmp");
+    // Called only after exclusive creation succeeds; a create failure leaves this fixed path unowned.
+    auto cleanup_owned_temp = [&]() {
+        std::error_code cleanup_error;
+        const bool removed = std::filesystem::remove(tmp, cleanup_error);
+        if (cleanup_error) {
+            error += "; cannot clean up owned temp " + tmp.string() + ": " + cleanup_error.message();
+        } else if (!removed) {
+            const PathInfo remaining = inspect_path_nofollow(tmp);
+            if (!remaining.inspected || remaining.exists)
+                error += "; cannot clean up owned temp " + tmp.string();
+        }
+    };
+    // created the way the session files and the sidecar's temp are (conversation_file.cpp RawFile::create_new,
+    // write_sidecar): exclusive, never following a link, owner-only (0600) - a pre-existing anything at the fixed
+    // temp name, including a symlink to someone else's file, is refused rather than truncated
+#if defined(_WIN32)
+    std::wstring w;
+    if (!wide(tmp.string(), w)) { error = "cannot create the spill chain manifest: the path is not valid UTF-8"; return false; }
+    const HANDLE h = CreateFileW(w.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { error = "cannot create the spill chain manifest: " + last_error(); return false; }
+    DWORD wrote = 0;
+    const BOOL write_ok = WriteFile(h, buf, (DWORD) kChainFile, &wrote, nullptr);
+    const DWORD write_error = !write_ok ? GetLastError() :
+                              wrote != (DWORD) kChainFile ? ERROR_WRITE_FAULT : ERROR_SUCCESS;
+    const BOOL close_ok = CloseHandle(h);
+    const DWORD close_error = close_ok ? ERROR_SUCCESS : GetLastError();
+    if (write_error != ERROR_SUCCESS || close_error != ERROR_SUCCESS) {
+        const DWORD why = write_error != ERROR_SUCCESS ? write_error : close_error;
+        error = "cannot write the spill chain manifest: " + last_error(why);
+        cleanup_owned_temp();
+        return false;
+    }
+#else
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) { error = std::string("cannot create the spill chain manifest: ") + std::strerror(errno); return false; }
+    size_t off = 0;
+    while (off < kChainFile) {
+        const ssize_t n = ::write(fd, buf + off, kChainFile - off);
+        if (n > 0) { off += (size_t) n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        error = std::string("cannot write the spill chain manifest: ") + (n < 0 ? std::strerror(errno) : "short write");
+        ::close(fd);
+        cleanup_owned_temp();
+        return false;
+    }
+    if (::close(fd) != 0) {
+        error = std::string("cannot write the spill chain manifest: ") + std::strerror(errno);
+        cleanup_owned_temp();
+        return false;
+    }
+#endif
+    std::error_code ec;
+    std::filesystem::rename(tmp, chain, ec);
+    if (ec) {
+        error = "cannot commit the spill chain manifest: " + ec.message();
+        cleanup_owned_temp();
+        return false;
+    }
+    return true;
+}
+
+bool ConversationSpillCache::spill_delta(size_t index, const SavedConversation& meta,
+                                         const std::vector<SessionKvSource>& kv, int64_t first_token,
+                                         size_t& bytes, std::string& error, bool durable) {
+    bytes = 0;
+    if (!enabled_ || index >= entries_.size()) { error = "spill cache is disabled"; return false; }
+    if (!delta_) { error = "delta chains are off"; return false; }
+    Entry& entry = entries_[index];
+    if (entry.prefix) { error = "a prefix entry has no delta chain"; return false; }
+    if (!entry.complete || !entry_files_valid(entry)) {
+        error = "spill entry is incomplete or its files are not valid regular files";
+        return false;
+    }
+    const bool had_chain = entry.has_chain;
+    auto account_log_after_attempt = [&]() {
+        const uint64_t before = entry.total_bytes();
+        const PathInfo log = inspect_path_nofollow(entry.delta_path());
+        if (!log.inspected) {
+            entry.complete = false;
+        } else if (log.exists) {
+            entry.has_chain = true;
+            if (log.regular) entry.delta_accounted_bytes = log.bytes;
+            else entry.complete = false;
+        }
+        if (!had_chain && entry.has_chain) entry.complete = false;
+        if (had_chain) {
+            uint64_t still_committed = 0;
+            std::string verify_error;
+            if (!read_chain(entry.chain_path(), entry.file_bytes, entry.delta_path(), still_committed, verify_error) ||
+                still_committed != entry.delta_bytes) entry.complete = false;
+        }
+        adjust_bytes(before, entry.total_bytes());
+    };
+    try {
+        SessionWriteOptions opt;
+        opt.durable = durable;
+        SessionStatus st;
+        uint64_t written = 0;
+        if (!session_delta_write(entry.delta_path(), entry.delta_bytes, meta, kv, first_token, identity_,
+                                 written, error, opt, &st)) {
+            account_log_after_attempt();
+            return false;
+        }
+        account_log_after_attempt();
+        if (written > UINT64_MAX - entry.delta_bytes) {
+            entry.complete = false;
+            error = "delta record length overflows the committed chain";
+            return false;
+        }
+        const uint64_t committed = entry.delta_bytes + written;
+        if (!write_chain(entry.chain_path(), entry.file_bytes, committed, error)) return false;
+        const PathInfo chain = inspect_path_nofollow(entry.chain_path());
+        if (!chain.inspected || !chain.regular) {
+            entry.has_chain = true;
+            entry.complete = false;
+            error = "published spill chain manifest is not a regular file";
+            return false;
+        }
+        {
+            const uint64_t before = entry.total_bytes();
+            entry.has_chain = true;
+            entry.delta_bytes = committed;
+            entry.chain_file_bytes = chain.bytes;
+            entry.complete = false;   // until the matching sidecar generation is published
+            adjust_bytes(before, entry.total_bytes());
+        }
+
+        // The sidecar describes the state the chain now holds; the read pass double-checks its tail before restore.
+        Entry updated = entry;
+        updated.live_meta.ids = meta.live.ids;
+        updated.live_meta.imgs = meta.live.imgs;
+        updated.checkpoint_lengths.clear();
+        for (const auto& c : meta.checkpoints) updated.checkpoint_lengths.push_back(c.ids.size());
+        updated.last_used = now_ms();
+        if (!write_sidecar(entry.meta_path(), updated, error, true)) return false;
+        const PathInfo sidecar = inspect_path_nofollow(entry.meta_path());
+        if (!sidecar.inspected || !sidecar.regular) {
+            error = "published spill sidecar is not a regular file";
+            return false;
+        }
+        {
+            const uint64_t before = entry.total_bytes();
+            entry.live_meta.ids = std::move(updated.live_meta.ids);
+            entry.live_meta.imgs = std::move(updated.live_meta.imgs);
+            entry.checkpoint_lengths = std::move(updated.checkpoint_lengths);
+            entry.last_used = updated.last_used;
+            entry.meta_bytes = sidecar.bytes;
+            entry.complete = true;
+            adjust_bytes(before, entry.total_bytes());
+        }
+        enforce_budget();
+        bytes = (size_t) written;
+        return true;
+    } catch (const std::bad_alloc&) {
+        error = "not enough RAM to index the delta record";
+        return false;
+    }
+}
+
+size_t ConversationSpillCache::find(const std::string& path) const {
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        const Entry& entry = entries_[i];
+        if (entry.session_path() == path && entry.complete && !(entry.has_chain && !delta_) &&
+            entry_files_valid(entry)) return i;
+    }
+    return entries_.size();
+}
+
+void ConversationSpillCache::touch(const std::string& path) {
+    if (!enabled_ || !delta_) return;   // the baseline v1 sidecar carries no stamp to persist
+    const size_t index = find(path);
+    if (index >= entries_.size()) return;
+    Entry& entry = entries_[index];
+    const uint64_t stamp = now_ms();
+    if (stamp <= entry.last_used) return;   // same millisecond or a backwards clock: nothing to record
+    entry.last_used = stamp;
+    std::string error;
+    // Best effort: a failed save of the stamp keeps the in-memory order for this run and the next save re-stamps it;
+    // the restore itself must not fail for a sidecar write.  touch() only runs with delta on, so the stamped v2
+    // sidecar is written; the stamp's decimal growth can change the file by a few bytes - keep the budget accounting
+    // exact.
+    const uint64_t before = entry.total_bytes();
+    write_sidecar(entry.meta_path(), entry, error, true);
+    const PathInfo meta = inspect_path_nofollow(entry.meta_path());
+    if (meta.inspected && meta.regular) entry.meta_bytes = meta.bytes;
+    else entry.complete = false;
+    if (entry.has_chain) {
+        const PathInfo chain = inspect_path_nofollow(entry.chain_path());
+        if (chain.inspected && chain.regular) entry.chain_file_bytes = chain.bytes;
+        else entry.complete = false;
+    }
+    adjust_bytes(before, entry.total_bytes());
+}
+
+uint64_t ConversationSpillCache::entry_last_used(size_t index) const {
+    return index < entries_.size() ? entries_[index].last_used : 0;
+}
+
+bool ConversationSpillCache::entry_info(size_t index, int64_t& tokens, int64_t& deepest, uint64_t& base_bytes,
+                                        uint64_t& delta_bytes, bool& prefix, std::string& path) const {
+    if (index >= entries_.size()) return false;
+    const Entry& e = entries_[index];
+    if (!e.complete || (e.has_chain && !delta_) || !entry_files_valid(e)) return false;
+    tokens = (int64_t) e.live_meta.ids.size();
+    deepest = 0;
+    for (size_t n : e.checkpoint_lengths) deepest = std::max(deepest, (int64_t) n);
+    base_bytes = e.file_bytes;
+    delta_bytes = e.delta_bytes;
+    prefix = e.prefix;
+    path = e.session_path();
+    return true;
+}
+
+bool ConversationSpillCache::entry_matches_prefix(size_t index, const ConversationIds& ids, size_t n,
+                                                   const std::vector<ConversationImageKey>& images) const {
+    if (index >= entries_.size() || !entries_[index].complete ||
+        (entries_[index].has_chain && !delta_) || !entry_files_valid(entries_[index])) return false;
+    const ConversationCheckpoint& c = entries_[index].live_meta;
+    if (n == 0 || n > c.ids.size() || n > ids.size()) return false;
+    if (!std::equal(c.ids.begin(), c.ids.begin() + (std::ptrdiff_t) n, ids.begin())) return false;
+    size_t a = 0, b = 0;
+    while ((a < c.imgs.size() && c.imgs[a].start < (int64_t) n) || (b < images.size() && images[b].start < (int64_t) n)) {
+        if (a == c.imgs.size() || c.imgs[a].start >= (int64_t) n ||
+            b == images.size() || images[b].start >= (int64_t) n || !(c.imgs[a] == images[b])) return false;
+        ++a;
+        ++b;
+    }
+    return true;
+}
+
+bool ConversationSpillCache::entry_chain_tail_matches(size_t index, const ConversationIds& tail_ids,
+                                                      const std::vector<ConversationImageKey>& tail_imgs,
+                                                      const std::vector<size_t>& tail_checkpoint_lengths) const {
+    if (index >= entries_.size() || entries_[index].prefix || !entries_[index].has_chain ||
+        !entries_[index].complete || !entry_files_valid(entries_[index])) return false;
+    const Entry& e = entries_[index];
+    return e.live_meta.ids == tail_ids && e.live_meta.imgs == tail_imgs &&
+           e.checkpoint_lengths == tail_checkpoint_lengths;
 }
 
 } // namespace strata::core

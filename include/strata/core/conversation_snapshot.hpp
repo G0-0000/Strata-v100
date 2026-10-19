@@ -127,6 +127,15 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+// --conversation-cache-disk-delta: the same sources, but each keeps its part's full size and starts at the first
+// page (or indexer row) at or after `unchanged_tokens`, the tokens whose K/V still matches the state the record's
+// base already holds (the same keep rule conversation_kv_save applies; the per-part arithmetic is
+// session_delta_first_bytes, host-testable).  The draft's moving cell is always refreshed, so it keeps one token
+// less.  The caller has synchronized and must not run the session until the record is written.
+bool conversation_snapshot_sources_delta(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                         const ConversationView& view, const SessionState& session,
+                                         const ModelGeometry& g, const QsaState& draft, int64_t unchanged_tokens,
+                                         std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };

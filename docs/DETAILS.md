@@ -1387,6 +1387,39 @@ memory (RssAnon) peaked 0.6 GiB above a run without the cache during a switch an
 conversation stays in RAM. Greedy replies matched the run without the cache for 13 of 15 turns; the other two
 match the RAM cache's restore of the same state (a restore and a full read of the prompt round differently).
 
+**Delta chains (`--conversation-cache-disk-delta`, opt-in; needs `--conversation-cache-disk-only`).** With this flag a
+switch does not rewrite the conversation's file: it appends one delta record to a `<stem>.dlog` file beside the base,
+holding the running state and only the K/V pages from the first changed cell on (the base file's K/V stays), and a
+`<stem>.dchain` manifest publishes the log's committed length - an interrupted append's torn tail is cut before the
+next record and never read. A returning conversation restores the base the streaming way, then every record in order,
+each writing at its recorded offset; a same-size edit between the two passes is refused by the record's payload hash
+before more is applied. Before the restore, the chain's last record must match the sidecar in full (ids, images,
+checkpoint lengths): the sidecar is published after the manifest, and a crash between the two is a clean miss, never
+a mix of two saves' state. The spill directory's budget counts the bytes charged to each entry: its
+session file and, for a chain, the log file (including any uncommitted tail), manifest and stamped v2
+sidecar. A legacy v1 sidecar is deliberately unaccounted, preserving the baseline session-file-only
+exact-fit and below-fit boundaries. Removal updates each entry's ledger as each artifact actually
+disappears; a partial group stays quarantined with its manifest and sidecar retained as ownership
+metadata, cannot match, load or append, and can be retried after a restart without charging an earlier
+removal twice. Required base, sidecar, log and manifest paths must be regular files. Deletion does not
+follow symlinks and debits only the bytes that entry had already been charged, never a symlink target's
+size. In a base-only run (including delta-off), a valid chain is kept and accounted but is not offered to
+the plain snapshot loader or evicted just because that restore mode cannot replay it; it cleanly misses
+and recomputes. Disk-only delta mode can restore compatible chains. Manifest publication uses an
+exclusive temp: after creation, any write or close failure stops publication and removes that owned
+temp (or reports a cleanup failure); a pre-existing temp is never removed on a failed exclusive create. When a chain's records outgrow
+the base file (by default two fifths of it, at least 64 MiB), or a conversation arrives whose K/V prefix
+no longer matches the chain on disk, the next switch writes a whole file as before, and prefix entries
+always write whole files. The chain's records are validated in the streaming restore's read pass and applied one at
+a time. The read pass keeps only the newest record's metadata; it does not build a per-record offset index. Before
+each parser allocation, counts are checked against the record and engine limits and the actual vector storage is
+admitted. The final preflight prices the read/apply overlap (record metadata, checkpoint and layer arrays, and one
+bounded I/O block), not the log's length: K/V payload streams through the block and is never resident. Checkpoint-tail
+bookkeeping is admitted before reserve, and the chain/sidecar comparison and apply preflight both finish before any
+live state is changed. An admission refusal is a cache miss; it does not invalidate or remove the chain. With the flag
+off, new sidecars stay the baseline v1 bytes and eviction keeps first-spilled-first order; existing v1
+sidecars remain readable.
+
 Disk-only mode also keeps **prefix entries** (`strata-conv-prefix-N`): when a conversation is saved, its shared
 opening is saved once more on its own, once per distinct opening. That is the deepest `"strata_prefix"` checkpoint on
 the live path when the request pinned one, else the root (the first turn boundary at least `--prompt-cache-root`

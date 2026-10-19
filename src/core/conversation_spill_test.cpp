@@ -6,11 +6,14 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include <chrono>
+#include <system_error>
 
 using namespace strata::core;
 namespace fs = std::filesystem;
@@ -146,7 +149,8 @@ int main() {
     const auto rematched = again.best(continuing, a.live.imgs, false, 0.0, 0);
     check(bool(rematched) && rematched.tokens == (int64_t) a.live.ids.size(), "rematch after reopen");
 
-    // a foreign identity is refused and its files removed
+    // a foreign identity is refused: its files are KEPT on disk (never auto-deleted), not indexed and outside the
+    // disk budget; open() logs a warning with their count and bytes - remove them manually.
     ConversationSpillCache foreign;
     check(foreign.open(dir, SessionFileIdentity{1, 2}, 1ull << 30, error), "open with foreign identity");
     check(foreign.size() == 0, "foreign identity: nothing indexed");
@@ -171,12 +175,19 @@ int main() {
     { std::ofstream(abandoned) << "half a conversation"; }
     const fs::path foreign_temp = dir / ".strata-notes.0123456789abcdef.tmp";   // not a spill file's temp
     { std::ofstream(foreign_temp) << "not ours"; }
+    // a killed sidecar or chain-manifest write leaves a <stem>.meta.tmp / <stem>.dchain.tmp behind: same wipe
+    const fs::path meta_temp = dir / "strata-conv-98.meta.tmp";
+    { std::ofstream(meta_temp) << "junk"; }
+    const fs::path chain_temp = dir / "strata-conv-97.dchain.tmp";
+    { std::ofstream(chain_temp) << "junk"; }
     ConversationSpillCache wiped;
     check(wiped.open(dir, id, 1ull << 30, error), "open with an abandoned temp");
     check(!fs::exists(abandoned), "abandoned spill temp removed at open");
+    check(!fs::exists(meta_temp), "abandoned sidecar temp removed at open");
+    check(!fs::exists(chain_temp), "abandoned chain-manifest temp removed at open");
     check(fs::exists(foreign_temp), "a foreign dot file is left alone");
-    check(wiped.stale_files_wiped() >= 1, "the abandoned temp counts as a stale file wiped");
-    check(wiped.size() == 1, "the temp is not indexed as a conversation");
+    check(wiped.stale_files_wiped() >= 3, "the abandoned temps count as stale files wiped");
+    check(wiped.size() == 1, "the temps are not indexed as a conversation");
     fs::remove(foreign_temp);
 
 
@@ -348,6 +359,1102 @@ int main() {
         check(tight.size() == 2, "prefix: budget evicted an ordinary conversation, not the prefix");
         check(tight.has_prefix(root.live.ids, {}, root.cvec), "prefix: dedupe sees the reopened prefix");
         fs::remove_all(pdir);
+    }
+
+    // --conversation-cache-disk-delta: a base session file plus an append log and its manifest are one entry.
+    // spill_delta appends the changed K/V and republishes the sidecar; the chain survives a reopen; erase, the
+    // budget and drop_superseded remove the chain files together; a chain that cannot be proven (short log, edited
+    // manifest) makes open() drop the whole entry rather than restore a state that does not match its sidecar.
+    auto sources_of = [](const SavedConversation& img, size_t first) {
+        std::vector<SessionKvSource> sources;
+        for (const auto& k : img.kv) {
+            SessionKvSource src;
+            src.format = k.format; src.cells = k.cells; src.heads = k.heads; src.head_dim = k.head_dim;
+            src.page_size = k.page_size; src.pooled_rows = k.pooled_rows; src.idx_dim = k.idx_dim;
+            const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+            for (size_t i = 0; i < 5; ++i) {
+                src.sizes[i] = parts[i]->size();
+                src.first_bytes[i] = parts[i]->size() > first ? first : 0;
+            }
+            src.read = [parts](size_t part, size_t offset, void* dst, size_t n) { return parts[part]->read(dst, offset, n); };
+            sources.push_back(std::move(src));
+        }
+        return sources;
+    };
+    auto meta_of = [](SavedConversation img) { img.kv.clear(); return img; };
+    auto read_file = [](const fs::path& p) {
+        std::vector<char> v;
+        if (FILE* f = std::fopen(p.string().c_str(), "rb")) {
+            char buf[65536];
+            size_t n;
+            while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) v.insert(v.end(), buf, buf + n);
+            std::fclose(f);
+        }
+        return v;
+    };
+    auto write_file = [](const fs::path& p, const std::vector<char>& v) {
+        if (FILE* f = std::fopen(p.string().c_str(), "wb")) {
+            if (!v.empty()) std::fwrite(v.data(), 1, v.size(), f);
+            std::fclose(f);
+        }
+    };
+    const fs::path cdir = fs::temp_directory_path() / "strata_spill_delta_test";
+    fs::remove_all(cdir);
+    {
+        SavedConversation base = sample(1500);
+        SavedConversation grown = base;
+        // the ids continue the sample's (1000 + i): a checkpoint generator keeps matching them
+        for (int i = 0; i < 300; ++i) grown.live.ids.push_back(int32_t(2500 + i));
+        grown.checkpoints.push_back(checkpoint(1800, 8));
+
+        ConversationSpillCache ch;
+        size_t written = 0;
+        check(ch.open(cdir, id, 1ull << 30, error, true), "delta spill: open");
+        check(ch.spill_streamed(meta_of(base), sources_of(base, 0), written, error), "delta spill: base");
+        const uint64_t base_file = written;
+        const size_t index = ch.find(ch.newest_path());
+        check(index == 0, "delta spill: find by path");
+        int64_t tokens = 0, deepest = 0;
+        uint64_t info_base = 0, info_delta = 0;
+        bool is_prefix = true;
+        std::string path;
+        check(ch.entry_info(index, tokens, deepest, info_base, info_delta, is_prefix, path) && tokens == 1500 &&
+              info_base == base_file && info_delta == 0 && !is_prefix, "delta spill: entry info before the delta");
+        size_t delta_written = 0;
+        check(ch.spill_delta(index, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(),
+                             delta_written, error), "delta spill: append");
+        check(delta_written > 0, "delta spill: the record was written");
+        check(ch.entry_matches_prefix(index, grown.live.ids, grown.live.ids.size(), {}),
+              "delta spill: the entry covers the state's tokens");
+        // a state the restore rewrote shorter than the entry still appends: only the covered prefix counts
+        ConversationIds shorter;
+        shorter.assign(grown.live.ids.begin(), grown.live.ids.begin() + 1700);
+        check(ch.entry_matches_prefix(index, shorter, 1600, {}), "delta spill: a shorter rewritten state matches");
+        ConversationIds diverging = grown.live.ids;
+        diverging[700] = 12345;
+        check(!ch.entry_matches_prefix(index, diverging, grown.live.ids.size(), {}),
+              "delta spill: a diverged prompt is not a match");
+        // a prefix entry refuses the delta append
+        {
+            ConversationSpillCache pc;
+            check(pc.open(cdir / "never", id, 1ull << 30, error, true), "delta spill: prefix dir");
+            SavedConversation root = sample(600);
+            root.checkpoints.clear();
+            root.checkpoints.push_back(checkpoint(600, 7));
+            size_t w = 0;
+            check(pc.spill_streamed(meta_of(root), sources_of(root, 0), w, error, true, true), "delta spill: prefix saved");
+            size_t wd = 0;
+            check(!pc.spill_delta(0, meta_of(root), sources_of(root, 0), 600, wd, error),
+                  "delta spill: a prefix entry refuses the append");
+            fs::remove_all(cdir / "never");
+        }
+        check(ch.bytes() == base_file + delta_written + fs::file_size(fs::path(path).replace_extension(".meta")) +
+                          fs::file_size(fs::path(path).replace_extension(".dchain")),
+              "delta spill: the budget counts the chain and its sidecars");
+        fs::path dlog(path), dchain(path);
+        dlog.replace_extension(".dlog");
+        dchain.replace_extension(".dchain");
+        check(fs::file_size(dlog) == delta_written, "delta spill: the log holds the record");
+        std::vector<int32_t> cont(grown.live.ids.begin(), grown.live.ids.end());
+        cont.push_back(7);
+        const auto hit = ch.best(cont, {}, grown.cvec, 0.0, 0);
+        const bool hit_matches = bool(hit);
+        const bool hit_committed_matches = hit.delta_committed == delta_written;
+        const bool hit_path_matches = hit.path == ch.newest_path();
+        const bool hit_tokens_match = hit.tokens == (int64_t) grown.live.ids.size() &&
+                                      hit.live_tokens == (int64_t) grown.live.ids.size();
+        if (!hit_matches || !hit_committed_matches || !hit_path_matches || !hit_tokens_match)
+            std::fprintf(stderr, "  delta spill match: mode=delta-on match=%d committed=%llu expected=%llu path='%s' expected_path='%s' tokens=%lld live_tokens=%lld\n",
+                         (int) hit_matches, (unsigned long long) hit.delta_committed,
+                         (unsigned long long) delta_written, hit.path.c_str(), ch.newest_path().c_str(),
+                         (long long) hit.tokens, (long long) hit.live_tokens);
+        check(hit_matches && hit_committed_matches && hit_path_matches && hit_tokens_match,
+              "delta spill: best() offers the chain");
+        // The chain is reindexed on a reopen (an engine restart); pass the enabled mode explicitly, as generate.cpp
+        // does when --conversation-cache-disk-delta is active. The default-off safe miss is covered by the real-chain
+        // cross-mode fixture below.
+        ConversationSpillCache reopened;
+        check(reopened.open(cdir, id, 1ull << 30, error, true) && reopened.size() == 1,
+              "delta spill: reopen keeps the entry");
+        const auto again = reopened.best(cont, {}, grown.cvec, 0.0, 0);
+        const bool again_matches = bool(again);
+        const bool committed_matches = again.delta_committed == delta_written;
+        const bool path_matches = again.path == hit.path;
+        if (!again_matches || !committed_matches || !path_matches)
+            std::fprintf(stderr, "  delta spill reopen: mode=delta-on match=%d committed=%llu expected=%llu path='%s' expected_path='%s'\n",
+                         (int) again_matches, (unsigned long long) again.delta_committed,
+                         (unsigned long long) delta_written, again.path.c_str(), hit.path.c_str());
+        check(again_matches && committed_matches && path_matches, "delta spill: the chain survives a reopen");
+        // erase removes the base, the sidecar, the log and the manifest together
+        check(reopened.erase(again.path, error) && reopened.size() == 0, "delta spill: erase removes the chain");
+        check(!fs::exists(path) && !fs::exists(fs::path(path).replace_extension(".meta")) && !fs::exists(dlog) &&
+              !fs::exists(dchain), "delta spill: no chain file left");
+
+        // a committed length past the log's bytes: the chain cannot be proven and the entry goes
+        const fs::path broken = fs::temp_directory_path() / "strata_spill_delta_broken";
+        fs::remove_all(broken);
+        {
+            ConversationSpillCache c1;
+            check(c1.open(broken, id, 1ull << 30, error, true), "delta spill: open broken-dir");
+            check(c1.spill_streamed(meta_of(base), sources_of(base, 0), written, error), "delta spill: broken base");
+            size_t w = 0;
+            check(c1.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), w, error),
+                  "delta spill: broken append");
+            fs::path d2 = c1.newest_path();
+            d2.replace_extension(".dlog");
+            fs::resize_file(d2, fs::file_size(d2) - 4);
+        }
+        ConversationSpillCache c2;
+        check(c2.open(broken, id, 1ull << 30, error, true) && c2.size() == 0,
+              "delta spill: a short log drops the entry");
+        {
+            ConversationSpillCache c3;
+            check(c3.open(broken, id, 1ull << 30, error, true), "delta spill: reopen broken-dir");
+            check(c3.spill_streamed(meta_of(base), sources_of(base, 0), written, error), "delta spill: broken base 2");
+            size_t w = 0;
+            check(c3.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), w, error),
+                  "delta spill: broken append 2");
+            fs::path d3 = c3.newest_path();
+            d3.replace_extension(".dchain");
+            std::fstream f(d3, std::ios::binary | std::ios::in | std::ios::out);
+            char c = 0;
+            f.read(&c, 1);
+            c = char(c ^ 0x40);
+            f.seekp(0);
+            f.write(&c, 1);
+            f.close();
+        }
+        ConversationSpillCache c4;
+        check(c4.open(broken, id, 1ull << 30, error, true) && c4.size() == 0,
+              "delta spill: an edited manifest drops the entry");
+        for (const auto& e : fs::directory_iterator(broken))
+            check(e.path().extension() != ".sess" && e.path().extension() != ".meta" &&
+                  e.path().extension() != ".dlog" && e.path().extension() != ".dchain",
+                  "delta spill: a dropped chain leaves no file behind");
+        fs::remove_all(broken);
+
+        // a full write that supersedes the chain removes the chain files with it
+        {
+            ConversationSpillCache c5;
+            check(c5.open(cdir, id, 1ull << 30, error, true), "delta spill: open for the supersede test");
+            check(c5.spill_streamed(meta_of(base), sources_of(base, 0), written, error), "delta spill: base 2");
+            size_t w = 0;
+            check(c5.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), w, error),
+                  "delta spill: append 2");
+            fs::path d5 = c5.newest_path();
+            d5.replace_extension(".dlog");
+            check(fs::exists(d5), "delta spill: the chain is on disk");
+            SavedConversation longer = grown;
+            for (int i = 0; i < 200; ++i) longer.live.ids.push_back(int32_t(2800 + i));
+            longer.checkpoints.push_back(checkpoint((size_t) grown.live.ids.size(), 9));
+            size_t w2 = 0;
+            check(c5.spill_streamed(meta_of(longer), sources_of(longer, 0), w2, error), "delta spill: full write");
+            const std::string kept = c5.newest_path();
+            const size_t dropped = c5.drop_superseded(longer.live.ids, {}, longer.checkpoints, longer.cvec, kept);
+            check(dropped == 1, "delta spill: the old chain is superseded");
+            check(!fs::exists(d5) && !fs::exists(fs::path(d5.string().substr(0, d5.string().size() - 5) + ".dchain")),
+                  "delta spill: the superseded chain's files are gone");
+            fs::remove_all(cdir);
+        }
+    }
+
+    // A hard link outside the spill directory must not let a rejected append truncate shared-inode bytes.
+    {
+        const fs::path hard_link_root = fs::temp_directory_path() / ("strata_spill_hardlink_test-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        const fs::path hard_link_dir = hard_link_root / "spill";
+        fs::create_directories(hard_link_root);
+        SavedConversation base = sample(1000);
+        SavedConversation grown = base;
+        for (int i = 0; i < 200; ++i) grown.live.ids.push_back(int32_t(2500 + i));
+        grown.checkpoints.push_back(checkpoint(1200, 8));
+        ConversationSpillCache hard_link_cache;
+        check(hard_link_cache.open(hard_link_dir, id, 1ull << 30, error, true), "hardlink: open delta directory");
+        size_t base_bytes = 0;
+        check(hard_link_cache.spill_streamed(meta_of(base), sources_of(base, 0), base_bytes, error),
+              "hardlink: save base");
+        size_t committed = 0;
+        check(hard_link_cache.spill_delta(0, meta_of(grown), sources_of(grown, 1024),
+                                          (int64_t) grown.live.ids.size(), committed, error),
+              "hardlink: create valid appendable chain");
+        const std::string session = hard_link_cache.newest_path();
+        const fs::path log = fs::path(session).replace_extension(".dlog");
+        const fs::path manifest = fs::path(session).replace_extension(".dchain");
+        const fs::path sidecar = fs::path(session).replace_extension(".meta");
+        const fs::path sentinel = hard_link_root / "external-sentinel.dlog";
+        check(hard_link_cache.size() == 1 && fs::is_regular_file(log) && fs::is_regular_file(manifest) &&
+              fs::is_regular_file(sidecar), "hardlink: chain, log and sidecar are valid before the guard");
+
+        std::error_code link_error;
+        fs::create_hard_link(log, sentinel, link_error);
+        const bool hard_links_unsupported = link_error == std::errc::operation_not_supported ||
+                                            link_error == std::errc::function_not_supported ||
+                                            link_error == std::errc::not_supported;
+        if (hard_links_unsupported) {
+            std::fprintf(stderr, "SKIP: hard-link sentinel fixture unsupported: %s\n", link_error.message().c_str());
+        } else {
+            check(!link_error, "hardlink: create external sentinel hard link");
+            const std::vector<char> suffix = {'u', 'n', 'c', 'o', 'm', 'm', 'i', 't', 't', 'e', 'd'};
+            {
+                std::ofstream out(log, std::ios::binary | std::ios::app);
+                out.write(suffix.data(), (std::streamsize) suffix.size());
+                out.close();
+                check(bool(out), "hardlink: append the permitted uncommitted suffix");
+            }
+            const std::vector<char> log_before = read_file(log);
+            const std::vector<char> sentinel_before = read_file(sentinel);
+            const std::vector<char> manifest_before = read_file(manifest);
+            const std::vector<char> sidecar_before = read_file(sidecar);
+            check(sentinel_before == log_before && log_before.size() == committed + suffix.size() &&
+                  manifest_before.size() == 40 && !sidecar_before.empty(),
+                  "hardlink: snapshots contain the shared log and published metadata");
+            size_t refused_bytes = 0;
+            check(!hard_link_cache.spill_delta(0, meta_of(grown), sources_of(grown, 1024),
+                                               (int64_t) grown.live.ids.size(), refused_bytes, error),
+                  "hardlink: append is refused");
+            check(error.find("hard link") != std::string::npos,
+                  "hardlink: refusal came from the opened-inode link-count guard");
+            check(read_file(log) == log_before && read_file(sentinel) == sentinel_before,
+                  "hardlink: refusal leaves exact shared sentinel bytes unchanged");
+            check(read_file(manifest) == manifest_before && read_file(sidecar) == sidecar_before,
+                  "hardlink: refusal leaves the published manifest and sidecar unchanged");
+            check(fs::remove(sentinel), "hardlink: remove only the test-owned external hard link");
+        }
+        fs::remove_all(hard_link_root);
+    }
+
+    // an interrupted append: bytes past the manifest's committed length are dropped before the next record, and the
+    // committed chain reads back exactly (base + records, in order, rebuild the newest state)
+    {
+        const fs::path tdir = fs::temp_directory_path() / "strata_spill_torn_test";
+        fs::remove_all(tdir);
+        SavedConversation base = sample(1200);
+        SavedConversation grown = base;
+        for (int i = 0; i < 300; ++i) grown.live.ids.push_back(int32_t(2500 + i));
+        grown.checkpoints.push_back(checkpoint(1500, 8));
+        ConversationSpillCache c1;
+        size_t w = 0;
+        check(c1.open(tdir, id, 1ull << 30, error, true), "torn: open");
+        check(c1.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "torn: base");
+        size_t w1 = 0;
+        check(c1.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), w1, error),
+              "torn: first record");
+        const fs::path dlog = fs::path(c1.newest_path()).replace_extension(".dlog");
+        const uint64_t committed = fs::file_size(dlog);
+        // a crash mid-write: bytes past the committed length
+        {
+            std::ofstream out(dlog, std::ios::binary | std::ios::app);
+            const std::string junk(997, 'x');
+            out.write(junk.data(), (std::streamsize) junk.size());
+        }
+        check(fs::file_size(dlog) == committed + 997, "torn: the log is longer than the committed length");
+        // the next append starts at the committed length: the tail is cut, the record lands after the first
+        SavedConversation longer = sample(1700);
+        size_t w2 = 0;
+        check(c1.spill_delta(0, meta_of(longer), sources_of(longer, 1024), (int64_t) longer.live.ids.size(), w2, error),
+              "torn: second append over the tail");
+        check(fs::file_size(dlog) == committed + w2, "torn: the uncommitted tail is cut before the append");
+        // ordinary reconstruction: base + both records rebuild `longer` byte for byte
+        ConversationSpillCache c2;
+        check(c2.open(tdir, id, 1ull << 30, error, true) && c2.size() == 1, "torn: reopen keeps the entry");
+        const auto m = c2.best(longer.live.ids, {}, longer.cvec, 0.0, 0);
+        const uint64_t expected_committed = committed + w2;
+        const std::string expected_path = c1.newest_path();
+        const bool matches = bool(m);
+        const bool committed_matches = m.delta_committed == expected_committed;
+        const bool path_matches = m.path == expected_path;
+        if (!matches || !committed_matches || !path_matches)
+            std::fprintf(stderr, "  torn reopen: mode=delta-on match=%d committed=%llu expected=%llu path='%s' expected_path='%s'\n",
+                         (int) matches, (unsigned long long) m.delta_committed,
+                         (unsigned long long) expected_committed, m.path.c_str(), expected_path.c_str());
+        check(matches && committed_matches && path_matches, "torn: the committed chain matches");
+        SessionReadLimits lim;
+        SavedConversation base_meta;
+        std::vector<std::array<uint64_t, 5>> base_sizes;
+        size_t base_bytes = 0;
+        check(session_file_read_streamed(m.path, id, base_meta, base_bytes, error, lim, &base_sizes),
+              "torn: the base reads streamed");
+        std::vector<std::array<std::vector<uint8_t>, 5>> rebuilt(longer.kv.size());
+        for (size_t l = 0; l < longer.kv.size(); ++l) {
+            const std::array<const ConversationBuffer*, 5> parts = {&longer.kv[l].k, &longer.kv[l].v,
+                                                                    &longer.kv[l].k_scale, &longer.kv[l].v_scale,
+                                                                    &longer.kv[l].pooled};
+            for (size_t part = 0; part < 5; ++part) rebuilt[l][part].resize(parts[part]->size());
+        }
+        auto sink = [&](size_t layer, size_t part, uint64_t offset, const void* data, size_t n) {
+            if (layer >= rebuilt.size() || offset > rebuilt[layer][part].size() ||
+                n > rebuilt[layer][part].size() - offset) return false;
+            std::memcpy(rebuilt[layer][part].data() + offset, data, n);
+            return true;
+        };
+        check(session_file_apply_streamed(m.path, id, sink, base_sizes, error), "torn: the base applies");
+        uint64_t at = 0;
+        int applied = 0;
+        while (at < m.delta_committed) {
+            SessionDeltaRecord rec;
+            uint64_t next = 0;
+            check(session_delta_read(dlog.string(), at, m.delta_committed, id, lim, rec, next, error),
+                  "torn: a committed record reads");
+            check(session_delta_apply(dlog.string(), at, id, rec, sink, error), "torn: a committed record applies");
+            at = next;
+            ++applied;
+        }
+        check(applied == 2, "torn: exactly the two committed records apply");
+        bool rebuilt_same = true;
+        for (size_t l = 0; rebuilt_same && l < longer.kv.size(); ++l) {
+            const std::array<const ConversationBuffer*, 5> parts = {&longer.kv[l].k, &longer.kv[l].v,
+                                                                    &longer.kv[l].k_scale, &longer.kv[l].v_scale,
+                                                                    &longer.kv[l].pooled};
+            for (size_t part = 0; rebuilt_same && part < 5; ++part) {
+                std::vector<uint8_t> want(parts[part]->size());
+                if (!want.empty())
+                    parts[part]->visit(0, want.size(), [&](const uint8_t* p, size_t c, size_t at2) {
+                        std::memcpy(want.data() + at2, p, c);
+                        return true;
+                    });
+                rebuilt_same = rebuilt[l][part] == want;
+            }
+        }
+        check(rebuilt_same, "torn: base + records rebuild the newest state exactly");
+        fs::remove_all(tdir);
+    }
+
+    // a chain whose base file is gone: a clean miss at reopen, and the owned chain files go with the sidecar
+    {
+        const fs::path mdir = fs::temp_directory_path() / "strata_spill_missing_base_test";
+        fs::remove_all(mdir);
+        SavedConversation base = sample(1200);
+        SavedConversation grown = base;
+        for (int i = 0; i < 200; ++i) grown.live.ids.push_back(int32_t(2500 + i));
+        ConversationSpillCache c1;
+        size_t w = 0;
+        check(c1.open(mdir, id, 1ull << 30, error, true), "missing-base: open");
+        check(c1.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "missing-base: base");
+        size_t wd = 0;
+        check(c1.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), wd, error),
+              "missing-base: append");
+        const fs::path sess = c1.newest_path();
+        const fs::path meta = fs::path(sess).replace_extension(".meta");
+        const fs::path dlog = fs::path(sess).replace_extension(".dlog");
+        const fs::path dchain = fs::path(sess).replace_extension(".dchain");
+        check(fs::remove(sess), "missing-base: the base file goes");
+        ConversationSpillCache c2;
+        check(c2.open(mdir, id, 1ull << 30, error, true) && c2.size() == 0, "missing-base: a clean miss");
+        check(!fs::exists(meta) && !fs::exists(dlog) && !fs::exists(dchain),
+              "missing-base: the owned chain files go with the sidecar");
+        fs::remove_all(mdir);
+    }
+
+    // A sidecar missing after a crash cannot make a surviving base/log a usable entry; the owned orphan group is swept.
+    {
+        const fs::path sdir = fs::temp_directory_path() / "strata_spill_missing_sidecar_test";
+        fs::remove_all(sdir);
+        SavedConversation base = sample(1000), grown = sample(1200);
+        ConversationSpillCache c1;
+        size_t w = 0, wd = 0;
+        check(c1.open(sdir, id, 1ull << 30, error, true), "missing-sidecar: open");
+        check(c1.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "missing-sidecar: base");
+        check(c1.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), wd, error),
+              "missing-sidecar: append");
+        const fs::path sess = c1.newest_path();
+        const fs::path meta = fs::path(sess).replace_extension(".meta");
+        const fs::path dlog = fs::path(sess).replace_extension(".dlog");
+        const fs::path dchain = fs::path(sess).replace_extension(".dchain");
+        check(fs::remove(meta), "missing-sidecar: remove metadata to simulate interruption");
+        ConversationSpillCache reopened;
+        check(reopened.open(sdir, id, 1ull << 30, error, true), "missing-sidecar: reopen");
+        check(reopened.size() == 0 && reopened.bytes() == 0,
+              "missing-sidecar: an entry without ownership metadata is a clean miss");
+        check(!fs::exists(sess) && !fs::exists(dlog) && !fs::exists(dchain),
+              "missing-sidecar: the orphan group is removed without following external paths");
+        fs::remove_all(sdir);
+    }
+
+    // A surviving .dlog without its manifest is an incomplete chain, never a plain snapshot carrying newer IDs.
+    {
+        const fs::path ldir = fs::temp_directory_path() / "strata_spill_missing_manifest_test";
+        fs::remove_all(ldir);
+        SavedConversation base = sample(1000), grown = sample(1200);
+        ConversationSpillCache c1;
+        size_t w = 0, wd = 0;
+        check(c1.open(ldir, id, 1ull << 30, error, true), "missing-manifest: open");
+        check(c1.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "missing-manifest: base");
+        check(c1.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), wd, error),
+              "missing-manifest: append");
+        const fs::path sess = c1.newest_path();
+        const fs::path meta = fs::path(sess).replace_extension(".meta");
+        const fs::path dlog = fs::path(sess).replace_extension(".dlog");
+        const fs::path dchain = fs::path(sess).replace_extension(".dchain");
+        check(fs::remove(dchain), "missing-manifest: remove publication marker");
+        ConversationSpillCache reopened;
+        check(reopened.open(ldir, id, 1ull << 30, error), "missing-manifest: reopen in base-only mode");
+        check(reopened.size() == 0 && reopened.bytes() == 0,
+              "missing-manifest: the log prevents fallback to a plain base entry");
+        check(!fs::exists(sess) && !fs::exists(meta) && !fs::exists(dlog),
+              "missing-manifest: incomplete owned artifacts are cleaned together");
+        fs::remove_all(ldir);
+    }
+
+    // The base-only restore mode safely misses a real chain without deleting or loading the valid disk-only entry.
+    {
+        const fs::path xdir = fs::temp_directory_path() / "strata_spill_cross_mode_chain_test";
+        fs::remove_all(xdir);
+        SavedConversation base = sample(1000), grown = sample(1200);
+        ConversationSpillCache disk_only;
+        size_t w = 0, wd = 0;
+        check(disk_only.open(xdir, id, 1ull << 30, error, true), "cross-mode: disk-only open");
+        check(disk_only.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "cross-mode: base");
+        check(disk_only.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), wd, error),
+              "cross-mode: real chain append");
+        const std::string sess = disk_only.newest_path();
+        const uint64_t charged = disk_only.bytes();
+        const fs::path meta = fs::path(sess).replace_extension(".meta");
+        const fs::path dlog = fs::path(sess).replace_extension(".dlog");
+        const fs::path dchain = fs::path(sess).replace_extension(".dchain");
+        ConversationSpillCache base_only;
+        check(base_only.open(xdir, id, 1ull << 30, error), "cross-mode: base-only open");
+        check(base_only.size() == 1 && base_only.bytes() == charged,
+              "cross-mode: the valid chain remains indexed and accounted");
+        check(!bool(base_only.best(grown.live.ids, {}, grown.cvec, 0.0, 0)),
+              "cross-mode: base-only matching skips chain metadata");
+        check(base_only.find(sess) == base_only.size(), "cross-mode: append lookup skips unsupported chain");
+        SavedConversation loaded;
+        check(!base_only.load(sess, loaded, {}, error), "cross-mode: plain load refuses chain-backed state");
+        check(fs::exists(sess) && fs::exists(meta) && fs::exists(dlog) && fs::exists(dchain),
+              "cross-mode: unsupported mode does not delete a valid chain");
+        fs::remove_all(xdir);
+    }
+
+    // Deleting a symlink removes only the link and debits the entry's prior charge, never the external target size.
+#ifndef _WIN32
+    {
+        const fs::path sdir = fs::temp_directory_path() / "strata_spill_symlink_accounting_test";
+        fs::remove_all(sdir);
+        ConversationSpillCache c1;
+        check(c1.open(sdir, id, 1ull << 30, error), "symlink-accounting: open");
+        SavedConversation image = sample(1000);
+        size_t written = 0;
+        check(c1.spill_streamed(meta_of(image), sources_of(image, 0), written, error), "symlink-accounting: save");
+        const std::string sess = c1.newest_path();
+        const fs::path target = sdir / "outside-target.bin";
+        const uint64_t target_size = 2ull << 20;
+        { std::ofstream out(target, std::ios::binary); std::vector<char> payload((size_t) target_size, 'X'); out.write(payload.data(), payload.size()); }
+        check(fs::remove(sess), "symlink-accounting: replace the indexed base");
+        fs::create_symlink(target.filename(), sess);
+        const uint64_t before = c1.bytes();
+        check(before == written, "symlink-accounting: legacy v1 charge excludes its sidecar");
+        check(!bool(c1.best(image.live.ids, {}, image.cvec, 0.0, 0)),
+              "symlink-accounting: a symlink is not a regular session hit");
+        std::string remove_error;
+        check(c1.erase(sess, remove_error), "symlink-accounting: unlink the owned path");
+        check(c1.bytes() == 0, "symlink-accounting: only previously charged entry bytes are debited");
+        check(fs::file_size(target) == target_size, "symlink-accounting: the external target remains untouched");
+        fs::remove_all(sdir);
+    }
+#endif
+
+    // the disk budget evicts a delta chain as one entry: the base, the sidecar, the log and the manifest go together
+    // and the byte accounting is exact (the sidecar and manifest bytes count too)
+    {
+        const fs::path edir = fs::temp_directory_path() / "strata_spill_evict_chain_test";
+        fs::remove_all(edir);
+        SavedConversation base = sample(1000);
+        SavedConversation grown = base;
+        for (int i = 0; i < 200; ++i) grown.live.ids.push_back(int32_t(2500 + i));
+        ConversationSpillCache c1;
+        size_t w = 0;
+        check(c1.open(edir, id, 1ull << 30, error, true), "evict-chain: open");
+        check(c1.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "evict-chain: base");
+        const uint64_t meta_sz = fs::file_size(fs::path(c1.newest_path()).replace_extension(".meta"));
+        // a budget that fits the base and its sidecar: the append pushes the chain over it and the whole entry goes
+        ConversationSpillCache c2;
+        check(c2.open(edir, id, w + meta_sz, error, true), "evict-chain: open at the base's bytes plus its sidecar");
+        check(c2.size() == 1 && c2.bytes() == w + meta_sz, "evict-chain: the base and its sidecar fit");
+        const fs::path sess = c2.newest_path();
+        const fs::path meta = fs::path(sess).replace_extension(".meta");
+        const fs::path dlog = fs::path(sess).replace_extension(".dlog");
+        const fs::path dchain = fs::path(sess).replace_extension(".dchain");
+        size_t wd = 0;
+        check(c2.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), wd, error),
+              "evict-chain: the append over the budget");
+        check(c2.size() == 0 && c2.bytes() == 0 && c2.disk_evictions() == 1,
+              "evict-chain: the chain is evicted as one entry, the accounting exact");
+        check(!fs::exists(sess) && !fs::exists(meta) && !fs::exists(dlog) && !fs::exists(dchain),
+              "evict-chain: all four files go");
+        fs::remove_all(edir);
+    }
+
+    // the publication gap: the sidecar is written AFTER the chain manifest, so a crash can leave it describing the
+    // state before the last record (same token count, different ids).  The restore-time gate compares the chain's
+    // tail with the sidecar in full - ids, images and checkpoint lengths - and misses cleanly instead of applying a
+    // mix of two saves' state.  Here: a stale sidecar that a token-COUNT check alone cannot catch.
+    {
+        const fs::path gdir = fs::temp_directory_path() / "strata_spill_pubgap_test";
+        fs::remove_all(gdir);
+        // the restore-time gate, factored the way generate.cpp's read pass runs it: every committed record reads,
+        // then the last record's tail must equal the sidecar in full.
+        auto gate_ok = [&](ConversationSpillCache& cache, const std::string& entry_path, uint64_t committed) {
+            if (committed == 0) return true;
+            const fs::path dlog = fs::path(entry_path).replace_extension(".dlog");
+            uint64_t at = 0;
+            SessionDeltaRecord rec;
+            SessionReadLimits lim;
+            while (at < committed) {
+                uint64_t next = 0;
+                std::string e;
+                if (!session_delta_read(dlog.string(), at, committed, id, lim, rec, next, e)) return false;
+                if (next <= at || next > committed) return false;
+                at = next;
+            }
+            std::vector<size_t> lengths;
+            lengths.reserve(rec.meta.checkpoints.size());
+            for (const auto& c : rec.meta.checkpoints) lengths.push_back(c.ids.size());
+            return cache.entry_chain_tail_matches(cache.find(entry_path), rec.meta.live.ids, rec.meta.live.imgs,
+                                                  lengths);
+        };
+        ConversationSpillCache c0;
+        check(c0.open(gdir, id, 1ull << 30, error, true), "gap: open");
+        SavedConversation a = sample(1500);
+        size_t w = 0;
+        check(c0.spill_streamed(meta_of(a), sources_of(a, 0), w, error), "gap: base saved");
+        const fs::path meta_path = fs::path(c0.newest_path()).replace_extension(".meta");
+        const std::vector<char> sidecar_a = read_file(meta_path);
+        // b: the same token count, but the last 400 ids differ - what a client regenerating the tail would send
+        SavedConversation b = a;
+        for (size_t i = 1100; i < b.live.ids.size(); ++i) b.live.ids[i] = int32_t(77000 + i);
+        size_t wb = 0;
+        check(c0.spill_delta(0, meta_of(b), sources_of(b, 1024), (int64_t) b.live.ids.size(), wb, error),
+              "gap: the record commits");
+        // published together, the chain and the sidecar agree: the gate passes
+        {
+            ConversationSpillCache ok_cache;
+            check(ok_cache.open(gdir, id, 1ull << 30, error, true) && ok_cache.size() == 1,
+                  "gap: reopen keeps the chain");
+            const auto m = ok_cache.best(b.live.ids, {}, b.cvec, 0.0, 0);
+            const std::string expected_path = c0.newest_path();
+            const bool matches = bool(m);
+            const bool committed_matches = m.delta_committed == wb;
+            const bool path_matches = m.path == expected_path;
+            if (!matches || !committed_matches || !path_matches)
+                std::fprintf(stderr, "  gap reopen: mode=delta-on match=%d committed=%llu expected=%llu path='%s' expected_path='%s'\n",
+                             (int) matches, (unsigned long long) m.delta_committed,
+                             (unsigned long long) wb, m.path.c_str(), expected_path.c_str());
+            check(matches && committed_matches && path_matches, "gap: the committed chain matches");
+            check(gate_ok(ok_cache, m.path, m.delta_committed), "gap: a consistent chain passes the tail check");
+        }
+        // simulate the interruption: roll the sidecar back to a's (stale: same count, different ids)
+        write_file(meta_path, sidecar_a);
+        ConversationSpillCache gap_cache;
+        check(gap_cache.open(gdir, id, 1ull << 30, error, true) && gap_cache.size() == 1,
+              "gap: the stale sidecar still indexes (a clean miss is the reader's call, not open's)");
+        const auto stale = gap_cache.best(b.live.ids, {}, b.cvec, 0.0, 0);
+        const std::string expected_path = c0.newest_path();
+        const bool stale_matches = bool(stale);
+        const bool committed_matches = stale.delta_committed == wb;
+        const bool path_matches = stale.path == expected_path;
+        if (!stale_matches || !committed_matches || !path_matches)
+            std::fprintf(stderr, "  gap stale reopen: mode=delta-on match=%d committed=%llu expected=%llu path='%s' expected_path='%s'\n",
+                         (int) stale_matches, (unsigned long long) stale.delta_committed,
+                         (unsigned long long) wb, stale.path.c_str(), expected_path.c_str());
+        check(stale_matches && committed_matches && path_matches, "gap: the sidecar offers the chain");
+        check(stale.live_tokens == (int64_t) b.live.ids.size(),
+              "gap: the count alone cannot tell the two states apart");
+        check(!gate_ok(gap_cache, stale.path, stale.delta_committed),
+              "gap: the full tail comparison catches what the count cannot");
+        fs::remove_all(gdir);
+    }
+
+    // a foreign identity's chain is kept whole, never deleted: not indexed, not matched, outside the budget; a later
+    // own-identity pass still finds everything (the foreign pass claims nothing)
+    {
+        const fs::path fdir = fs::temp_directory_path() / "strata_spill_foreign_chain_test";
+        fs::remove_all(fdir);
+        SavedConversation base = sample(1000);
+        SavedConversation grown = base;
+        for (int i = 0; i < 200; ++i) grown.live.ids.push_back(int32_t(2500 + i));
+        ConversationSpillCache own;
+        size_t w = 0;
+        check(own.open(fdir, id, 1ull << 30, error, true), "foreign-chain: open");
+        check(own.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "foreign-chain: base");
+        size_t wd = 0;
+        check(own.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), wd, error),
+              "foreign-chain: append");
+        const fs::path sess = own.newest_path();
+        const fs::path meta = fs::path(sess).replace_extension(".meta");
+        const fs::path dlog = fs::path(sess).replace_extension(".dlog");
+        const fs::path dchain = fs::path(sess).replace_extension(".dchain");
+        ConversationSpillCache foreign;
+        check(foreign.open(fdir, SessionFileIdentity{1, 2}, 1ull << 30, error), "foreign-chain: foreign open");
+        check(foreign.size() == 0 && foreign.bytes() == 0, "foreign-chain: nothing indexed or counted");
+        check(fs::exists(sess) && fs::exists(meta) && fs::exists(dlog) && fs::exists(dchain),
+              "foreign-chain: all four files kept, none deleted");
+        ConversationSpillCache back;
+        check(back.open(fdir, id, 1ull << 30, error, true) && back.size() == 1,
+              "foreign-chain: the own identity finds it again");
+        const auto m = back.best(grown.live.ids, {}, grown.cvec, 0.0, 0);
+        const bool matches = bool(m);
+        const bool committed_matches = m.delta_committed == wd;
+        const bool path_matches = m.path == sess.string();
+        if (!matches || !committed_matches || !path_matches)
+            std::fprintf(stderr, "  foreign-chain reopen: mode=delta-on match=%d committed=%llu expected=%llu path='%s' expected_path='%s'\n",
+                         (int) matches, (unsigned long long) m.delta_committed,
+                         (unsigned long long) wd, m.path.c_str(), sess.string().c_str());
+        check(matches && committed_matches && path_matches, "foreign-chain: the chain matches again");
+        fs::remove_all(fdir);
+    }
+
+    // the budget evicts the least recently used, not first-written: a restore's touch makes an old entry the newest,
+    // and the stamps survive a reopen (a v1 sidecar's unknown age sorts as the oldest)
+    {
+        const fs::path ldir = fs::temp_directory_path() / "strata_spill_lru_test";
+        fs::remove_all(ldir);
+        ConversationSpillCache lru;
+        check(lru.open(ldir, id, 1ull << 30, error, true), "lru: open");
+        SavedConversation c1 = sample(1000);
+        SavedConversation c2 = sample(1500);   // the largest: its eviction must free enough for the budget below
+        SavedConversation c3 = sample(900);
+        size_t w = 0, w1 = 0, w2 = 0, w3 = 0;
+        check(lru.spill_streamed(meta_of(c1), sources_of(c1, 0), w, error), "lru: c1 saved");
+        const std::string p1 = lru.newest_path();
+        w1 = w;
+        const uint64_t m1 = fs::file_size(fs::path(p1).replace_extension(".meta"));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        check(lru.spill_streamed(meta_of(c2), sources_of(c2, 0), w, error), "lru: c2 saved");
+        const std::string p2 = lru.newest_path();
+        w2 = w;
+        const uint64_t m2 = fs::file_size(fs::path(p2).replace_extension(".meta"));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        check(lru.spill_streamed(meta_of(c3), sources_of(c3, 0), w, error), "lru: c3 saved");
+        const std::string p3 = lru.newest_path();
+        w3 = w;
+        const uint64_t m3 = fs::file_size(fs::path(p3).replace_extension(".meta"));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        lru.touch(p1);   // c1 was used again - it is the newest now, though it was saved first
+        check(lru.entry_last_used(lru.find(p1)) > lru.entry_last_used(lru.find(p3)), "lru: a touch stamps the newest");
+        check(lru.bytes() == w1 + w2 + w3 + m1 + m2 + m3, "lru: the three and their sidecars are accounted");
+        // a budget that fits two of the three: reopening evicts c2, the least recently used
+        ConversationSpillCache reopened;
+        check(reopened.open(ldir, id, w1 + w3 + m1 + m3 + 16, error, true), "lru: reopen with a budget for two");
+        check(reopened.size() == 2, "lru: one entry evicted");
+        check(reopened.disk_evictions() >= 1, "lru: the eviction is counted");
+        check(reopened.find(p2) == reopened.size(), "lru: the least recently used one is gone");
+        check(reopened.find(p1) != reopened.size() && reopened.find(p3) != reopened.size(),
+              "lru: the touched and the newer one stay");
+        check(reopened.entry_last_used(reopened.find(p1)) > reopened.entry_last_used(reopened.find(p3)),
+              "lru: the last-use stamps are persisted");
+        fs::remove_all(ldir);
+    }
+
+    // a v1 sidecar (written before the last-use stamp existed) is still indexed and restorable; its unknown age
+    // sorts as the oldest, so an upgrade never drops the cache
+    {
+        const fs::path vdir = fs::temp_directory_path() / "strata_spill_v1_test";
+        fs::remove_all(vdir);
+        fs::create_directories(vdir);
+        SavedConversation v = sample(1000);
+        size_t w = 0;
+        check(session_file_write((vdir / "strata-conv-1.sess").string(), v, id, w, error), "v1: the session file");
+        {
+            std::ofstream out(vdir / "strata-conv-1.meta", std::ios::binary | std::ios::trunc);
+            SessionHasher h(0);
+            auto raw = [&](const void* p, size_t n) {
+                out.write(static_cast<const char*>(p), (std::streamsize) n);
+                h.update(p, n);
+            };
+            auto u64 = [&](uint64_t x) { raw(&x, 8); };
+            auto i64 = [&](int64_t x) { raw(&x, 8); };
+            raw("SCSM", 4);
+            u64(1);                        // the v1 version: no last-use stamp follows the checkpoint lengths
+            u64(id.model);
+            u64(id.config);
+            u64(v.cvec ? 1 : 0);
+            u64(v.live.ids.size());
+            for (int32_t x : v.live.ids) i64(x);
+            u64(v.live.imgs.size());
+            for (const auto& k : v.live.imgs) { i64(k.start); u64(k.hash); }
+            u64(v.checkpoints.size());
+            for (const auto& c : v.checkpoints) u64(c.ids.size());
+            u64(h.digest());
+        }
+        ConversationSpillCache v1;
+        check(v1.open(vdir, id, 1ull << 30, error), "v1: open keeps it");
+        check(v1.size() == 1, "v1: indexed");
+        check(v1.bytes() == w, "v1: the budget counts the session file alone");
+        check(v1.entry_last_used(0) == 0, "v1: the unknown age is 0");
+        const auto hit = v1.best(v.live.ids, v.live.imgs, v.cvec, 0.0, 0);
+        check(bool(hit), "v1: it matches");
+        SavedConversation back;
+        check(v1.load(hit.path, back, {}, error) && back.live.ids == v.live.ids, "v1: it loads back");
+        fs::remove_all(vdir);
+    }
+
+    // the flag off keeps the baseline on-disk format: new sidecars are v1 (no last-use stamp), the append is
+    // refused, and a directory mixing v1 and v2 sidecars is indexed, matched and restorable by either setting -
+    // nothing is deleted, so a pre-delta engine can read the same directory unchanged
+    {
+        const fs::path odir = fs::temp_directory_path() / "strata_spill_offpath_test";
+        fs::remove_all(odir);
+        SavedConversation a = sample(1000), b = sample(1500);
+        // Keep the two candidates distinct: best() walks newest-first and retains the first equal-length match.
+        // These original fixtures shared tokens 1000..1999, so a 1000-token prompt tied and selected b even though
+        // this assertion deliberately loads a. The test is about cross-version file compatibility, not tie policy.
+        for (auto& token : b.live.ids) token += 40000;
+        for (auto& saved : b.checkpoints) for (auto& token : saved.ids) token += 40000;
+        size_t w = 0;
+        ConversationSpillCache off;
+        check(off.open(odir, id, 1ull << 30, error), "off-path: open");
+        check(off.spill_streamed(meta_of(a), sources_of(a, 0), w, error), "off-path: save v1");
+        const fs::path meta_a = fs::path(off.newest_path()).replace_extension(".meta");
+        const std::vector<char> v1bytes = read_file(meta_a);
+        uint64_t version = 0;
+        std::memcpy(&version, v1bytes.data() + 4, 8);
+        check(version == 1, "off-path: the delta-off sidecar is v1");
+        size_t wd = 0;
+        check(!off.spill_delta(off.find(off.newest_path()), meta_of(a), sources_of(a, 0), 1000, wd, error),
+              "off-path: the append refuses with delta off");
+        ConversationSpillCache on;
+        check(on.open(odir, id, 1ull << 30, error, true), "off-path: reopen with delta on");
+        check(on.spill_streamed(meta_of(b), sources_of(b, 0), w, error), "off-path: save v2");
+        const fs::path meta_b = fs::path(on.newest_path()).replace_extension(".meta");
+        uint64_t version2 = 0;
+        const std::vector<char> v2bytes = read_file(meta_b);
+        std::memcpy(&version2, v2bytes.data() + 4, 8);
+        check(version2 == 2, "off-path: the delta-on sidecar is v2");
+        // mixed v1/v2 directory: either setting indexes both, deletes nothing, matches and loads both
+        ConversationSpillCache mixed_off;
+        check(mixed_off.open(odir, id, 1ull << 30, error), "off-path: mixed reopen, delta off");
+        check(mixed_off.size() == 2, "off-path: both entries indexed with delta off");
+        ConversationSpillCache mixed_on;
+        check(mixed_on.open(odir, id, 1ull << 30, error, true), "off-path: mixed reopen, delta on");
+        check(mixed_on.size() == 2, "off-path: both entries indexed with delta on");
+        check(fs::exists(meta_a) && fs::exists(meta_b), "off-path: no sidecar deleted by either setting");
+        const auto hit_a = mixed_off.best(a.live.ids, {}, a.cvec, 0.0, 0);
+        const auto hit_b = mixed_on.best(b.live.ids, {}, b.cvec, 0.0, 0);
+        check(bool(hit_a) && bool(hit_b), "off-path: both match in a mixed directory");
+        check(hit_a.path == fs::path(meta_a).replace_extension(".sess").string(),
+              "off-path: the prompt selects the intended v1 entry");
+        SavedConversation back;
+        const bool loaded_v1 = mixed_off.load(hit_a.path, back, {}, error);
+        if (!loaded_v1)
+            std::fprintf(stderr, "  off-path v1 load error: %s\n", error.c_str());
+        else if (back.live.ids != a.live.ids) {
+            size_t mismatch = 0;
+            while (mismatch < back.live.ids.size() && mismatch < a.live.ids.size() &&
+                   back.live.ids[mismatch] == a.live.ids[mismatch]) ++mismatch;
+            std::fprintf(stderr, "  off-path v1 id mismatch at %zu: got %d, expected %d\n", mismatch,
+                         mismatch < back.live.ids.size() ? back.live.ids[mismatch] : -1,
+                         mismatch < a.live.ids.size() ? a.live.ids[mismatch] : -1);
+        }
+        check(loaded_v1, "off-path: the v1 entry loads");
+        check(back.live.ids == a.live.ids, "off-path: the v1 entry loads back");
+        fs::remove_all(odir);
+    }
+
+    // the default-off boundary, exactly: a pre-existing plain v1 directory is budgeted on the session file alone -
+    // an exact-fit budget keeps the entry and a below-file budget evicts it, the way the pre-feature engine did it
+    {
+        const fs::path bdir = fs::temp_directory_path() / "strata_spill_v1_budget_test";
+        fs::remove_all(bdir);
+        ConversationSpillCache c1;
+        check(c1.open(bdir, id, 1ull << 30, error), "v1-budget: open");
+        SavedConversation v = sample(1000);
+        size_t vw = 0;
+        check(c1.spill_streamed(meta_of(v), sources_of(v, 0), vw, error), "v1-budget: save");
+        check(c1.bytes() == vw, "v1-budget: the session file alone is counted");
+        ConversationSpillCache exact;
+        check(exact.open(bdir, id, vw, error), "v1-budget: reopen at the exact file budget");
+        check(exact.size() == 1, "v1-budget: an exact-fit budget keeps a legacy entry (the baseline boundary)");
+        check(exact.bytes() == vw, "v1-budget: exact-fit accounting remains the session file alone");
+        ConversationSpillCache tight;
+        check(tight.open(bdir, id, vw - 16, error), "v1-budget: reopen just under the file budget");
+        check(tight.size() == 0 && tight.disk_evictions() == 1, "v1-budget: a below-file budget evicts it");
+        check(tight.bytes() == 0, "v1-budget: below-fit eviction debits only this entry's session bytes");
+        fs::remove_all(bdir);
+    }
+
+    // a long chain is validated and applied one record at a time: 40 records, a per-record bound refuses the walk
+    // mid-chain, and base + every record rebuilds the newest state byte for byte
+    {
+        const fs::path ndir = fs::temp_directory_path() / "strata_spill_many_records_test";
+        fs::remove_all(ndir);
+        ConversationSpillCache c1;
+        check(c1.open(ndir, id, 1ull << 30, error, true), "many-records: open");
+        SavedConversation base = sample(1000);
+        size_t w = 0;
+        check(c1.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "many-records: base");
+        SavedConversation grown = base;
+        uint64_t expected_committed = 0;
+        for (int i = 1; i <= 40; ++i) {
+            grown.live.ids.push_back(int32_t(9000 + i));
+            size_t wd = 0;
+            check(c1.spill_delta(0, meta_of(grown), sources_of(grown, 64), (int64_t) grown.live.ids.size(), wd,
+                                 error), "many-records: append");
+            expected_committed += wd;
+        }
+        ConversationSpillCache c2;
+        check(c2.open(ndir, id, 1ull << 30, error, true) && c2.size() == 1, "many-records: reopen keeps the chain");
+        const auto m = c2.best(grown.live.ids, {}, grown.cvec, 0.0, 0);
+        const bool matches = bool(m) && m.live_tokens == (int64_t) grown.live.ids.size();
+        const bool committed_matches = m.delta_committed == expected_committed;
+        const bool path_matches = m.path == c1.newest_path();
+        if (!matches || !committed_matches || !path_matches)
+            std::fprintf(stderr, "  many-records reopen: mode=delta-on match=%d committed=%llu expected=%llu path='%s' expected_path='%s'\n",
+                         (int) matches, (unsigned long long) m.delta_committed,
+                         (unsigned long long) expected_committed, m.path.c_str(), c1.newest_path().c_str());
+        check(matches && committed_matches && path_matches, "many-records: the chain matches the newest state");
+        // per-record read bounds refuse the walk mid-chain (each record is validated one at a time, before the tail)
+        SessionReadLimits tight;
+        tight.max_tokens = base.live.ids.size() + 20;
+        std::string e2;
+        const std::string dlog = fs::path(m.path).replace_extension(".dlog").string();
+        uint64_t at = 0;
+        bool refused = false;
+        while (at < m.delta_committed) {
+            SessionDeltaRecord rec;
+            uint64_t next = 0;
+            if (!session_delta_read(dlog, at, m.delta_committed, id, tight, rec, next, e2)) { refused = true; break; }
+            at = next;
+        }
+        check(refused && at > 0 && at < m.delta_committed,
+              "many-records: a per-record bound refuses the chain mid-walk");
+        // exact reconstruction: the base, then every record in order, one at a time
+        SessionReadLimits lim;
+        SavedConversation base_meta;
+        std::vector<std::array<uint64_t, 5>> base_sizes;
+        size_t base_bytes = 0;
+        check(session_file_read_streamed(m.path, id, base_meta, base_bytes, e2, lim, &base_sizes),
+              "many-records: the base reads streamed");
+        std::vector<std::array<std::vector<uint8_t>, 5>> rebuilt(grown.kv.size());
+        for (size_t l = 0; l < grown.kv.size(); ++l) {
+            const std::array<const ConversationBuffer*, 5> parts = {&grown.kv[l].k, &grown.kv[l].v,
+                                                                    &grown.kv[l].k_scale, &grown.kv[l].v_scale,
+                                                                    &grown.kv[l].pooled};
+            for (size_t part = 0; part < 5; ++part) rebuilt[l][part].resize(parts[part]->size());
+        }
+        auto sink = [&](size_t layer, size_t part, uint64_t offset, const void* data, size_t n) {
+            if (layer >= rebuilt.size() || offset > rebuilt[layer][part].size() ||
+                n > rebuilt[layer][part].size() - offset) return false;
+            std::memcpy(rebuilt[layer][part].data() + offset, data, n);
+            return true;
+        };
+        check(session_file_apply_streamed(m.path, id, sink, base_sizes, e2), "many-records: the base applies");
+        at = 0;
+        int applied = 0;
+        while (at < m.delta_committed) {
+            SessionDeltaRecord rec;
+            uint64_t next = 0;
+            check(session_delta_read(dlog, at, m.delta_committed, id, lim, rec, next, e2),
+                  "many-records: a committed record reads");
+            check(session_delta_apply(dlog, at, id, rec, sink, e2), "many-records: a committed record applies");
+            at = next;
+            ++applied;
+        }
+        check(applied == 40, "many-records: exactly the 40 committed records apply");
+        bool rebuilt_same = true;
+        for (size_t l = 0; rebuilt_same && l < grown.kv.size(); ++l) {
+            const std::array<const ConversationBuffer*, 5> parts = {&grown.kv[l].k, &grown.kv[l].v,
+                                                                    &grown.kv[l].k_scale, &grown.kv[l].v_scale,
+                                                                    &grown.kv[l].pooled};
+            for (size_t part = 0; rebuilt_same && part < 5; ++part) {
+                std::vector<uint8_t> want(parts[part]->size());
+                if (!want.empty())
+                    parts[part]->visit(0, want.size(), [&](const uint8_t* p, size_t c, size_t at2) {
+                        std::memcpy(want.data() + at2, p, c);
+                        return true;
+                    });
+                rebuilt_same = rebuilt[l][part] == want;
+            }
+        }
+        check(rebuilt_same, "many-records: base + 40 records rebuild the newest state exactly");
+        // The walk preflight accounts for actual object/vector storage and the read/apply overlap, never log length.
+        // The conversation-file control-path fixture also exercises admission refusal and a streamed payload larger
+        // than its resident allowance; these assertions only check the bounded formula's shape.
+        {
+            SessionReadLimits bounded;
+            bounded.max_tokens = 64;
+            bounded.max_checkpoints = 1;
+            bounded.max_kv_layers = 1;
+            bounded.max_state_bytes = {4096, 4096, 4096, 4096, 4096};
+            const uint64_t old_payload_only_estimate =
+                64ull * (sizeof(int32_t) + sizeof(ConversationImageKey)) + 5ull * 4096 + 64;
+            const uint64_t metadata = session_read_meta_peak_bytes(bounded);
+            const uint64_t walk = session_delta_walk_peak_bytes(bounded);
+            check(metadata > 2 * old_payload_only_estimate && metadata < 4 * old_payload_only_estimate,
+                  "walk preflight: one metadata state includes object headers and page-rounded vector capacity");
+            check(walk > metadata + (16ull << 20) && walk < (17ull << 20),
+                  "walk preflight: overlapping record/parser metadata and one bounded I/O block");
+            check(session_delta_walk_peak_bytes(lim) >= session_read_meta_peak_bytes(lim),
+                  "walk preflight: an open-limit walk saturates safely");
+            SessionReadLimits generous;
+            generous.max_tokens = uint64_t(grown.live.ids.size()) * 4;
+            generous.max_checkpoints = 64;
+            generous.max_kv_layers = grown.kv.size();
+            generous.max_state_bytes.fill(2ull << 20);
+            check(session_delta_walk_peak_bytes(generous) > m.delta_committed,
+                  "walk preflight: generous finite limits can exceed this log without pricing its length");
+        }
+        fs::remove_all(ndir);
+    }
+
+    // the manifest's fixed temp name is created exclusively with no link following, the way the session files and
+    // the sidecar's temp are (conversation_file.cpp): a pre-existing ordinary file or a symlink is refused, and a
+    // symlink's target is never truncated
+    {
+        const fs::path cdir = fs::temp_directory_path() / "strata_spill_chain_tmp_test";
+        fs::remove_all(cdir);
+        ConversationSpillCache c1;
+        check(c1.open(cdir, id, 1ull << 30, error, true), "chain-tmp: open");
+        SavedConversation base = sample(1000);
+        size_t w = 0;
+        check(c1.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "chain-tmp: base");
+        SavedConversation grown = base;
+        for (int i = 0; i < 200; ++i) grown.live.ids.push_back(int32_t(2500 + i));
+        const std::string sess = c1.newest_path();
+        const fs::path chain = fs::path(sess).replace_extension(".dchain");
+        const fs::path tmp = fs::path(chain.string() + ".tmp");
+
+        {   // an ordinary pre-existing file at the temp name: refused, left as it was
+            { std::ofstream(tmp.string().c_str(), std::ios::binary | std::ios::trunc) << "sentinel-bytes"; }
+            size_t wd = 0;
+            check(!c1.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), wd, error),
+                  "chain-tmp: an existing temp file refuses the append");
+            check(read_file(tmp) == std::vector<char>({'s', 'e', 'n', 't', 'i', 'n', 'e', 'l', '-', 'b', 'y', 't', 'e', 's'}),
+                  "chain-tmp: the pre-existing temp file is untouched");
+            check(!fs::exists(chain), "chain-tmp: no manifest is published over the refusal");
+            check(fs::remove(tmp), "chain-tmp: pre-existing temp removed");
+        }
+        {   // A symlink at the temp name must not be followed or removed as an unowned temp. Windows runs this when
+            // the host permits symlink creation; the ordinary sentinel case above remains portable and mandatory.
+            const fs::path linkdir = cdir.string() + "_link";
+            fs::remove_all(linkdir);
+            ConversationSpillCache linked;
+            check(linked.open(linkdir, id, 1ull << 30, error, true), "chain-tmp: link fixture open");
+            SavedConversation link_base = sample(1000);
+            check(linked.spill_streamed(meta_of(link_base), sources_of(link_base, 0), w, error),
+                  "chain-tmp: link fixture base");
+            SavedConversation link_grown = link_base;
+            for (int i = 0; i < 200; ++i) link_grown.live.ids.push_back(int32_t(2500 + i));
+            const fs::path link_chain = fs::path(linked.newest_path()).replace_extension(".dchain");
+            const fs::path link_tmp = link_chain.string() + ".tmp";
+            const fs::path target = linkdir / "sentinel-owner.bin";
+            { std::ofstream(target.string().c_str(), std::ios::binary | std::ios::trunc) << "precious"; }
+            std::error_code link_error;
+            fs::create_symlink(target.filename(), link_tmp, link_error);
+#ifdef _WIN32
+            if (link_error)
+                std::fprintf(stderr, "SKIP: chain-tmp Windows symlink fixture unavailable: %s\n", link_error.message().c_str());
+#else
+            check(!link_error, "chain-tmp: create symlink sentinel");
+#endif
+            if (!link_error) {
+                size_t wd = 0;
+                check(!linked.spill_delta(0, meta_of(link_grown), sources_of(link_grown, 1024),
+                                          (int64_t) link_grown.live.ids.size(), wd, error),
+                      "chain-tmp: a symlinked temp refuses the append");
+                check(read_file(target) == std::vector<char>({'p', 'r', 'e', 'c', 'i', 'o', 'u', 's'}),
+                      "chain-tmp: the link's target is never written through");
+                check(fs::is_symlink(link_tmp), "chain-tmp: the symlink itself is left for the operator");
+                check(!fs::exists(link_chain), "chain-tmp: no manifest is published over the symlink");
+                fs::remove(link_tmp);
+            }
+            fs::remove_all(linkdir);
+        }
+        fs::remove_all(cdir);
+    }
+
+    // Partial removal debits only bytes already counted for this entry. The ownership sidecar and manifest remain
+    // beside a survivor, so a restart can retain an ineligible ledger and retry without double-debiting.
+    {
+        const fs::path ddir = fs::temp_directory_path() / "strata_spill_delete_fail_test";
+        fs::remove_all(ddir);
+        SavedConversation base = sample(1000);
+        SavedConversation grown = base;
+        for (int i = 0; i < 200; ++i) grown.live.ids.push_back(int32_t(2500 + i));
+        ConversationSpillCache c1;
+        check(c1.open(ddir, id, 1ull << 30, error, true), "delete-fail: open");
+        size_t w = 0;
+        check(c1.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "delete-fail: chain base");
+        size_t wd = 0;
+        check(c1.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), wd, error),
+              "delete-fail: append");
+        const uint64_t total_a = c1.bytes();
+        const std::string sp = c1.newest_path();
+        SavedConversation other = sample(800);
+        check(c1.spill_streamed(meta_of(other), sources_of(other, 0), w, error), "delete-fail: second entry");
+        const uint64_t total_b = c1.bytes() - total_a;
+
+        ConversationSpillCache c2;
+        check(c2.open(ddir, id, total_a + total_b, error, true), "delete-fail: reopen at the exact budget");
+        const fs::path dlog = fs::path(sp).replace_extension(".dlog");
+        const uint64_t s_sz = fs::file_size(sp);
+        {
+            std::error_code ec;
+            fs::remove(dlog, ec);
+            fs::create_directory(dlog);
+            { std::ofstream((dlog / "pinned").string().c_str()) << "busy"; }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        SavedConversation third = sample(700);
+        for (auto& t : third.live.ids) t += 40000;
+        size_t w3 = 0;
+        check(c2.spill_streamed(meta_of(third), sources_of(third, 0), w3, error), "delete-fail: third entry");
+        const uint64_t total_c = w3 + fs::file_size(fs::path(c2.newest_path()).replace_extension(".meta"));
+        const uint64_t owned_remainder = total_a - s_sz;
+        check(c2.size() == 2, "delete-fail: the incomplete chain stays indexed, the complete entry went");
+        check(c2.disk_evictions() == 1, "delete-fail: exactly one complete eviction is counted");
+        check(c2.bytes() == owned_remainder + total_c,
+              "delete-fail: partial eviction debits the removed base but retains log, manifest and sidecar charges");
+        const fs::path meta = fs::path(sp).replace_extension(".meta");
+        const fs::path dchain = fs::path(sp).replace_extension(".dchain");
+        check(!fs::exists(sp) && fs::is_directory(dlog) && fs::exists(meta) && fs::exists(dchain),
+              "delete-fail: preserve ownership metadata beside the blocking log path");
+        check(c2.find(sp) == c2.size(), "delete-fail: an incomplete entry is not found for append");
+        check(!bool(c2.best(grown.live.ids, {}, grown.cvec, 0.0, 0)),
+              "delete-fail: an incomplete chain is not offered as a hit");
+        SavedConversation unavailable;
+        check(!c2.load(sp, unavailable, {}, error), "delete-fail: an incomplete base cannot be loaded");
+        size_t rejected_append = 0;
+        check(!c2.spill_delta(0, meta_of(grown), sources_of(grown, 1024),
+                              (int64_t) grown.live.ids.size(), rejected_append, error),
+              "delete-fail: an incomplete entry refuses append");
+
+        // Reopen retains the same remaining debit using the manifest's committed length, without making the entry
+        // eligible. A retry against the still-blocked path changes no accounting.
+        ConversationSpillCache c3;
+        check(c3.open(ddir, id, total_a + total_b, error, true), "delete-fail: reopen partial ownership");
+        check(c3.size() == 2 && c3.find(sp) == c3.size(), "delete-fail: reopen retains but hides the incomplete entry");
+        check(c3.bytes() == owned_remainder + total_c, "delete-fail: reopen accounts the exact remaining owned bytes");
+        check(!c3.load(sp, unavailable, {}, error), "delete-fail: reopened incomplete state still cannot load");
+        check(!c3.spill_delta(0, meta_of(grown), sources_of(grown, 1024),
+                              (int64_t) grown.live.ids.size(), rejected_append, error),
+              "delete-fail: reopened incomplete entry still refuses append");
+        SavedConversation longer = grown;
+        for (int i = 0; i < 100; ++i) longer.live.ids.push_back(int32_t(3000 + i));
+        longer.checkpoints.push_back(checkpoint(grown.live.ids.size(), 9));
+        size_t wl = 0;
+        check(c3.spill_streamed(meta_of(longer), sources_of(longer, 0), wl, error), "delete-fail: full write");
+        const std::string kept = c3.newest_path();
+        const uint64_t before_drop = c3.bytes();
+        const size_t dropped = c3.drop_superseded(longer.live.ids, {}, longer.checkpoints, longer.cvec, kept);
+        check(dropped == 0, "delete-fail: a partial group is not claimed dropped");
+        check(c3.find(sp) == c3.size(), "delete-fail: partial entry remains ineligible after drop_superseded");
+        check(c3.bytes() == before_drop, "delete-fail: a failed drop does not debit a second time");
+        check(fs::exists(dlog) && fs::exists(meta) && fs::exists(dchain),
+              "delete-fail: the survivor and its ownership metadata are untouched");
+
+        const uint64_t before_erase = c3.bytes();
+        std::string ee;
+        check(!c3.erase(sp, ee), "delete-fail: erase reports the survivor");
+        check(ee.find(dlog.string()) != std::string::npos, "delete-fail: erase names the surviving path");
+        check(c3.find(sp) == c3.size(), "delete-fail: erase does not expose the incomplete entry");
+        check(c3.bytes() == before_erase, "delete-fail: retrying the same partial removal does not double-debit");
+        fs::remove_all(dlog);
+        check(c3.erase(sp, ee), "delete-fail: retry succeeds after the blocking path is gone");
+        check(!fs::exists(sp) && !fs::exists(meta) && !fs::exists(dlog) && !fs::exists(dchain),
+              "delete-fail: successful retry removes the remaining owned group");
+        check(before_erase - c3.bytes() == owned_remainder,
+              "delete-fail: retry debits exactly the remaining per-entry ledger");
+        fs::remove_all(ddir);
     }
 
     std::printf("conversation_spill_test: %d checks passed\n", checks);

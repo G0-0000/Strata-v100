@@ -9246,6 +9246,16 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
             if (disk_only) {
+                // --conversation-cache-min-tokens gates the disk tier too, not only the RAM cache below: a short
+                // conversation is not worth a whole session file, and the oldest-first budget eviction would push
+                // the long ones out for it.  The same non-error skip the RAM path's wants() takes.
+                if (!disk_continuing && !conversations.wants((int64_t) live.size())) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip disk save (%zu tokens, below the %lld "
+                                         "minimum; disk=%zu MiB in %zu files)\n",
+                                 live.size(), (long long) o.conversation_cache_min_tokens,
+                                 (size_t) (conversation_spill.bytes() >> 20), conversation_spill.size());
+                    return true;
+                }
                 if (!disk_continuing) disk_save_live(false, "switch");
                 return true;
             }
@@ -15719,7 +15729,14 @@ int main(int argc, char** argv) {
             }
         }
         if (conversation_spill.enabled() && disk_only) {   // the live conversation goes to disk, flushed
-            disk_save_live(true, "shutdown");
+            // the --conversation-cache-min-tokens gate the switch path takes applies here too
+            if (conversations.wants((int64_t) live.size()))
+                disk_save_live(true, "shutdown");
+            else
+                std::fprintf(stderr, "strata serve: conversation cache: skip disk save (%zu tokens, below the %lld "
+                                     "minimum; disk=%zu MiB in %zu files)\n",
+                             live.size(), (long long) o.conversation_cache_min_tokens,
+                             (size_t) (conversation_spill.bytes() >> 20), conversation_spill.size());
         } else if (conversation_spill.enabled()) {   // the parked conversations go to disk, so a restart finds them
             if (!park_current(0))
                 std::fprintf(stderr, "strata serve: conversation cache: the final active conversation was not captured (%s)\n",

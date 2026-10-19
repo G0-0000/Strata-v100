@@ -1278,7 +1278,9 @@ comes back, it is read the way a streaming RESTORE reads it: a read pass checks 
 GPU changes (a bad file is dropped and the prompt is read as usual), then the K/V goes into the pools 16 MiB at a
 time. The new file is written before the conversation's older copies are removed, so a failed write loses nothing,
 and no conversation is refused for its size: `--conversation-cache-disk-mib` is the only limit. The agent's next
-turn of the same conversation (it resumes at the newest turn checkpoint) writes nothing. A clean shutdown saves the
+turn of the same conversation (it resumes at the newest turn checkpoint) writes nothing. `--conversation-cache-min-tokens`
+gates the disk writes too: a conversation shorter than N tokens is never written to the spill directory (the switch
+save and the clean-shutdown flush are both skipped). A clean shutdown saves the
 live conversation (flushed), so the next start continues it. Single GPU, without `--batch` or `--peer-device`.
 
 Measured on a Ryzen AI Max+ 395 (gfx1151, the iGPU alone, internal NVMe; Qwen3.8-Flash-Next with K-quant experts,

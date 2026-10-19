@@ -1,6 +1,7 @@
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
 #include "strata/core/session.hpp"
 #include "strata/core/numa_policy.hpp"
+#include "strata/core/pin_budget.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/progress.hpp"
 
@@ -544,7 +545,9 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
     {
         // S2: this staging is faulted in by the thread that allocates it, so S1's light rule - bind the thread for
         // the scope that allocates - decides the node its pages come from.  `init` is the only place it is allocated,
-        // so this scope covers every path that reaches it.  Off (hot < 0): no syscall.
+        // so this scope covers every path that reaches it.  Off (hot < 0): no syscall.  The allocator itself was
+        // swapped upstream for host_alloc_guarded (pin budget); that is orthogonal to which node faults the pages in,
+        // so the binding scope wraps it either way.
         const int hot = detail::numa_hot_node();
         detail::ThreadNodeBinding nb;
         std::string why;
@@ -552,7 +555,7 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
             std::fprintf(stderr, "SessionLoopScratch: WARNING: cannot bind this thread to NUMA node %d (%s): the "
                                  "pool's pinned staging takes the process's memory policy\n", hot, why.c_str());
         // MAPPED as well as pinned: the token graph's handoff kernel reads it through its device pointer.
-        if (cudaHostAlloc((void**) &y_miss, parts_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        if (strata::core::host_alloc_guarded((void**) &y_miss, parts_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             err = "SessionLoopScratch: cudaHostAlloc for the pool's staging failed";
             return false;
         }

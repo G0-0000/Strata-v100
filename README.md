@@ -34,10 +34,27 @@
 - [本分支开发说明](https://github.com/G0-0000/Strata-v100/blob/b1-fp16/CONTEXT.md)
 - [上游项目与通用文档](https://github.com/Niko1221/Strata)
 
+## Something went wrong?
+
+- **My PC froze the first time Strata started.** It loads the model into RAM. Wait, and don't close the window. Still
+  frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
+- **It stopped while downloading or installing.** Start the app or `strata launch` again, or run `START-HERE.bat` (or
+  `./setup.sh`) again. It continues where it stopped.
+- **It is very slow, the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does not have
+  enough free RAM. Close other programs (browsers use a lot), or pick a smaller size such as Q2_0 or IQ2_XS.
+- **It says there is no engine for this PC.** In the app, open **Settings, Engine** and press **Update engine**. In the
+  Terminal, run `strata update`. `strata doctor` shows which engine files are installed.
+- **It says port 8080 is already in use.** Strata is already running. Look for its window.
+
+More problems and fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
+[issue](https://github.com/Niko1221/Strata/issues). In the app, attach the file from **Settings, Engine, Diagnostics, View
+logs, Save logs**. In the Terminal, paste the output of `strata doctor`. From source, attach `strata-<model>.log` from the
+Strata folder. For a security problem, report it privately: [SECURITY.md](SECURITY.md).
+
 ## Credits and license
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
+The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was compressed by
+[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5), agentionai (Gyro)
 and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
 [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
 parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).

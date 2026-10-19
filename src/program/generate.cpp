@@ -10875,37 +10875,68 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
-                        "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
-                        "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                        "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
-                        "conversation_cache_disk_mib=%lld conversation_cache_disk_only=%d conversation_cache_similarity=%.3f "
-                        "conversation_cache_n_min=%lld "
-                        "tail_role_token=%lld vram_elastic=%d "
-                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
-                        (long long) o.max_context, o.kv.c_str(),
-                        (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
-                                         ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
-                        (long long) slots_all, (long long) mib_all,
-                        (long long) slots_primary, (long long) mib_primary,
-                        o.spec, o.mtp_max_t,
-                        o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
-                        (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
-                        pool.workers(), o.pcie_frac,
-                        o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                        (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
-                        (long long) o.conversation_cache_disk_mib, disk_only ? 1 : 0, o.conversation_cache_similarity,
-                        (long long) o.conversation_cache_n_min,
-                        (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
-                        // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
-                        // prompt flows through, the chunk size from which a chunk streams every expert, --prefill-pipe
-                        (long long) o.prefill_chunk, sp.stage_count(),
-                        (long long) strata::prefill::Prefill::stream_all_min_tokens(),
-                        strata::prefill::Prefill::pipe_setting(),
-                        o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+            // the disk-tier fields are logged only when the tier is actually enabled: with every new flag off the
+            // startup line stays byte-identical to a build without the disk cache (P2: default path unchanged).
+            if (conversation_spill.enabled())
+                std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+                            "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                            "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+                            "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+                            "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
+                            "conversation_cache_disk_mib=%lld conversation_cache_disk_only=%d "
+                            "conversation_cache_similarity=%.3f conversation_cache_n_min=%lld "
+                            "tail_role_token=%lld vram_elastic=%d "
+                            "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                            (long long) o.max_context, o.kv.c_str(),
+                            (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+                                             ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
+                            (long long) slots_all, (long long) mib_all,
+                            (long long) slots_primary, (long long) mib_primary,
+                            o.spec, o.mtp_max_t,
+                            o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
+                            (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
+                            pool.workers(), o.pcie_frac,
+                            o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                            (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
+                            (long long) o.conversation_cache_disk_mib, disk_only ? 1 : 0, o.conversation_cache_similarity,
+                            (long long) o.conversation_cache_n_min,
+                            (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                            // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
+                            // prompt flows through, the chunk size from which a chunk streams every expert, --prefill-pipe
+                            (long long) o.prefill_chunk, sp.stage_count(),
+                            (long long) strata::prefill::Prefill::stream_all_min_tokens(),
+                            strata::prefill::Prefill::pipe_setting(),
+                            o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
+                                           " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                                           " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+            else
+                std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+                            "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                            "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+                            "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+                            "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
+                            "tail_role_token=%lld vram_elastic=%d "
+                            "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                            (long long) o.max_context, o.kv.c_str(),
+                            (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+                                             ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
+                            (long long) slots_all, (long long) mib_all,
+                            (long long) slots_primary, (long long) mib_primary,
+                            o.spec, o.mtp_max_t,
+                            o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
+                            (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
+                            pool.workers(), o.pcie_frac,
+                            o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                            (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
+                            (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                            // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
+                            // prompt flows through, the chunk size from which a chunk streams every expert, --prefill-pipe
+                            (long long) o.prefill_chunk, sp.stage_count(),
+                            (long long) strata::prefill::Prefill::stream_all_min_tokens(),
+                            strata::prefill::Prefill::pipe_setting(),
+                            o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
+                                           " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                                           " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the

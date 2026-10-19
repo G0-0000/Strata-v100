@@ -5,11 +5,20 @@
 #include "strata/core/conversation_spill.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <new>
+#include <sstream>
 #include <system_error>
+
+#if !defined(_WIN32)
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace strata::core {
 namespace {
@@ -118,10 +127,9 @@ bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Ent
 
 bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, const Entry& entry, std::string& error) const {
     const std::filesystem::path temporary(meta.string() + ".tmp");
+    std::ostringstream payload;
     {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) { error = "cannot create spill sidecar"; return false; }
-        MetaWriter w(out);
+        MetaWriter w(payload);
         if (!w.raw(kMetaMagic, 4) || !w.u64(kMetaVersion) || !w.u64(identity_.model) || !w.u64(identity_.config) ||
             !w.u64(entry.cvec ? 1 : 0) || !w.u64(entry.live_meta.ids.size())) {
             error = "cannot write spill sidecar"; return false;
@@ -132,9 +140,38 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
         if (!w.u64(entry.checkpoint_lengths.size())) { error = "cannot write spill sidecar"; return false; }
         for (size_t len : entry.checkpoint_lengths) if (!w.u64(len)) { error = "cannot write spill sidecar checkpoints"; return false; }
         if (!w.finish()) { error = "cannot finish spill sidecar"; return false; }
-        out.flush();
-        if (!out) { error = "cannot flush spill sidecar"; return false; }
     }
+    const std::string bytes = payload.str();
+    // The sidecar's token ids are decodable conversation content: the temp is created the way the session files
+    // are (conversation_file.cpp RawFile::create_new) - exclusive, never following a link, owner-only (0600) -
+    // not by truncating whatever a name happens to point at.
+#if defined(_WIN32)
+    {   // Windows: permissions follow the containing directory
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out) { error = "cannot create spill sidecar"; return false; }
+        out.write(bytes.data(), (std::streamsize) bytes.size());
+        out.flush();
+        if (!out) { error = "cannot write spill sidecar"; return false; }
+    }
+#else
+    const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) { error = std::string("cannot create spill sidecar: ") + std::strerror(errno); return false; }
+    size_t off = 0;
+    while (off < bytes.size()) {
+        const ssize_t n = ::write(fd, bytes.data() + off, bytes.size() - off);
+        if (n > 0) { off += (size_t) n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        error = std::string("cannot write spill sidecar: ") + (n < 0 ? std::strerror(errno) : "short write");
+        ::close(fd);
+        std::error_code rm; std::filesystem::remove(temporary, rm);
+        return false;
+    }
+    if (::close(fd) != 0) {
+        error = std::string("cannot write spill sidecar: ") + std::strerror(errno);
+        std::error_code rm; std::filesystem::remove(temporary, rm);
+        return false;
+    }
+#endif
     std::error_code ec;
     std::filesystem::rename(temporary, meta, ec);
     if (ec) { std::filesystem::remove(temporary, ec); error = "cannot commit spill sidecar"; return false; }
@@ -155,7 +192,19 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
     if (directory.empty() || !identity.model || !identity.config || !budget_) return true;
     try {
         std::error_code ec;
+#if defined(_WIN32)
         std::filesystem::create_directories(directory_, ec);
+#else
+        // create the leaf private (0700): it holds the session files, which are owner-only (0600).  Only a
+        // directory this engine creates is tightened; an existing one keeps its mode.
+        bool made_leaf = ::mkdir(directory_.c_str(), 0700) == 0;
+        if (!made_leaf && errno != EEXIST) {   // parents missing: the general path, then tighten the leaf it makes
+            std::filesystem::create_directories(directory_, ec);
+            made_leaf = !ec;
+        }
+        if (!ec && made_leaf && ::chmod(directory_.c_str(), 0700) != 0 && errno != EPERM)
+            ec.assign(errno, std::generic_category());
+#endif
         if (ec || !std::filesystem::is_directory(directory_, ec) || ec) {
             error = "cannot create or inspect spill directory " + directory_.string(); return false;
         }
@@ -175,6 +224,8 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
         if (ec) { error = "cannot scan spill directory " + directory_.string(); return false; }
         std::sort(metas.begin(), metas.end());
         size_t stale = stale_files_wiped_;
+        size_t foreign = 0;                 // sidecars naming another model/config identity: kept, not indexed
+        uint64_t foreign_bytes = 0;
         for (const auto& meta : metas) {
             Entry entry;
             entry.stem = meta;
@@ -183,7 +234,18 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
             bool other_identity = false;
             std::string parse_error;
             if (!read_sidecar(meta, entry, other_identity, parse_error)) {
-                if (!other_identity) { std::filesystem::remove(meta, ec); ec.clear(); std::filesystem::remove(entry.session_path(), ec); ec.clear(); ++stale; }
+                if (other_identity) {
+                    // Kept (never deleted), not indexed and outside the disk budget - but counted, so a rebuild or a
+                    // config change does not leave the operator guessing where the disk space went.
+                    ++foreign;
+                    std::error_code fec;
+                    if (const auto s = std::filesystem::file_size(entry.session_path(), fec); !fec) foreign_bytes += s;
+                    if (const auto s = std::filesystem::file_size(meta, fec); !fec) foreign_bytes += s;
+                    continue;
+                }
+                std::filesystem::remove(meta, ec); ec.clear();
+                std::filesystem::remove(entry.session_path(), ec); ec.clear();
+                ++stale;
                 continue;
             }
             std::error_code sec;
@@ -207,6 +269,13 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
             if (std::filesystem::exists(meta, ec) && !ec) continue;
             std::filesystem::remove(it->path(), ec); ec.clear(); ++stale;
         }
+        if (foreign > 0)
+            std::fprintf(stderr, "strata serve: conversation cache: WARNING: %zu spill file(s) (~%llu MiB) belong to "
+                                 "another model/config identity: kept on disk, not indexed and outside the disk "
+                                 "budget; remove them manually, e.g.\n"
+                                 "  rm -f %s/strata-conv-*.sess %s/strata-conv-*.meta\n",
+                         foreign, (unsigned long long) (foreign_bytes >> 20),
+                         directory_.string().c_str(), directory_.string().c_str());
         enabled_ = true;
         enforce_budget();
         stale_files_wiped_ = stale;

@@ -1246,6 +1246,17 @@ whose own checksum fails, is removed when the directory is scanned. The identity
 configuration fingerprint the session files below are bound to, so a spilled conversation and a hand-saved session
 file are interchangeable.
 
+The identity fingerprint follows the resolved configuration, so an engine rebuild or a config change (new flags, a
+different `--kv` or rope setting) makes every file already in the directory a foreign identity. Those files are
+**kept** — never auto-deleted, not indexed, and outside `--conversation-cache-disk-mib`'s budget, so the disk
+space they hold is invisible to the eviction and only the startup warning (`spill file(s) ... belong to another
+model/config identity`) reports their count and bytes. Use one spill directory per model **and** config, and when
+the config changes, clear the old files by hand:
+
+```bash
+rm -f DIR/strata-conv-*.sess DIR/strata-conv-*.meta
+```
+
 `--conversation-cache-similarity F` sets the least longest-common-prefix fraction of the new prompt a disk hit may
 offer (the fraction is `common_prefix_tokens / new_prompt_tokens`, and must be strictly greater than F);
 `--conversation-cache-n-min N` sets the least common-prefix token count. Both default to 0, which keeps every exact

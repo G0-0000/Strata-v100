@@ -28,7 +28,9 @@ struct ConversationSpillMatch {
 class ConversationSpillCache {
 public:
     // Opens (creating if needed) the spill directory and indexes the conversations already in it. Files whose
-    // sidecar names another model/config identity, or whose session file is missing or unreadable, are removed.
+    // session file is missing, unreadable or over budget, or whose sidecar is invalid, are removed. Files whose
+    // sidecar names another model/config identity are KEPT: never deleted, not indexed, outside the disk budget;
+    // open() logs a warning with their count and bytes - remove them manually.
     bool open(const std::filesystem::path& directory, SessionFileIdentity identity, uint64_t budget_bytes,
               std::string& error);
     bool enabled() const { return enabled_; }

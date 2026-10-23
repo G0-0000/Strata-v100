@@ -11460,19 +11460,31 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            // 磁盘层 INFO 字段仅在该层启用时输出；WRITE/READ 阈值则始终以数字字段报告。
+            // 磁盘层 INFO 字段仅在该层启用时输出；READ 阈值为 0 时启动行与无该功能之前逐字节一致，
+            // 大于 0 时才多报 conversation_cache_min_read_tokens 字段（参数恒传，仅格式串随阈值取舍）。
             if (conversation_spill.enabled())
-                std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
-                            "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
-                            "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                            "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                             "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
-                             "conversation_cache_min_read_tokens=%lld "
-                             "conversation_cache_disk_mib=%lld conversation_cache_disk_only=%d "
-                             "conversation_cache_disk_delta=%d "
-                            "conversation_cache_similarity=%.3f conversation_cache_n_min=%lld "
-                            "tail_role_token=%lld vram_elastic=%d "
-                            "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                std::printf(o.conversation_cache_min_read_tokens == 0
+                            ? "INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+                              "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                              "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+                              "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+                              "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
+                              "conversation_cache_disk_mib=%lld conversation_cache_disk_only=%d "
+                              "conversation_cache_disk_delta=%d "
+                              "conversation_cache_similarity=%.3f conversation_cache_n_min=%lld "
+                              "tail_role_token=%lld vram_elastic=%d "
+                              "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n"
+                            : "INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+                              "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                              "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+                              "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+                              "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
+                              "conversation_cache_min_read_tokens=%lld "
+                              "conversation_cache_disk_mib=%lld conversation_cache_disk_only=%d "
+                              "conversation_cache_disk_delta=%d "
+                              "conversation_cache_similarity=%.3f conversation_cache_n_min=%lld "
+                              "tail_role_token=%lld vram_elastic=%d "
+                              "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
                             (long long) o.max_context, o.kv.c_str(),
                             (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                              ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -11498,13 +11510,21 @@ int main(int argc, char** argv) {
                                            " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                            " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
             else
-                std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
-                            "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
-                            "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                            "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                             "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
-                             "conversation_cache_min_read_tokens=%lld "
-                            "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                std::printf(o.conversation_cache_min_read_tokens == 0
+                            ? "INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+                              "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                              "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+                              "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+                              "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
+                              "tail_role_token=%lld vram_elastic=%d "
+                              "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n"
+                            : "INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+                              "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                              "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+                              "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+                              "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
+                              "conversation_cache_min_read_tokens=%lld "
+                              "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
                             (long long) o.max_context, o.kv.c_str(),
                             (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                              ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -11517,6 +11537,8 @@ int main(int argc, char** argv) {
                             o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                              (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                              (long long) o.conversation_cache_min_read_tokens,
+                             // the READ=0 branch of the format string above consumes these two; the READ>0 branch leaves them
+                             (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                             // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
                             // prompt flows through, the chunk size from which a chunk streams every expert, --prefill-pipe
                             (long long) o.prefill_chunk, sp.stage_count(),

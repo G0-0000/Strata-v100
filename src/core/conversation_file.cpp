@@ -2013,6 +2013,29 @@ uint64_t session_delta_record_bytes(const SavedConversation& meta, const std::ve
     return sizing.n + kTrailer;
 }
 
+bool session_file_full_bytes(const SavedConversation& image, const std::vector<SessionKvSource>& sources,
+                             uint64_t& bytes, std::string& error) {
+    bytes = 0;
+    error.clear();
+    if (has_stage_parts(image)) {
+        error = "session file: layer-split state cannot be saved";
+        return false;
+    }
+    if (!image.kv.empty()) {
+        error = "session file: K/V given both in the image and as sources";
+        return false;
+    }
+    Out sizing;
+    put_payload(sizing, image, &sources);
+    if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
+        sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
+        error = "session file: the state is too large for this build";
+        return false;
+    }
+    bytes = sizing.n + kHeader + kTrailer;
+    return true;
+}
+
 bool session_delta_first_bytes(SessionKvSource& s, int64_t kept_tokens, bool index, int64_t idx_block,
                                int64_t idx_key_dim, std::string& error) {
     if (kept_tokens < 0 || s.page_size <= 0 || s.cells < 0 || (index && (idx_block <= 0 || idx_key_dim <= 0))) {

@@ -178,6 +178,11 @@ struct SessionKvSource {
     std::function<bool(size_t part, size_t offset, void* dst, size_t n)> read;
     std::function<std::string()> error;
 };
+// 精确计数完整 `.sess` 文件（含头部和尾部），复用序列化计数路径。source 按完整 size 计；不读取 source、不复制 GPU 数据、不做文件 I/O。
+// 失败时通过 `error` 说明会话无效或大小无法表示。
+bool session_file_full_bytes(const SavedConversation& image, const std::vector<SessionKvSource>& sources,
+                             uint64_t& bytes, std::string& error);
+
 // `meta` carries everything but the K/V (meta.kv must be empty); `kv` supplies the layers in order.
 bool session_file_write(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
                         const SessionFileIdentity& id, size_t& bytes, std::string& error,

@@ -1413,7 +1413,12 @@ exclusive temp: after creation, any write or close failure stops publication and
 temp (or reports a cleanup failure); a pre-existing temp is never removed on a failed exclusive create. When a chain's records outgrow
 the base file (by default two fifths of it, at least 64 MiB), or a conversation arrives whose K/V prefix
 no longer matches the chain on disk, the next switch writes a whole file as before, and prefix entries
-always write whole files. The chain's records are validated in the streaming restore's read pass and applied one at
+always write whole files. `--conversation-cache-disk-delta-percent N` sets the chain limit as a percentage of the base file
+(default 40; range 1..100), with the same 64 MiB minimum. It does not enable delta mode: set
+`--conversation-cache-disk-delta` separately. The default 40 keeps the previous two-fifths calculation. For a non-default
+percentage, Strata also writes a whole file rather than a delta when the next delta record alone would be at least as
+large as the exact full `.sess` snapshot. The percentage limit separately applies to the accumulated chain plus the next
+record, with overflow handled as over the limit. The chain's records are validated in the streaming restore's read pass and applied one at
 a time. The read pass keeps only the newest record's metadata; it does not build a per-record offset index. Before
 each parser allocation, counts are checked against the record and engine limits and the actual vector storage is
 admitted. The final preflight prices the read/apply overlap (record metadata, checkpoint and layer arrays, and one

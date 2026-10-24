@@ -73,8 +73,10 @@ public:
     }
 
     // Reads a spilled conversation back into image (its K/V included), with the engine's read limits and identity.
+    // `status` (optional) reports the verified file format: on a RAM refusal of a verified format-v2 file the caller
+    // keeps the file for a later attempt (a format-v1 refusal, as before, discards it).
     bool load(const std::string& path, SavedConversation& image, const SessionReadLimits& limits,
-              std::string& error) const;
+              std::string& error, SessionStatus* status = nullptr) const;
     // Writes a parked conversation (its K/V in RAM) as a session file plus its sidecar, and indexes it.
     bool spill(const SavedConversation& image, std::string& error);
     // --conversation-cache-disk-only: the same file and sidecar, written straight from the live session - `meta`
@@ -85,7 +87,7 @@ public:
     // that any new conversation opening the same way resumes from.  Prefix entries persist: drop_superseded never
     // removes them and the disk budget evicts every ordinary conversation before one of them.
     bool spill_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv, size_t& bytes,
-                        std::string& error, bool durable = false, bool prefix = false);
+                        std::string& error, bool durable = false, bool prefix = false, bool state_ref = false);
     // --conversation-cache-disk-delta: appends one delta record for an indexed entry instead of rewriting its file.
     // `meta` + `kv` describe the conversation's current state; kv[i].sizes are full part sizes and first_bytes the
     // offset each part's data starts at.  The record is written to the entry's `<stem>.dlog`, its committed length is

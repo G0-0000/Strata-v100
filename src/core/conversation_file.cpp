@@ -1,4 +1,5 @@
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/rht_state_codec.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -46,11 +47,10 @@ namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 constexpr uint32_t kVersion = 1;
-// version 2 (--conversation-cache-disk-state-ref, a prefix save only): every checkpoint's five running-state arrays
-// are descriptor-coded (codec, logical, stored, bytes); a checkpoint whose five arrays are all byte-identical to the
-// live state's is stored as REF descriptors pointing at the live copy.  Only written when at least one non-live
-// checkpoint actually takes REF; otherwise the file is byte-identical v1.
-constexpr uint32_t kVersionStateRef = 2;
+// Version 2 uses descriptor-coded state arrays (codec, logical, stored, bytes): a prefix checkpoint may use REF
+// descriptors, and an ordinary disk save may use RHT for GDN. Without either a REF descriptor or RHT state, bytes
+// remain the version-1 format.
+constexpr uint32_t kVersionV2 = 2;
 constexpr size_t kHeader = 64, kTrailer = 16;
 // per checkpoint the v2 descriptors add 5 x 16 B over v1's five 8 B length words (live included)
 constexpr uint64_t kV2DescriptorSlack = 80;
@@ -799,25 +799,63 @@ bool checkpoint_state_homomorphic(const ConversationCheckpoint& c, const Convers
            bytes_equal(c.dead, live.dead) && bytes_equal(c.block_pos, live.block_pos);
 }
 
-// v2: one running-state array as (codec, logical, stored, bytes[stored]); REF (codec 1) stores no bytes, its logical
-// size is the live array's length and the reader copies the live bytes into an independent vector
-template<class Vec>
-void put_state_v2(Out& o, const Vec& v, bool ref) {
-    o.u64(ref ? 1 : 0);
-    o.u64((uint64_t) v.size());
-    o.u64(ref ? 0 : (uint64_t) v.size());
-    if (!ref) o.raw(v.data(), v.size());
+using StateCodecArray = std::array<uint8_t, 5>;
+
+// Codec choices are decided once before either sizing or writing.  REF takes precedence over RHT for a checkpoint;
+// unsupported geometry, a mismatched GDN buffer, and non-finite state all remain RAW.
+std::vector<StateCodecArray> state_codecs(const SavedConversation& s, bool enabled, const std::vector<char>& ref,
+                                          rht::Layout& layout) {
+    std::vector<StateCodecArray> codec(s.checkpoints.size() + 1);
+    if (!enabled || !rht::layout_from(s.geometry, s.layer_lo, s.layer_hi, layout)) return codec;
+    const auto select_gdn = [&](const ConversationCheckpoint& checkpoint, size_t index, bool is_ref) {
+        if (is_ref || checkpoint.gdn.size() != layout.logical ||
+            !rht::all_finite(checkpoint.gdn.data(), layout.logical)) return;
+        codec[index][0] = 2;
+    };
+    select_gdn(s.live, 0, false);
+    for (size_t i = 0; i < s.checkpoints.size(); ++i)
+        select_gdn(s.checkpoints[i], i + 1, i < ref.size() && ref[i] != 0);
+    return codec;
 }
 
-void put_checkpoint_v2(Out& o, const ConversationCheckpoint& c, bool ref) {
+bool any_state_codec2(const std::vector<StateCodecArray>& codec) {
+    return std::any_of(codec.begin(), codec.end(), [](const StateCodecArray& state) { return state[0] == 2; });
+}
+
+// v2: one running-state array as (codec, logical, stored, bytes[stored]); REF (codec 1) stores no bytes, its logical
+// size is the live array's length and the reader copies the live bytes into an independent vector; RHT (codec 2)
+// stores the encoded GDN array and decodes it into an independent logical-size vector.
+template<class Vec>
+void put_state_v2(Out& o, const Vec& v, uint8_t codec, const rht::Layout& layout) {
+    o.u64(codec);
+    if (codec == 2) {
+        o.u64(layout.logical);
+        o.u64(layout.stored);
+        if (!o.f) {
+            o.count(layout.stored);
+        } else if (!rht::encode(v.data(), layout, [&](const void* data, size_t bytes) {
+                       o.raw(data, bytes);
+                       return o.ok;
+                   })) {
+            o.ok = false;
+        }
+        return;
+    }
+    o.u64((uint64_t) v.size());
+    o.u64(codec == 1 ? 0 : (uint64_t) v.size());
+    if (codec != 1) o.raw(v.data(), v.size());
+}
+
+void put_checkpoint_v2(Out& o, const ConversationCheckpoint& c, const StateCodecArray& codec,
+                       const rht::Layout& layout) {
     o.vec(c.ids);
     o.u64(c.imgs.size());
     for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
-    put_state_v2(o, c.gdn, ref);
-    put_state_v2(o, c.ple, ref);
-    put_state_v2(o, c.tails, ref);
-    put_state_v2(o, c.dead, ref);
-    put_state_v2(o, c.block_pos, ref);
+    put_state_v2(o, c.gdn, codec[0], layout);
+    put_state_v2(o, c.ple, codec[1], layout);
+    put_state_v2(o, c.tails, codec[2], layout);
+    put_state_v2(o, c.dead, codec[3], layout);
+    put_state_v2(o, c.block_pos, codec[4], layout);
     o.u64(c.used);
 }
 
@@ -825,12 +863,18 @@ void put_checkpoint_v2(Out& o, const ConversationCheckpoint& c, bool ref) {
 // five arrays become REF descriptors.  The K/V part is byte-identical to v1 (RAW, streamed from `sources` or the
 // captured buffers); only the state arrays are descriptor-coded.
 void put_payload_v2(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources,
-                    const std::vector<char>& ref) {
+                    const std::vector<char>& ref, const std::vector<StateCodecArray>& codec,
+                    const rht::Layout& layout) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
-    put_checkpoint_v2(o, s.live, false);
+    put_checkpoint_v2(o, s.live, codec[0], layout);
     o.u64(s.checkpoints.size());
-    for (size_t i = 0; i < s.checkpoints.size(); ++i) put_checkpoint_v2(o, s.checkpoints[i], ref[i] != 0);
+    for (size_t i = 0; i < s.checkpoints.size(); ++i) {
+        const bool is_ref = i < ref.size() && ref[i] != 0;
+        StateCodecArray checkpoint_codec = codec[i + 1];
+        if (is_ref) checkpoint_codec.fill(1);
+        put_checkpoint_v2(o, s.checkpoints[i], checkpoint_codec, layout);
+    }
     if (sources) {
         o.u64(sources->size());
         for (const auto& k : *sources) {
@@ -870,20 +914,29 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
 // ---- delta records (--conversation-cache-disk-delta): the same meta prefix as a session file, then the K/V each
 // part as (offset, size, bytes).  The payload hash covers the record's header fields too, so an edit anywhere in it
 // is refused by the read pass.
-constexpr uint64_t kDeltaVersion = 1;
+constexpr uint64_t kDeltaVersionV1 = 1;
+constexpr uint64_t kDeltaVersion = 2;
 constexpr char kDeltaMagic[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
 
 void put_delta_record(Out& o, const SessionFileIdentity& id, int64_t first_token, const SavedConversation& s,
-                      const std::vector<SessionKvSource>& kv) {
+                      const std::vector<SessionKvSource>& kv, uint64_t version,
+                      const std::vector<StateCodecArray>& codec, const rht::Layout& layout) {
     o.raw(kDeltaMagic, 8);
-    o.u64(kDeltaVersion);
+    o.u64(version);
     o.u64(id.model); o.u64(id.config);
     o.i64(first_token);
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
-    put_checkpoint(o, s.live);
-    o.u64(s.checkpoints.size());
-    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    if (version == kDeltaVersion) {
+        put_checkpoint_v2(o, s.live, codec[0], layout);
+        o.u64(s.checkpoints.size());
+        for (size_t i = 0; i < s.checkpoints.size(); ++i)
+            put_checkpoint_v2(o, s.checkpoints[i], codec[i + 1], layout);
+    } else {
+        put_checkpoint(o, s.live);
+        o.u64(s.checkpoints.size());
+        for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    }
     o.u64(kv.size());
     for (const auto& k : kv) {
         put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
@@ -904,9 +957,9 @@ struct In {
     const std::vector<std::array<uint64_t, 5>>* verify_kv = nullptr;
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
-    // format v2: the checkpoint descriptors are parsed with a local, complete per-allocation admission (the read
-    // pass's one upfront ask is only an initial screen, not a reservation) and REF arrays copy the live bytes into
-    // independent vectors
+    // format v2: the upfront read ask is an initial screen, not a reservation. REF and RHT allocate full logical
+    // outputs, which resize_admitted prices once per allocation; descriptor handling must not repeat the aggregate
+    // peak ask after earlier allocations. REF arrays copy live bytes into independent vectors.
     const ConversationCheckpoint* ref_live = nullptr;
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
     bool raw(void* p, size_t c) {
@@ -1071,7 +1124,9 @@ struct DeltaIn {
     const SessionDeltaRecord* verify = nullptr;
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
-    bool fail(const std::string& m) { if (error.empty()) error = "delta record: " + m; return false; }
+    const ConversationCheckpoint* ref_live = nullptr;
+     bool fail(const std::string& m) { if (error.empty()) error = "delta record: " + m; return false; }
+     bool account_state_codec(uint64_t codec, uint64_t, uint64_t) { return codec <= 2; }
     bool raw(void* p, size_t c) {
         if (c > end - at) return fail("record ends early");
         if (c && !f->read_at(at, static_cast<uint8_t*>(p), c)) { kind = f->kind(); return fail("read error: " + f->error()); }
@@ -1089,6 +1144,13 @@ struct DeltaIn {
     bool i64(int64_t& v) { return raw(&v, 8); }
     bool count(uint64_t& n, size_t elem, uint64_t limit = UINT64_MAX) {
         if (!u64(n)) return false;
+        if (elem && n > (end - at) / elem) return fail("element count exceeds the record");
+        if (n > limit) return fail("element count " + std::to_string(n) + " exceeds this engine's limit " +
+                                   std::to_string(limit));
+        if (n > (uint64_t) std::numeric_limits<size_t>::max() / (elem ? elem : 1)) return fail("element count too large");
+        return true;
+    }
+    bool bound(uint64_t n, size_t elem, uint64_t limit = UINT64_MAX) {
         if (elem && n > (end - at) / elem) return fail("element count exceeds the record");
         if (n > limit) return fail("element count " + std::to_string(n) + " exceeds this engine's limit " +
                                    std::to_string(limit));
@@ -1128,6 +1190,10 @@ struct DeltaIn {
         uint64_t n = 0;
         if (!count(n, sizeof(T), limit) || !resize(v, n)) return false;
         return raw(v.data(), (size_t) n * sizeof(T));
+    }
+    template<class T, class A> bool resize_admitted(std::vector<T, A>& v, uint64_t n) { return resize(v, n); }
+    template<class T, class A> bool vec_admitted(std::vector<T, A>& v, uint64_t limit = UINT64_MAX) {
+        return vec(v, limit);
     }
 };
 
@@ -1184,13 +1250,14 @@ bool has_stage_parts(const SavedConversation& s) {
 }
 
 // ---- format v2 readers: descriptor-coded state arrays with per-allocation admission.  REF resolves against the
-// file's live checkpoint (parsed first) into an INDEPENDENT vector; a legal file may mix RAW and REF arrays, the
-// writer this phase emits only all-five groups.  ids/imgs/used are never referenced and keep their stored values.
-template<class Vec>
-bool get_state_v2(In& in, Vec& dst, const Vec& live_src, uint64_t limit, bool live, const char* name) {
+// file's live checkpoint (parsed first) into an INDEPENDENT vector; RHT decodes into an independent logical-size
+// vector.  ids/imgs/used are never referenced and keep their stored values.
+template<class R, class Vec>
+bool get_state_v2(R& in, Vec& dst, const Vec& live_src, uint64_t limit, bool live, const char* name,
+                  bool gdn, const std::array<int64_t, 18>& geometry, int64_t layer_lo, int64_t layer_hi) {
     uint64_t codec = 0, logical = 0, stored = 0;
     if (!in.u64(codec) || !in.u64(logical) || !in.u64(stored)) return false;
-    if (codec > 1) return in.fail(std::string("unknown state array codec ") + std::to_string(codec) + " (" + name + ")");
+    if (codec > 2) return in.fail(std::string("unknown state array codec ") + std::to_string(codec) + " (" + name + ")");
     if (codec == 1) {
         // REF: only a non-live checkpoint, no stored bytes, the live same-order array's exact length (a logical size
         // may exceed the file's remaining bytes - that is what REF is for)
@@ -1198,34 +1265,53 @@ bool get_state_v2(In& in, Vec& dst, const Vec& live_src, uint64_t limit, bool li
         if (stored != 0) return in.fail(std::string("a REF state array stores no bytes (") + name + ")");
         if (logical != (uint64_t) live_src.size())
             return in.fail(std::string("a REF state array's length differs from the live state's (") + name + ")");
-        if (logical > limit) return in.fail("state array exceeds this engine's limit");
-        if (!in.resize_admitted(dst, logical)) return false;
+        if (!in.bound(logical, 0, limit) || !in.resize_admitted(dst, logical)) return false;
         if (logical) std::memcpy(dst.data(), live_src.data(), (size_t) logical);
+        return true;
+    }
+    if (codec == 2) {
+        if (!gdn) return in.fail(std::string("RHT codec is only valid for gdn state (") + name + ")");
+        rht::Layout layout{};
+        if (!rht::layout_from(geometry, layer_lo, layer_hi, layout))
+            return in.fail("RHT codec is invalid for this model geometry and layer range");
+        if (logical != layout.logical)
+            return in.fail("RHT state logical size does not match the model geometry");
+        if (stored != layout.stored)
+            return in.fail("RHT state stored size does not match the model geometry");
+        if (stored > logical) return in.fail("RHT stored size exceeds its logical size");
+        if (!in.bound(logical, 0, limit) || !in.bound(stored, 1) || !in.resize_admitted(dst, logical)) return false;
+        const auto read = [&in](void* data, size_t bytes) { return in.raw(data, bytes); };
+        if (!rht::decode(read, dst.data(), layout))
+            return in.fail(std::string("invalid RHT state payload (") + name + ")");
         return true;
     }
     if (stored != logical)
         return in.fail(std::string("a RAW state array's stored size differs from its logical size (") + name + ")");
     // `stored` was read with the descriptor: validate it against the bytes left and the engine limit, never read it
     // again (count() would consume the next u64 of the payload and overwrite `stored`)
-    if (!in.bound(stored, 1, limit)) return false;   // stored alone consumes the file's remaining bytes
-    if (!in.resize_admitted(dst, stored)) return false;
+    if (!in.bound(stored, 1, limit)) return false;
+    if (!in.resize_admitted(dst, logical)) return false;
     return in.raw(dst.data(), (size_t) stored);
 }
 
-bool get_checkpoint_v2(In& in, ConversationCheckpoint& c, bool live) {
+template<class R>
+bool get_checkpoint_v2(R& in, ConversationCheckpoint& c, bool live,
+                       const std::array<int64_t, 18>& geometry, int64_t layer_lo, int64_t layer_hi) {
     if (!in.vec_admitted(c.ids, in.limits.max_tokens)) return false;
     uint64_t n = 0;
     if (!in.count(n, 16, in.limits.max_tokens) || !in.resize_admitted(c.imgs, n)) return false;
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
-    if (!get_state_v2(in, c.gdn, in.ref_live->gdn, m[0], live, "gdn")) return false;
-    if (!get_state_v2(in, c.ple, in.ref_live->ple, m[1], live, "ple")) return false;
-    if (!get_state_v2(in, c.tails, in.ref_live->tails, m[2], live, "tails")) return false;
-    if (!get_state_v2(in, c.dead, in.ref_live->dead, m[3], live, "dead")) return false;
-    return get_state_v2(in, c.block_pos, in.ref_live->block_pos, m[4], live, "block_pos") && in.u64(c.used);
+    if (!get_state_v2(in, c.gdn, in.ref_live->gdn, m[0], live, "gdn", true, geometry, layer_lo, layer_hi)) return false;
+    if (!get_state_v2(in, c.ple, in.ref_live->ple, m[1], live, "ple", false, geometry, layer_lo, layer_hi)) return false;
+    if (!get_state_v2(in, c.tails, in.ref_live->tails, m[2], live, "tails", false, geometry, layer_lo, layer_hi)) return false;
+    if (!get_state_v2(in, c.dead, in.ref_live->dead, m[3], live, "dead", false, geometry, layer_lo, layer_hi)) return false;
+    return get_state_v2(in, c.block_pos, in.ref_live->block_pos, m[4], live, "block_pos", false,
+                        geometry, layer_lo, layer_hi) && in.u64(c.used);
 }
 
-bool get_meta_prefix_v2(In& in, SavedConversation& s) {
+template<class R>
+bool get_meta_prefix_v2(R& in, SavedConversation& s) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -1238,11 +1324,12 @@ bool get_meta_prefix_v2(In& in, SavedConversation& s) {
     if (cvec > 1) return in.fail("invalid cvec flag");
     s.cvec = cvec == 1;
     in.ref_live = &s.live;   // set before the live parse: the descriptor reader resolves REF arrays against it
-    if (!get_checkpoint_v2(in, s.live, true)) return false;
+    if (!get_checkpoint_v2(in, s.live, true, s.geometry, s.layer_lo, s.layer_hi)) return false;
     uint64_t n = 0;
     // a v2 checkpoint is at least 2 counts + 5 descriptors + used = 144 bytes; a K/V layer at least 7 + 5 = 96
     if (!in.count(n, 144, in.limits.max_checkpoints) || !in.resize_admitted(s.checkpoints, n)) return false;
-    for (auto& c : s.checkpoints) if (!get_checkpoint_v2(in, c, false)) return false;
+    for (auto& c : s.checkpoints)
+        if (!get_checkpoint_v2(in, c, false, s.geometry, s.layer_lo, s.layer_hi)) return false;
     return true;
 }
 
@@ -1309,7 +1396,7 @@ bool get_payload_streamed_v2(In& in, SavedConversation& s, const SessionKvBlock&
 }
 
 // header, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
-// header_hash:u64 (session_hash64 of bytes 0..55, seed 0); version 2 is the state-ref format (below)
+// header_hash:u64 (session_hash64 of bytes 0..55, seed 0); version 2 is the descriptor-coded state format (below)
 void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, uint32_t version) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
@@ -1519,10 +1606,15 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
     return std::min(n, l.max_file_bytes);
 }
 
-uint64_t session_read_peak_bytes(uint64_t file_bytes) {
-    const uint64_t segments = file_bytes / kBlock + 1;
-    // the parsed image (about the payload), the read buffer, a page per buffer segment, the small vectors
-    return sat_add(sat_add(sat_add(file_bytes, kBlock), sat_mul(segments, 4096)), uint64_t(1) << 20);
+uint64_t session_read_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits, uint32_t file_version,
+                                 uint64_t decoded_state_extra) {
+    (void) limits;
+    // Optional descriptor expansion augments this estimate when a caller already knows it. Readers keep this as an
+    // initial screen, then admit each actual logical destination allocation once while parsing.
+    const uint64_t parsed_bytes = sat_add(file_bytes,
+        file_version == kVersionV2 ? decoded_state_extra : 0);
+    const uint64_t segments = parsed_bytes / kBlock + 1;
+    return sat_add(sat_add(sat_add(parsed_bytes, kBlock), sat_mul(segments, 4096)), uint64_t(1) << 20);
 }
 
 namespace {
@@ -1562,16 +1654,39 @@ uint64_t session_delta_walk_peak_bytes(const SessionReadLimits& limits) {
     return std::max(read_peak, apply_peak);
 }
 
-uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits) {
+namespace {
+uint64_t session_stream_metadata_bytes(uint64_t file_bytes, const SessionReadLimits& limits,
+                                       bool& includes_state_allocations) {
+    includes_state_allocations = false;
+    const bool state_open = std::find(limits.max_state_bytes.begin(), limits.max_state_bytes.end(), UINT64_MAX) !=
+                            limits.max_state_bytes.end();
+    if (limits.max_tokens == UINT64_MAX || limits.max_checkpoints == UINT64_MAX || state_open) return file_bytes;
+
+    uint64_t one_checkpoint = 64;
+    const uint64_t token_bytes = sizeof(int32_t) + sizeof(ConversationImageKey);
+    if (file_bytes < one_checkpoint || limits.max_tokens > (file_bytes - one_checkpoint) / token_bytes) return file_bytes;
+    one_checkpoint += limits.max_tokens * token_bytes;
+    for (uint64_t bytes : limits.max_state_bytes) {
+        if (bytes > file_bytes - one_checkpoint) return file_bytes;
+        one_checkpoint += bytes;
+    }
+    if (one_checkpoint && limits.max_checkpoints > (file_bytes - one_checkpoint) / one_checkpoint) return file_bytes;
+    includes_state_allocations = true;
+    return one_checkpoint + limits.max_checkpoints * one_checkpoint;
+}
+} // namespace
+
+uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits, uint32_t file_version,
+                                        uint64_t decoded_state_extra) {
     // the reader's block and the block a K/V part is moved through, plus the small vectors
     uint64_t n = sat_add(sat_mul(2, kBlock), uint64_t(1) << 20);
-    // the parsed running-state metadata: the live checkpoint and every checkpoint the limits accept, each bounded
-    // by the tokens and state bytes the engine allows (an open limit can hold no more than the file itself)
-    uint64_t cp = sat_mul(limits.max_tokens, sizeof(int32_t) + sizeof(ConversationImageKey));
-    for (uint64_t b : limits.max_state_bytes) cp = sat_add(cp, b);
-    cp = sat_add(cp, 64);
-    const uint64_t checkpoints = limits.max_checkpoints == UINT64_MAX ? file_bytes : sat_mul(limits.max_checkpoints, cp);
-    n = sat_add(n, std::min(sat_add(cp, checkpoints), file_bytes));
+    // A bounded metadata estimate includes the allowed logical state arrays when it fits below the file-size cap.
+    // Callers that know descriptors may add expansion not represented by the metadata estimate; the read path instead
+    // admits each destination allocation separately after this initial screen.
+    bool includes_state_allocations = false;
+    const uint64_t metadata_bytes = session_stream_metadata_bytes(file_bytes, limits, includes_state_allocations);
+    n = sat_add(n, metadata_bytes);
+    if (file_version == kVersionV2 && !includes_state_allocations) n = sat_add(n, decoded_state_extra);
     // one hash per <= 16 MiB block moved, and the per-layer directories (a tiny term, bounded by the file)
     n = sat_add(n, sat_mul(file_bytes / kBlock + 1, 6 * sizeof(uint64_t)));
     return n;
@@ -1587,7 +1702,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
     // the state-ref decision, once, before sizing: with state_ref on (a prefix save), a non-live checkpoint whose
     // five running-state arrays are ALL byte-identical to the live state's takes REF in a version-2 file; any
-    // difference in any array keeps that checkpoint RAW, and with no REF hit at all the file stays byte-identical v1
+    // difference in any array keeps that checkpoint RAW, and absent both REF and RHT descriptors the file stays v1
     std::vector<char> ref;
     if (opt.state_ref && !image.checkpoints.empty()) {
         ref.assign(image.checkpoints.size(), 0);
@@ -1595,10 +1710,13 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
             ref[i] = checkpoint_state_homomorphic(image.checkpoints[i], image.live) ? 1 : 0;
         if (std::find(ref.begin(), ref.end(), char(1)) == ref.end()) ref.clear();
     }
-    const uint32_t version = ref.empty() ? kVersion : kVersionStateRef;
+    rht::Layout codec_layout{};
+    const std::vector<StateCodecArray> codec = state_codecs(image, opt.state_codec_rht, ref, codec_layout);
+    const bool any_codec2 = any_state_codec2(codec);
+    const uint32_t version = ref.empty() && !any_codec2 ? kVersion : kVersionV2;
     Out sizing;
-    if (ref.empty()) put_payload(sizing, image, sources);
-    else put_payload_v2(sizing, image, sources, ref);
+    if (version == kVersion) put_payload(sizing, image, sources);
+    else put_payload_v2(sizing, image, sources, ref, codec, codec_layout);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
@@ -1642,8 +1760,8 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     out.f = &f;
     out.hash = &hash;
     if (ok) {
-        if (ref.empty()) put_payload(out, image, sources);
-        else put_payload_v2(out, image, sources, ref);
+        if (version == kVersion) put_payload(out, image, sources);
+        else put_payload_v2(out, image, sources, ref, codec, codec_layout);
     }
     ok = ok && out.ok && out.n == payload;
     if (ok) {
@@ -1711,6 +1829,7 @@ uint64_t session_save_peak_bytes(const ConversationCheckpoint* deepest, const Se
     n = sat_add(n, sat_mul(live.tokens, sizeof(int32_t)));                    // its token list
     n = sat_add(n, sat_mul(live.images, sizeof(ConversationImageKey)));       // its images
     n = sat_add(n, sat_mul(live.kv_layers, sizeof(SessionKvSource) + 256));   // the K/V source directory
+    n = sat_add(n, live.codec_scratch);                                       // bounded state-codec working set
     return n;
 }
 
@@ -1751,7 +1870,7 @@ bool header_ok(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, u
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion && version != kVersionStateRef) {
+    if (version != kVersion && version != kVersionV2) {
         error = "session file: unsupported version " + std::to_string(version);
         return false;
     }
@@ -1839,7 +1958,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     if (!rf.open(path, id, limits, payload, error, st)) return false;
     if (limits.admit) {
         std::string why;
-        if (!limits.admit(session_read_peak_bytes(rf.size), why)) {
+        if (!limits.admit(session_read_peak_bytes(rf.size, limits, rf.version), why)) {
             st.error = SessionError::memory;
             error = "session file: " + why;
             return false;
@@ -1847,7 +1966,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     SavedConversation parsed;
     In in{&rf.source, SessionHasher(0), payload, error, limits};
-    const bool ok = rf.version == kVersionStateRef ? get_payload_v2(in, parsed) : get_payload(in, parsed);
+    const bool ok = rf.version == kVersionV2 ? get_payload_v2(in, parsed) : get_payload(in, parsed);
     if (!ok) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
@@ -1875,7 +1994,7 @@ bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, Sa
     if (!rf.open(path, id, limits, payload, error, st)) return false;
     if (limits.admit) {
         std::string why;
-        if (!limits.admit(session_read_stream_peak_bytes(rf.size, limits), why)) {
+        if (!limits.admit(session_read_stream_peak_bytes(rf.size, limits, rf.version), why)) {
             st.error = SessionError::memory;
             error = "session file: " + why;
             return false;
@@ -1884,7 +2003,7 @@ bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, Sa
     SavedConversation parsed;
     In in{&rf.source, SessionHasher(0), payload, error, limits};
     in.record_kv = kv_part_bytes;
-    const bool ok = rf.version == kVersionStateRef ? get_payload_streamed_v2(in, parsed, {})
+    const bool ok = rf.version == kVersionV2 ? get_payload_streamed_v2(in, parsed, {})
                                                    : get_payload_streamed(in, parsed, {});
     if (!ok) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
@@ -1915,7 +2034,7 @@ bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, c
     ReadFile rf;
     uint64_t payload = 0;
     if (!rf.open(path, id, bounds ? *bounds : open, payload, error, st)) return false;
-    const bool v2 = rf.version == kVersionStateRef;
+    const bool v2 = rf.version == kVersionV2;
     if (v2 && bounds && bounds->admit) {
         // the apply pass re-parses the metadata while the read pass's copy is still resident: admit ONLY this
         // additional peak (parser metadata and one 16 MiB I/O block), before the first byte can reach the sink.  The
@@ -2039,8 +2158,11 @@ bool delta_write_impl(const std::string& path, uint64_t at, const SavedConversat
     for (const auto& s : kv)
         for (size_t p = 0; p < 5; ++p)
             if (s.first_bytes[p] > s.sizes[p]) { error = "delta record: a K/V offset is past its part"; return false; }
+    rht::Layout codec_layout{};
+    const std::vector<StateCodecArray> codec = state_codecs(meta, opt.state_codec_rht, {}, codec_layout);
+    const uint64_t record_version = any_state_codec2(codec) ? kDeltaVersion : kDeltaVersionV1;
     Out sizing;
-    put_delta_record(sizing, id, first_token, meta, kv);
+    put_delta_record(sizing, id, first_token, meta, kv, record_version, codec, codec_layout);
     if (sizing.overflow || sizing.n > UINT64_MAX - kTrailer) {
         error = "delta record: the state is too large for this build";
         return false;
@@ -2084,7 +2206,7 @@ bool delta_write_impl(const std::string& path, uint64_t at, const SavedConversat
     Out out;
     out.f = &f;
     out.hash = &hash;
-    put_delta_record(out, id, first_token, meta, kv);
+    put_delta_record(out, id, first_token, meta, kv, record_version, codec, codec_layout);
     bool ok = out.ok && out.n == sizing.n;
     if (ok) {
         const uint64_t ph = hash.digest();
@@ -2122,7 +2244,8 @@ bool delta_read_impl(const std::string& path, uint64_t at0, uint64_t limit, cons
     char magic[8];
     uint64_t version = 0, model = 0, config = 0;
     int64_t first_token = 0;
-    if (!in.raw(magic, 8) || std::memcmp(magic, kDeltaMagic, 8) != 0 || !in.u64(version) || version != kDeltaVersion ||
+    if (!in.raw(magic, 8) || std::memcmp(magic, kDeltaMagic, 8) != 0 || !in.u64(version) ||
+        (version != kDeltaVersionV1 && version != kDeltaVersion) ||
         !in.u64(model) || !in.u64(config) || !in.i64(first_token)) {
         st.error = in.kind;
         return false;
@@ -2135,7 +2258,9 @@ bool delta_read_impl(const std::string& path, uint64_t at0, uint64_t limit, cons
     // as it was
     SessionDeltaRecord result;
     SavedConversation& parsed = result.meta;
-    if (!get_meta_prefix_t(in, parsed)) { st.error = in.kind; return false; }
+    const bool parsed_meta = version == kDeltaVersion ? get_meta_prefix_v2(in, parsed)
+                                                     : get_meta_prefix_t(in, parsed);
+    if (!parsed_meta) { st.error = in.kind; return false; }
     uint64_t n = 0;
     if (!in.count(n, 96, limits.max_kv_layers)) { st.error = in.kind; return false; }
     if (!in.resize(parsed.kv, n) || !in.resize_zero(result.kv_offset, n) || !in.resize_zero(result.kv_bytes, n)) {
@@ -2232,7 +2357,8 @@ bool delta_apply_impl(const std::string& path, uint64_t at0, const SessionFileId
     char magic[8];
     uint64_t version = 0, model = 0, config = 0;
     int64_t first_token = 0;
-    if (!in.raw(magic, 8) || std::memcmp(magic, kDeltaMagic, 8) != 0 || !in.u64(version) || version != kDeltaVersion ||
+    if (!in.raw(magic, 8) || std::memcmp(magic, kDeltaMagic, 8) != 0 || !in.u64(version) ||
+        (version != kDeltaVersionV1 && version != kDeltaVersion) ||
         !in.u64(model) || !in.u64(config) || !in.i64(first_token)) { st.error = in.kind; return false; }
     if (model != id.model || config != id.config) {
         error = "delta record: saved with another model or engine configuration";
@@ -2240,7 +2366,9 @@ bool delta_apply_impl(const std::string& path, uint64_t at0, const SessionFileId
     }
     if (first_token != expected.first_token) { in.fail("the record's first token differs from the read pass"); st.error = in.kind; return false; }
     SavedConversation parsed;
-    if (!get_meta_prefix_t(in, parsed)) { st.error = in.kind; return false; }
+    const bool parsed_meta = version == kDeltaVersion ? get_meta_prefix_v2(in, parsed)
+                                                     : get_meta_prefix_t(in, parsed);
+    if (!parsed_meta) { st.error = in.kind; return false; }
     if (parsed.live.ids.size() != expected.meta.live.ids.size() || parsed.geometry != expected.meta.geometry ||
         parsed.layer_lo != expected.meta.layer_lo || parsed.layer_hi != expected.meta.layer_hi ||
         parsed.cvec != expected.meta.cvec || parsed.checkpoints.size() != expected.meta.checkpoints.size()) {
@@ -2348,10 +2476,13 @@ bool session_delta_apply(const std::string& path, uint64_t at, const SessionFile
 }
 
 uint64_t session_delta_record_bytes(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
-                                    bool* overflow) {
+                                    bool* overflow, bool state_codec_rht) {
     if (overflow) *overflow = false;
+    rht::Layout codec_layout{};
+    const std::vector<StateCodecArray> codec = state_codecs(meta, state_codec_rht, {}, codec_layout);
+    const uint64_t record_version = any_state_codec2(codec) ? kDeltaVersion : kDeltaVersionV1;
     Out sizing;
-    put_delta_record(sizing, SessionFileIdentity{}, 0, meta, kv);
+    put_delta_record(sizing, SessionFileIdentity{}, 0, meta, kv, record_version, codec, codec_layout);
     if (sizing.overflow || sizing.n > UINT64_MAX - kTrailer) {
         if (overflow) *overflow = true;
         return 0;

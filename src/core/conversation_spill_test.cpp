@@ -2,6 +2,7 @@
 // written as a session file plus a metadata sidecar, matched from the sidecar alone, and read back whole.
 // Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no CUDA, no model.
 #include "strata/core/conversation_spill.hpp"
+#include "strata/core/rht_state_codec.hpp"
 
 #include <array>
 #include <cstdio>
@@ -9,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -66,6 +68,24 @@ SavedConversation sample(size_t tokens) {
         kv.pooled = pattern(9 * 128 * 4, uint8_t(layer + 40));
         s.kv.push_back(std::move(kv));
     }
+    return s;
+}
+SavedConversation rht_sample(size_t tokens) {
+    SavedConversation s = sample(tokens);
+    s.geometry = {2560, 2, 4, 128, 16, 1, 2, 1, 6144, 24, 2, 256, 4, 128, 4, 320, 512, 640};
+    s.layer_lo = 0;
+    s.layer_hi = 2;
+    rht::Layout layout{};
+    if (!rht::layout_from(s.geometry, s.layer_lo, s.layer_hi, layout)) std::abort();
+    const auto finite_gdn = [&](ConversationCheckpoint& checkpoint, uint8_t seed) {
+        checkpoint.gdn.resize((size_t) layout.logical);
+        for (size_t at = 0; at < checkpoint.gdn.size(); at += sizeof(float)) {
+            const float value = (float) ((int) (at / sizeof(float) % 127) - 63) * 0.001f + (float) seed * 0.01f;
+            std::memcpy(checkpoint.gdn.data() + at, &value, sizeof(value));
+        }
+    };
+    finite_gdn(s.live, 1);
+    for (size_t i = 0; i < s.checkpoints.size(); ++i) finite_gdn(s.checkpoints[i], (uint8_t) (i + 2));
     return s;
 }
 bool buffers_equal(const ConversationBuffer& a, const ConversationBuffer& b) {
@@ -1626,6 +1646,144 @@ int main() {
                                  next, error) && next == wr && rec.meta.live.ids == grown.live.ids,
               "state-ref delta-on: the record is still a v1 record and reads back");
         fs::remove_all(ddir);
+    }
+
+    // RHT is opt-in for ordinary disk spills and delta records; prefix files and slot/RAM saves remain RAW.
+    {
+        auto session_version = [&](const fs::path& path) {
+            const std::vector<char> data = read_file(path);
+            uint32_t version = 0;
+            if (data.size() >= 12) std::memcpy(&version, data.data() + 8, 4);
+            return version;
+        };
+        auto word64 = [](const std::vector<char>& data, size_t at) {
+            uint64_t value = 0;
+            if (at <= data.size() && data.size() - at >= sizeof(value)) std::memcpy(&value, data.data() + at, sizeof(value));
+            return value;
+        };
+        const fs::path pdir = dir / "rht-prefix-on";
+        const fs::path plain_dir = dir / "rht-prefix-off";
+        fs::remove_all(pdir); fs::remove_all(plain_dir);
+        const SavedConversation root = rht_sample(600);
+        ConversationSpillCache prefix_on;
+        check(prefix_on.open(pdir, id, 1ull << 30, error), "rht spill: prefix-on open");
+        size_t prefix_on_bytes = 0;
+        check(prefix_on.spill_streamed(meta_of(root), sources_of(root, 0), prefix_on_bytes, error,
+                                       true, true, false, true),
+              "rht spill: prefix true accepts the requested codec flag");
+        const std::vector<char> prefix_on_data = read_file(prefix_on.newest_path());
+        ConversationSpillCache prefix_off;
+        check(prefix_off.open(plain_dir, id, 1ull << 30, error), "rht spill: prefix-off open");
+        size_t prefix_off_bytes = 0;
+        check(prefix_off.spill_streamed(meta_of(root), sources_of(root, 0), prefix_off_bytes, error,
+                                        true, true, false, false),
+              "rht spill: prefix baseline save");
+        const std::vector<char> prefix_off_data = read_file(prefix_off.newest_path());
+        check(session_version(prefix_on.newest_path()) == 1 && prefix_on_data == prefix_off_data,
+              "rht spill: prefix forces the codec off and preserves its f32 RAW bytes");
+
+        const fs::path slot_path = dir / "rht-slot-default.sess";
+        size_t slot_bytes = 0;
+        check(session_file_write(slot_path.string(), root, id, slot_bytes, error) &&
+              session_version(slot_path) == 1 && read_file(slot_path) == prefix_off_data,
+              "rht spill: default slot SAVE remains byte-identical RAW");
+        const fs::path ram_dir = dir / "rht-ram-default";
+        ConversationSpillCache ram_spill;
+        check(ram_spill.open(ram_dir, id, 1ull << 30, error) && ram_spill.spill(root, error) &&
+              session_version(ram_spill.newest_path()) == 1 && read_file(ram_spill.newest_path()) == prefix_off_data,
+              "rht spill: the RAM-eviction spill remains byte-identical RAW");
+
+        const fs::path ordinary_dir = dir / "rht-ordinary";
+        ConversationSpillCache ordinary;
+        check(ordinary.open(ordinary_dir, id, 1ull << 30, error, true), "rht spill: ordinary open");
+        size_t base_bytes = 0;
+        check(ordinary.spill_streamed(meta_of(root), sources_of(root, 0), base_bytes, error,
+                                      false, false, false, true),
+              "rht spill: ordinary base accepts codec opt-in");
+        const std::string base_path = ordinary.newest_path();
+        check(session_version(base_path) == 2, "rht spill: ordinary base uses v2 for actual codec-2 descriptors");
+        SavedConversation grown = root;
+        for (int i = 0; i < 100; ++i) grown.live.ids.push_back(int32_t(8000 + i));
+        size_t delta_bytes = 0;
+        check(ordinary.spill_delta(ordinary.find(base_path), meta_of(grown), sources_of(grown, 1024),
+                                   (int64_t) grown.live.ids.size(), delta_bytes, error, false, true),
+              "rht spill: ordinary delta accepts codec opt-in");
+        const fs::path ordinary_log = fs::path(base_path).replace_extension(".dlog");
+        const std::vector<char> ordinary_log_bytes = read_file(ordinary_log);
+        SessionDeltaRecord ordinary_record;
+        uint64_t ordinary_next = 0;
+        check(word64(ordinary_log_bytes, 8) == 2 &&
+              session_delta_read(ordinary_log.string(), 0, ordinary_log_bytes.size(), id, {}, ordinary_record,
+                                 ordinary_next, error) && ordinary_next == ordinary_log_bytes.size(),
+              "rht spill: ordinary delta uses v2 and reads back");
+
+        // A base v1 file with a v1 record followed by a v2 record is a supported mixed chain.
+        const fs::path mixed_dir = dir / "rht-mixed-chain";
+        ConversationSpillCache mixed;
+        check(mixed.open(mixed_dir, id, 1ull << 30, error, true), "rht spill: mixed chain open");
+        const SavedConversation mixed_base = rht_sample(600);
+        size_t mixed_base_bytes = 0;
+        check(mixed.spill_streamed(meta_of(mixed_base), sources_of(mixed_base, 0), mixed_base_bytes, error),
+              "rht spill: mixed chain v1 base");
+        const std::string mixed_base_path = mixed.newest_path();
+        SavedConversation mixed_one = mixed_base;
+        mixed_one.live.ids.push_back(9001);
+        size_t delta_one = 0;
+        check(mixed.spill_delta(0, meta_of(mixed_one), sources_of(mixed_one, 1024),
+                                (int64_t) mixed_one.live.ids.size(), delta_one, error),
+              "rht spill: mixed chain v1 delta");
+        SavedConversation mixed_two = mixed_one;
+        mixed_two.live.ids.push_back(9002);
+        size_t delta_two = 0;
+        check(mixed.spill_delta(0, meta_of(mixed_two), sources_of(mixed_two, 1024),
+                                (int64_t) mixed_two.live.ids.size(), delta_two, error, false, true),
+              "rht spill: mixed chain v2 delta");
+        const fs::path mixed_log = fs::path(mixed_base_path).replace_extension(".dlog");
+        const std::vector<char> mixed_log_bytes = read_file(mixed_log);
+        const uint64_t mixed_limit = mixed_log_bytes.size();
+        SessionDeltaRecord mixed_v1, mixed_v2;
+        uint64_t mixed_at = 0, mixed_end = 0;
+        const bool first_ok = session_delta_read(mixed_log.string(), 0, mixed_limit, id, {}, mixed_v1, mixed_at, error);
+        const bool second_ok = first_ok && session_delta_read(mixed_log.string(), mixed_at, mixed_limit, id, {},
+                                                               mixed_v2, mixed_end, error);
+        const SessionKvBlock discard_kv = [](size_t, size_t, uint64_t, const void*, size_t) { return true; };
+        const bool mixed_apply = first_ok && second_ok &&
+            session_delta_apply(mixed_log.string(), 0, id, mixed_v1, discard_kv, error) &&
+            session_delta_apply(mixed_log.string(), mixed_at, id, mixed_v2, discard_kv, error);
+        check(session_version(mixed_base_path) == 1 && word64(mixed_log_bytes, 8) == 1 &&
+              first_ok && word64(mixed_log_bytes, (size_t) mixed_at + 8) == 2 && second_ok &&
+              mixed_end == mixed_limit && mixed_apply,
+              "rht spill: readers and apply accept a v1 base with a mixed v1/v2 delta chain");
+
+        // The opt-in flag does not force v2 when every GDN array falls back to RAW.
+        const fs::path fallback_dir = dir / "rht-raw-fallback";
+        ConversationSpillCache fallback;
+        check(fallback.open(fallback_dir, id, 1ull << 30, error, true), "rht spill: fallback open");
+        SavedConversation nonfinite = rht_sample(600);
+        const float infinity = std::numeric_limits<float>::infinity();
+        auto make_nonfinite = [&](SavedConversation& image) {
+            const auto set = [&](ConversationCheckpoint& cp) { std::memcpy(cp.gdn.data(), &infinity, sizeof(infinity)); };
+            set(image.live);
+            for (auto& cp : image.checkpoints) set(cp);
+        };
+        make_nonfinite(nonfinite);
+        size_t fallback_base_bytes = 0;
+        check(fallback.spill_streamed(meta_of(nonfinite), sources_of(nonfinite, 0), fallback_base_bytes, error,
+                                      false, false, false, true) && session_version(fallback.newest_path()) == 1,
+              "rht spill: all-RAW base fallback stays v1");
+        SavedConversation nonfinite_grown = nonfinite;
+        nonfinite_grown.live.ids.push_back(9100);
+        size_t fallback_delta_bytes = 0;
+        check(fallback.spill_delta(0, meta_of(nonfinite_grown), sources_of(nonfinite_grown, 1024),
+                                   (int64_t) nonfinite_grown.live.ids.size(), fallback_delta_bytes, error,
+                                   false, true),
+              "rht spill: all-RAW delta fallback writes");
+        const fs::path fallback_log = fs::path(fallback.newest_path()).replace_extension(".dlog");
+        const std::vector<char> fallback_log_bytes = read_file(fallback_log);
+        check(word64(fallback_log_bytes, 8) == 1,
+              "rht spill: all-RAW delta fallback remains v1 even with codec opt-in");
+        fs::remove_all(pdir); fs::remove_all(plain_dir); fs::remove_all(ram_dir);
+        fs::remove_all(ordinary_dir); fs::remove_all(mixed_dir); fs::remove_all(fallback_dir);
     }
 
     std::printf("conversation_spill_test: %d checks passed\n", checks);

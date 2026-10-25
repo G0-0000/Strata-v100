@@ -1424,8 +1424,9 @@ each parser allocation, counts are checked against the record and engine limits 
 admitted. The final preflight prices the read/apply overlap (record metadata, checkpoint and layer arrays, and one
 bounded I/O block), not the log's length: K/V payload streams through the block and is never resident. Checkpoint-tail
 bookkeeping is admitted before reserve, and the chain/sidecar comparison and apply preflight both finish before any
-live state is changed. An admission refusal is a cache miss; it does not invalidate or remove the chain. With the flag
-off, new sidecars stay the baseline v1 bytes and eviction keeps first-spilled-first order; existing v1
+live state is changed. An admission refusal is a cache miss; it does not invalidate or remove the chain. With
+`--conversation-cache-disk-delta` off, new sidecars stay the baseline v1 bytes (RHT does not change their format) and
+eviction keeps first-spilled-first order; existing v1
 sidecars remain readable.
 
 Disk-only mode also keeps **prefix entries** (`strata-conv-prefix-N`): when a conversation is saved, its shared
@@ -1451,18 +1452,31 @@ descriptor words): on the current cache contents that is an arithmetic estimate 
 snapshot directory - a space estimate from the files' contents, not a measured run of the new format. ids, images and
 `used` are not part of the comparison and are still saved per checkpoint. The flag is off by default, takes no value,
 needs `--conversation-cache-disk-only` (without it the engine warns and turns it off), and applies to prefix saves
-only: ordinary spills, SAVE and the delta writer always write whole files, and the delta chain format is unchanged.
+only. It does not change ordinary spills, slot SAVE, or delta records; their default format remains unchanged by this
+flag.
 
-A v2 file is read back with the flag on or off. Each reference is resolved against the file's live state, which the
-reader parses first, and copied into its own vector - so a restore still holds two independent copies of the state in
-RAM: the reference saves disk space and writes, not decoded memory. A file may mix plain and referenced arrays,
-though the writer only emits whole-checkpoint references. An illegal file - a live checkpoint referencing itself, a
-reference that stores bytes, a length that differs from the live state's - is refused like any corrupt session file.
-The flag is not part of the configuration identity, so turning it on or off does not orphan existing files. The
-engine version still is: after an upgrade (a new `LOCAL_REVISION`) files from the old version keep their old
-identity and stay on disk, unindexed and outside the disk budget. An older binary of the same revision does not know
-format v2: it refuses the file as invalid and may delete it, so back up prefix files before downgrading. Follow the
-standing production rule: never roll back or delete cache files by hand without authorization.
+**RHT codec for ordinary disk-only entries (`--conversation-cache-disk-state-codec-rht`, opt-in; needs
+`--conversation-cache-disk-only`).** This separate flag selects a lossy codec for recurrent GDN state in ordinary base
+`.sess` files and `.dlog` records. The convolution values remain f32 RAW. Prefix entries are excluded and keep their
+existing f32 RAW/REF representation; slot SAVE and RAM-cache spills also remain unchanged. The flag is off by default,
+so default bytes stay unchanged. Encoding starts from the f32 state already in memory and writes directly to the output
+through bounded helper scratch; it does not create a full temporary f32 copy or a second compressed-state buffer. RHT
+changes state values; this is not a generation-quality acceptance claim. A base file or delta record uses codec 2 only
+when at least one descriptor actually selects RHT; otherwise it stays in the prior format, including non-finite RAW
+fallback.
+
+A v2 file is read back with either opt-in flag on or off. Each reference is resolved against the file's live state, which
+the reader parses first, and copied into its own vector - so a restore still holds two independent copies of the state in
+RAM: the reference saves disk space and writes, not decoded memory. A file may mix RAW, REF and RHT descriptors,
+though the writer only emits whole-checkpoint references. An illegal descriptor - including a self-reference, stored
+bytes on REF, or a logical length that differs from the live state - is refused like any corrupt session file. Neither
+opt-in flag is part of the configuration identity, so turning one on or off does not orphan existing files. The engine
+version is part of that identity: on a normal `.15` to `.14` downgrade the identity differs, so the cache files and
+sidecars remain on disk but are not indexed or read. A binary predating state references does not know format v2 and
+refuses it; engine `.14` can read state references but cannot read codec 2. If an incompatible file is instead presented
+to a disk-only reader under a matching identity and parsing marks it invalid, that cache entry may be discarded. Back
+up files before changing versions. Follow the standing production rule: never roll back or delete cache files by hand
+without authorization.
 
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore

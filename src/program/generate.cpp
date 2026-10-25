@@ -26,6 +26,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/rht_state_codec.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/conversation_spill.hpp"
@@ -787,6 +788,8 @@ struct Options {
     /// its live state is written once (format v2): the checkpoint's five state arrays become on-disk references to
     /// the live copy.  Prefix saves only; not part of the config identity.
     bool conversation_cache_disk_state_ref = false;
+    /// --conversation-cache-disk-state-codec-rht: lossy recurrent GDN encoding for ordinary disk-only saves only.
+    bool conversation_cache_disk_state_codec_rht = false;
     int64_t conversation_cache_disk_mib = 8192;   // the spill directory's limit (0 = off)
     double conversation_cache_similarity = 0.0;   // least LCP/new-prompt fraction a disk hit may offer (range [0,1))
     int64_t conversation_cache_n_min = 0;         // least common-prefix tokens a disk hit may offer
@@ -970,6 +973,9 @@ void usage() {
                   "                       once - the checkpoint's five state arrays become on-disk references to the\n"
                   "                       live copy (session file format v2) - saving one full state copy per prefix\n"
                   "                       file (default off; prefix saves only; not part of the config identity)\n"
+                  "  --conversation-cache-disk-state-codec-rht  --conversation-cache-disk-only: lossy opt-in RHT+INT16\n"
+                  "                       for recurrent GDN state in ordinary base/delta files; convolution stays RAW.\n"
+                  "                       Prefixes are excluded; default off and not part of the config identity.\n"
                  "  --conversation-cache-disk-mib N  --serve: the spill directory's limit (default 8192; 0 = off)\n"
                  "  --conversation-cache-similarity F  --serve: least common-prefix fraction a disk hit may offer\n"
                  "                       (default 0 = any; range [0,1))\n"
@@ -2767,6 +2773,7 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-disk-only") o.conversation_cache_disk_only = true;
         else if (a == "--conversation-cache-disk-delta") o.conversation_cache_disk_delta = true;
         else if (a == "--conversation-cache-disk-state-ref") o.conversation_cache_disk_state_ref = true;
+        else if (a == "--conversation-cache-disk-state-codec-rht") o.conversation_cache_disk_state_codec_rht = true;
         else if (a == "--conversation-cache-disk-delta-percent") {
             const std::string value = next("--conversation-cache-disk-delta-percent");
             int64_t number = 0;
@@ -3125,6 +3132,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata serve: warning: --conversation-cache-disk-state-ref needs --conversation-cache-disk-only; "
                              "it is off\n");
         o.conversation_cache_disk_state_ref = false;
+    }
+    if (o.serve && o.conversation_cache_disk_state_codec_rht && !o.conversation_cache_disk_only) {
+        std::fprintf(stderr, "strata serve: warning: --conversation-cache-disk-state-codec-rht needs "
+                             "--conversation-cache-disk-only; it is off\n");
+        o.conversation_cache_disk_state_codec_rht = false;
     }
     if (o.serve && !o.conversation_cache_spill_dir.empty() && !o.conversation_cache_disk_only &&
         (o.conversation_cache_mib == 0 || o.prompt_cache == 0 || o.conversation_cache_slots == 0 ||
@@ -9842,7 +9854,7 @@ int main(int argc, char** argv) {
                 meta.live.pinned = false;
                 size_t bytes = 0;
                 if (!conversation_spill.spill_streamed(meta, sources, bytes, e, true, true,
-                                                       o.conversation_cache_disk_state_ref)) {
+                                                        o.conversation_cache_disk_state_ref, false)) {
                     std::fprintf(stderr, "strata serve: conversation cache: prefix save failed (%s)\n", e.c_str());
                     return;
                 }
@@ -9877,6 +9889,17 @@ int main(int argc, char** argv) {
                     sl.tokens = live.size();
                     sl.images = live_imgs.size();
                     sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                    // Ordinary disk-only base/delta saves may encode RHT; slot SAVE and prefix saves do not.
+                    if (o.conversation_cache_disk_state_codec_rht) {
+                        const std::array<int64_t, 18> geometry = {
+                            g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads,
+                            g.ssm_v_heads, g.ssm_d_conv, g.ssm_conv_channels, g.ssm_value_dim,
+                            g.n_head, g.n_head_kv, g.head_dim, g.idx_q_heads, g.idx_key_dim,
+                            g.hc, g.hc_lr, g.n_expert, g.n_ff};
+                        strata::core::rht::Layout layout{};
+                        if (strata::core::rht::layout_from(geometry, 0, g.n_layers, layout))
+                            sl.codec_scratch = strata::core::rht::scratch_bytes(layout);
+                    }
                 }
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                 auto admit = [&](uint64_t need, std::string& w) {
@@ -9919,7 +9942,8 @@ int main(int argc, char** argv) {
                         if (strata::core::conversation_snapshot_sources_delta(meta, sources, view, ss, g,
                                                                               mtp.kv_state(), unchanged, e)) {
                             bool overflow = false;
-                            const uint64_t estimate = strata::core::session_delta_record_bytes(meta, sources, &overflow);
+                            const uint64_t estimate = strata::core::session_delta_record_bytes(
+                                meta, sources, &overflow, o.conversation_cache_disk_state_codec_rht);
                             // 40 保留旧计算与舍入；该路径不运行完整会话计数。
                             uint64_t compact_at = 0;
                             if (o.conversation_cache_disk_delta_percent == 40) {
@@ -9959,7 +9983,7 @@ int main(int argc, char** argv) {
                             } else {
                                 size_t written = 0;
                                 if (conversation_spill.spill_delta(index, meta, sources, (int64_t) live.size(), written,
-                                                                   e, durable)) {
+                                                                    e, durable, o.conversation_cache_disk_state_codec_rht)) {
                                     bytes = written;
                                     kept = chain_path;
                                     delta_written = true;
@@ -9984,7 +10008,8 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: conversation cache: disk save skipped (%s)\n", e.c_str());
                         return;
                     }
-                    if (!conversation_spill.spill_streamed(meta, sources, bytes, e, durable)) {
+                    if (!conversation_spill.spill_streamed(meta, sources, bytes, e, durable, false, false,
+                                                            o.conversation_cache_disk_state_codec_rht)) {
                         std::fprintf(stderr, "strata serve: conversation cache: disk save failed (%s); it will be read "
                                              "again when it returns\n", e.c_str());
                         return;
@@ -13401,13 +13426,15 @@ int main(int argc, char** argv) {
             // for the apply pass, with admission disabled only after the complete pre-mutation preflight succeeds.
             strata::core::SessionReadLimits disk_delta_limits;
             bool disk_delta_limits_ready = false;
+            strata::core::SessionReadLimits disk_base_bounds;
+            bool disk_base_bounds_ready = false;
             std::string disk_delta_path;
             uint64_t disk_chain_bytes = 0;
             std::string disk_in_path;
             size_t disk_in_bytes = 0;
             int64_t disk_in_tokens = 0;
             bool disk_in_live = false;
-            bool disk_file_v2 = false;   // the read pass verified a format-v2 (state-ref) file: the apply pass gets finite bounds
+            bool disk_file_v2 = false;   // format-v2 state descriptors need finite base-file apply bounds
             double disk_read_ms = 0;
             if (disk_only && !disk_match.path.empty() && disk_match.tokens > std::max(resume, slot_tokens)) {
                 const auto td = Clock::now();
@@ -13434,9 +13461,12 @@ int main(int argc, char** argv) {
                     // invalid is read once more under the engine's own checkpoint limit before it counts as bad.
                     auto read_pass = [&](uint64_t max_checkpoints) {
                         st = {};
-                         disk_meta = {};
-                         disk_file_kv.clear();
-                         disk_chain_bytes = 0;
+                        disk_meta = {};
+                        disk_file_kv.clear();
+                        disk_chain_bytes = 0;
+                        disk_file_v2 = false;
+                        disk_base_bounds = {};
+                        disk_base_bounds_ready = false;
                         if (!strata::core::conversation_session_read_limits(limits, ss, g, mtp.kv_state(),
                                 (uint64_t) o.max_context, max_checkpoints, le)) {
                             st.error = strata::core::SessionError::memory;   // a runtime limit, not the file: keep it
@@ -13456,38 +13486,40 @@ int main(int argc, char** argv) {
                                                                       disk_in_bytes, le, limits, &disk_file_kv, &st))
                             return false;
                         disk_file_v2 = st.file_version == 2u;
-                        // --conversation-cache-disk-delta: the base plus every committed record.  The last record
+                        strata::core::session_read_bounds_from_meta(disk_meta, disk_base_bounds);
+                        disk_base_bounds_ready = true;
+                        // --conversation-cache-disk-delta: the base plus every committed record. The last record
                         // holds the state the sidecar (and so the match) describes; the base holds the K/V its own
-                        // record appended to.  Every record is validated here, before anything touches the device.
+                        // record appended to. Every record is validated here, before anything touches the device.
                         if (disk_match.delta_committed == 0) return true;
                         disk_delta_path = delta_log_of(disk_match.path);
-                         uint64_t at = 0;
-                         strata::core::SessionDeltaRecord last;
-                         bool have_last = false;
-                         while (at < disk_match.delta_committed) {
-                             // The parser admits each actual count-based allocation before reserve/resize.  Swap the
-                             // prior record out so its vectors are destroyed before the next record starts parsing.
-                             {
-                                 strata::core::SessionDeltaRecord released;
-                                 std::swap(last, released);
-                             }
-                             uint64_t next = 0;
-                             if (!strata::core::session_delta_read(disk_delta_path, at, disk_match.delta_committed,
-                                                                   spill_identity, limits, last, next, le, &st))
-                                 return false;
-                             if (next <= at || next > disk_match.delta_committed) {
-                                 le = "delta chain: a record's end is outside the committed length";
-                                 st.error = strata::core::SessionError::invalid;
-                                 return false;
-                             }
-                             have_last = true;
-                             at = next;
-                         }
-                         if (at != disk_match.delta_committed) {
-                             le = "delta chain: records do not end at the committed boundary";
-                             st.error = strata::core::SessionError::invalid;
-                             return false;
-                         }
+                        uint64_t at = 0;
+                        strata::core::SessionDeltaRecord last;
+                        bool have_last = false;
+                        while (at < disk_match.delta_committed) {
+                            // The parser admits each actual count-based allocation before reserve/resize. Swap the
+                            // prior record out so its vectors are destroyed before the next record starts parsing.
+                            {
+                                strata::core::SessionDeltaRecord released;
+                                std::swap(last, released);
+                            }
+                            uint64_t next = 0;
+                            if (!strata::core::session_delta_read(disk_delta_path, at, disk_match.delta_committed,
+                                                                  spill_identity, limits, last, next, le, &st))
+                                return false;
+                            if (next <= at || next > disk_match.delta_committed) {
+                                le = "delta chain: a record's end is outside the committed length";
+                                st.error = strata::core::SessionError::invalid;
+                                return false;
+                            }
+                            have_last = true;
+                            at = next;
+                        }
+                        if (at != disk_match.delta_committed) {
+                            le = "delta chain: records do not end at the committed boundary";
+                            st.error = strata::core::SessionError::invalid;
+                            return false;
+                        }
                         // The sidecar is published AFTER the chain manifest, so a crash can leave it one save behind
                         // (same token count, different ids): the tail must match it in full - ids, images and
                         // checkpoint lengths - or the restore would mix two saves' state.  A mismatch is a clean miss.
@@ -13547,15 +13579,15 @@ int main(int argc, char** argv) {
                         return true;
                     };
                     const uint64_t engine_checkpoints = (uint64_t) std::max(o.prompt_cache, 1);
-                     bool read_ok = read_pass(1);
-                     if (!read_ok && st.error == strata::core::SessionError::invalid && engine_checkpoints > 1)
-                         read_ok = read_pass(engine_checkpoints);
-                     if (read_ok && disk_match.delta_committed != 0) {
-                         disk_delta_limits = std::move(limits);
-                         disk_delta_limits.admit = {};   // admission completed before device/session mutation
-                         disk_delta_limits_ready = true;
-                     }
-                     std::error_code exists_error;
+                    bool read_ok = read_pass(1);
+                    if (!read_ok && st.error == strata::core::SessionError::invalid && engine_checkpoints > 1)
+                        read_ok = read_pass(engine_checkpoints);
+                    if (read_ok && disk_match.delta_committed != 0) {
+                        disk_delta_limits = std::move(limits);
+                        disk_delta_limits.admit = {};   // admission completed before device/session mutation
+                        disk_delta_limits_ready = true;
+                    }
+                    std::error_code exists_error;
                     if (!read_ok && !std::filesystem::exists(disk_match.path, exists_error) && !exists_error)
                         st.error = strata::core::SessionError::invalid;   // gone from the directory: drop its entry
                     if (!read_ok && st.error != strata::core::SessionError::invalid) {
@@ -13857,14 +13889,15 @@ int main(int argc, char** argv) {
                                              "policy\n", disk_apply_hot, disk_apply_bind_why.c_str());
                     strata::core::SessionReadLimits disk_apply_limits;
                     const strata::core::SessionReadLimits* disk_apply = nullptr;
+                    bool base_bounds_ok = true;
                     if (disk_file_v2) {
-                        // the apply pass re-parses the metadata while the read pass's copy is still resident: finite
-                        // bounds derived from the validated meta, and admission of only the apply pass's additional
-                        // peak, before the first block can reach the device.  A format-v2 file is a prefix entry and
-                        // spill_delta refuses prefixes, so `disk_meta` here is the base file's own metadata: the delta
-                        // tail records below can never have overwritten it for a v2 file (if that ever changed, the
-                        // bounds would describe the tail record, not the base, and would misprice the apply pass)
-                        strata::core::session_read_bounds_from_meta(disk_meta, disk_apply_limits);
+                        // The base file is re-parsed while the read pass's copy is resident. Use bounds saved from
+                        // the base read itself: delta records may have replaced disk_meta with the chain tail.
+                        if (!disk_base_bounds_ready) {
+                            base_bounds_ok = false;
+                            err = "conversation cache: base apply bounds were not captured";
+                        }
+                        disk_apply_limits = disk_base_bounds;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         disk_apply_limits.admit = [floor](uint64_t need, std::string& why) {
                             if (strata::core::conversation_memory_admit(strata::core::available_host_bytes(), need,
@@ -13876,8 +13909,8 @@ int main(int argc, char** argv) {
                         };
                         disk_apply = &disk_apply_limits;
                     }
-                    bool restored_ok = strata::core::session_file_apply_streamed(disk_in_path, spill_identity, sink,
-                                                                                 disk_file_kv, err, &st2, disk_apply);
+                    bool restored_ok = base_bounds_ok && strata::core::session_file_apply_streamed(
+                        disk_in_path, spill_identity, sink, disk_file_kv, err, &st2, disk_apply);
                     // --conversation-cache-disk-delta: re-walk only the committed prefix. Each record is read and
                     // applied before advancing; offsets are not retained per record and no uncommitted suffix is used.
                     uint64_t record_at = 0;

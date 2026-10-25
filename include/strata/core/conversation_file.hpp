@@ -159,6 +159,9 @@ struct SessionWriteOptions {
     // are all byte-identical to the live state's is written as on-disk references to it (format v2) instead of a
     // second copy.  No hit: the file stays byte-identical v1.  Has no effect on the v1 byte layout.
     bool state_ref = false;
+    // --conversation-cache-disk-state-codec-rht: opt-in lossy GDN encoding for ordinary disk-only base and delta
+    // writes.  Prefix saves and other session-write paths do not set this.
+    bool state_codec_rht = false;
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
@@ -208,10 +211,11 @@ struct SessionSaveLive {
     uint64_t state_bytes = 0;   // the live running state (gdn + ple + every owned QSA layer's tail, dead, block_pos)
     uint64_t tokens = 0, images = 0;
     uint64_t kv_layers = 0;     // K/V sources (owned QSA layers + the draft)
+    uint64_t codec_scratch = 0; // bounded state-codec scratch, 0 when the opt-in codec is off
 };
 // The peak, with saturating arithmetic: two copies of the deepest checkpoint (the list handed to the capture and the
 // one inside the captured image), the copied live state with its token and image lists, the K/V source directory,
-// the 16 MiB write buffer and 1 MiB for the small vectors.
+// bounded codec scratch when enabled, the 16 MiB write buffer and 1 MiB for the small vectors.
 uint64_t session_save_peak_bytes(const ConversationCheckpoint* deepest, const SessionSaveLive& live);
 // The SAVE's RAM PREFLIGHT, BEFORE anything is copied: `admit` is asked for session_save_peak_bytes; only when it
 // agrees is the deepest checkpoint copied into `out`.  On a refusal nothing was allocated, `out` is empty, `chain`
@@ -236,16 +240,17 @@ struct SessionReadLimits {
     // per K/V layer (the QSA layers, then the draft): the most bytes of each part (k, v, k_scale, v_scale, pooled).
     // A layer past the end of the list is bounded by the payload only.
     std::vector<std::array<uint64_t, 5>> max_kv_bytes;
-    // The RAM ADMISSION callback: session-file readers ask once for their parse peak; delta readers ask before each
-    // count-based allocation, and the caller preflights the combined read/apply peak. False refuses the read. Not a reservation.
+    // The RAM ADMISSION callback: session-file readers screen their baseline, then account decoded state descriptors and
+// check allocations; delta readers ask before each count-based allocation. False refuses the read. Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
-// What the RAM preflight is asked for a file of `file_bytes`: the parsed image (about the payload), the 16 MiB read
-// buffer, and the per-allocation overhead of its arrays (a page per 16 MiB segment plus the small vectors).
-uint64_t session_read_peak_bytes(uint64_t file_bytes);
+// Estimated RAM for a `file_bytes` file: the file-backed image, read buffer and overhead, plus optional
+// caller-supplied `decoded_state_extra` (RAW=0, REF=logical, RHT=logical-stored).
+uint64_t session_read_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits, uint32_t file_version = 1,
+                                 uint64_t decoded_state_extra = 0);
 // Full validation (a regular file with one link, size, header, identity, bounded parse, payload hash) before `image`
 // is replaced.  The file is opened without following a symbolic link (or a reparse point) at its name, and the checks
 // are made on the opened handle.  On failure `image` is unchanged and `status->error` says what kind of failure.
@@ -253,8 +258,8 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
 
-// ---- Streaming reads: a session whose K/V does not fit in RAM.  Two passes over one file: format v1 unchanged,
-// and format v2 (state-ref) served by the same two passes.
+// ---- Streaming reads: a session whose K/V does not fit in RAM. Two passes over one file: format v1 unchanged,
+// and format v2 (REF or RHT state descriptors) served by the same two passes.
 //
 // `session_file_read_streamed` reads and validates the whole file once, without materializing the K/V: `meta` gets
 // the running state and the K/V headers (its K/V buffers stay empty), the whole payload hash is checked, and when
@@ -266,7 +271,7 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // compares it to the file's trailer.  The first applied block is the gate: everything before it can still be
 // refused cleanly, a divergence found after it (a same-size edit, or a torn re-read) ends the caller - the caller
 // must not go on.  An atomic replacement that is itself self-consistent and keeps the same sizes is NOT detected:
-// the file must have no writer but this engine.  For a format-v2 file the caller must pass finite bounds with
+// the file must have no writer but this engine. For any format-v2 file the caller must pass finite bounds with
 // `bounds->admit` non-null; the legacy no-bounds form remains for compatibility but does not provide v2 admission
 // protection.  Peak RAM: two 16 MiB buffers and `meta`.
 //
@@ -281,17 +286,18 @@ bool session_file_apply_streamed(const std::string& path, const SessionFileIdent
                                  const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
                                  SessionStatus* status = nullptr, const SessionReadLimits* bounds = nullptr);
 // Finite read limits exactly bounding what re-parsing a file whose validated metadata is `meta` may allocate (the
-// counts and state-array sizes of `meta` itself, as the delta apply pass derives its bounds from the expected
-// record).  An apply pass of a format-v2 file uses these instead of the unlimited defaults, so its parse can never
+// counts and logical state-array sizes of `meta` itself, as the delta apply pass derives its bounds from the expected
+// record). An apply pass of a format-v2 file uses these instead of the unlimited defaults, so its parse can never
 // allocate beyond what the read pass admitted; `out.admit` is left to the caller.
 void session_read_bounds_from_meta(const SavedConversation& meta, SessionReadLimits& out);
 // The ADDITIONAL RAM peak of the streaming apply pass while the read pass's metadata is still resident: the apply
 // pass's freshly parsed metadata (bounded by `bounds`), one 16 MiB K/V block and the small I/O state.  The resident
 // read-pass metadata is not counted again; streamed K/V payload bytes are excluded.
 uint64_t session_stream_apply_peak_bytes(const SessionReadLimits& bounds);
-// The RAM preflight of the streaming read of a `file_bytes` file: the two block buffers, the small vectors and the
-// running-state metadata the limits admit; the K/V itself stays on disk.
-uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits);
+// Estimated RAM for a streaming read of a `file_bytes` file: the two block buffers, small vectors and file-backed
+// metadata, plus optional descriptor expansion not already covered by bounded logical-state metadata; K/V stays on disk.
+uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits, uint32_t file_version = 1,
+                                        uint64_t decoded_state_extra = 0);
 // One decoded metadata state bounded by the accepted token, checkpoint, state-array, and K/V-layer counts. Includes
 // the actual SavedConversation/ConversationCheckpoint/ConversationKv objects and their vector storage; streamed K/V
 // payload bytes are excluded.
@@ -353,7 +359,7 @@ bool session_delta_apply(const std::string& path, uint64_t at, const SessionFile
 
 // The bytes one record takes, for a sizing/preflight pass (saturating: `overflow` says the size does not fit).
 uint64_t session_delta_record_bytes(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
-                                    bool* overflow = nullptr);
+                                    bool* overflow = nullptr, bool state_codec_rht = false);
 
 // The per-part byte offset a delta record for `kept_tokens` unchanged tokens starts at (host-testable pure
 // arithmetic, the same keep rule conversation_kv_save applies): main-layer parts round down to whole cells through

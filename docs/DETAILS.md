@@ -1431,6 +1431,31 @@ every ordinary conversation before one of them, and they survive a restart. With
 of 15,924 tokens and took 4.7 s instead of 15.7 s; after an engine restart, 5.1 s (the 420 MiB entry restored in
 326 ms).
 
+**State references in prefix files (`--conversation-cache-disk-state-ref`, opt-in; needs
+`--conversation-cache-disk-only`).** A prefix entry holds the conversation's opening twice: the checkpoint saved
+with it is usually the same bytes as the live state. With this flag a prefix save compares the checkpoint's five
+running-state arrays (`gdn`, `ple`, `tails`, `dead`, `block_pos`) directly with the live state's - equal length and
+byte-for-byte, no digest - and a checkpoint that matches is written once: its five arrays become on-disk references
+(session-file format v2) to the live copy instead of a second copy of the same bytes. Any difference in any array
+keeps that checkpoint a plain copy, and with no match at all the file stays byte-identical v1. The match is decided
+once, before the file is sized, and the file is written directly as the live state plus those references - never as
+a full copy that is later cut down. One full state copy per prefix file is saved (its state bytes minus 160 bytes of
+descriptor words): on the current cache contents that is an arithmetic estimate of 675.6 MiB, about 5.66% of the
+snapshot directory - a space estimate from the files' contents, not a measured run of the new format. ids, images and
+`used` are not part of the comparison and are still saved per checkpoint. The flag is off by default, takes no value,
+needs `--conversation-cache-disk-only` (without it the engine warns and turns it off), and applies to prefix saves
+only: ordinary spills, SAVE and the delta writer always write whole files, and the delta chain format is unchanged.
+
+A v2 file is read back with the flag on or off. Each reference is resolved against the file's live state, which the
+reader parses first, and copied into its own vector - so a restore still holds two independent copies of the state in
+RAM: the reference saves disk space and writes, not decoded memory. A file may mix plain and referenced arrays,
+though the writer only emits whole-checkpoint references. An illegal file - a live checkpoint referencing itself, a
+reference that stores bytes, a length that differs from the live state's - is refused like any corrupt session file.
+The flag is not part of the configuration identity, so turning it on or off does not orphan existing files. Files
+written by an older engine version keep their old identity and stay on disk, unindexed and outside the disk budget. A
+binary that does not know format v2 refuses the file as invalid and may delete it, so back up prefix files before
+downgrading. Follow the standing production rule: never roll back or delete cache files by hand without authorization.
+
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
 requests of llama-server's slot API, for its single slot 0, when started with `--slot-save-path DIR` (also

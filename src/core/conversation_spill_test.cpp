@@ -1457,6 +1457,177 @@ int main() {
         fs::remove_all(ddir);
     }
 
+    // --conversation-cache-disk-state-ref (prefix saves only, PLAN 6.5): a prefix whose checkpoint's five
+    // running-state arrays equal the live state's is written as a format-v2 file, accounted by its physical bytes,
+    // matched and read back with no read-side flag; a RAM refusal keeps the file and the index entry
+    {
+        const fs::path rdir = fs::temp_directory_path() / "strata_spill_state_ref_test";
+        fs::remove_all(rdir);
+        auto homo_root = [](SavedConversation root, size_t tokens, int64_t used, uint64_t imghash) {
+            root.checkpoints.clear();
+            ConversationCheckpoint cp = root.live;   // the five arrays copy: the REF hit; ids/imgs/used stay its own
+            cp.ids.assign(root.live.ids.begin(), root.live.ids.begin() + (std::ptrdiff_t) tokens);
+            cp.imgs = {{5, imghash}};
+            cp.used = used;
+            root.checkpoints.push_back(cp);
+            return root;
+        };
+        const SavedConversation root = homo_root(sample(600), 300, 77, 0x777);
+        const uint64_t state_bytes = root.live.gdn.size() + root.live.ple.size() + root.live.tails.size() +
+                                     root.live.dead.size() + root.live.block_pos.size();
+        ConversationSpillCache sp;
+        check(sp.open(rdir, id, 1ull << 30, error), "state-ref: open");
+        size_t written = 0;
+        check(sp.spill_streamed(meta_of(root), sources_of(root, 0), written, error, true, true, true),
+              "state-ref: prefix save with the flag");
+        const std::string ref_path = sp.newest_path();
+        check(fs::path(ref_path).filename().string().rfind("strata-conv-prefix-", 0) == 0, "state-ref: prefix name");
+        const std::vector<char> ref_bytes = read_file(ref_path);
+        uint32_t version = 0; std::memcpy(&version, ref_bytes.data() + 8, 4);
+        check(version == 2, "state-ref: the prefix file is format v2");
+        // exact whole-file savings against the same prefix written without the flag (a miss stays byte-identical v1)
+        {
+            ConversationSpillCache plain;
+            const fs::path plain_dir = fs::temp_directory_path() / "strata_spill_state_ref_plain_test";
+            check(plain.open(plain_dir, id, 1ull << 30, error), "state-ref: plain open");
+            size_t plain_written = 0;
+            check(plain.spill_streamed(meta_of(root), sources_of(root, 0), plain_written, error, true, true, false),
+                  "state-ref: the same prefix without the flag");
+            uint32_t plain_version = 0;
+            const std::vector<char> plain_bytes = read_file(plain.newest_path());
+            std::memcpy(&plain_version, plain_bytes.data() + 8, 4);
+            check(plain_version == 1, "state-ref: without the flag the prefix file is v1");
+            check(plain_written - written == state_bytes - 160, "state-ref: exact whole-file savings state_bytes - 160");
+            check(written == fs::file_size(ref_path), "state-ref: the accounting size is the physical file size");
+            fs::remove_all(plain_dir);
+        }
+        // delta-off accounting charges the session file alone (the baseline v1 sidecar is unpriced)
+        check(sp.bytes() == written, "state-ref: delta-off accounting is the file alone");
+        check(sp.prefix_count() == 1 && sp.has_prefix(root.live.ids, {}, root.cvec), "state-ref: indexed as a prefix");
+        // no read-side flag: the v2 prefix matches a new conversation and loads back whole
+        std::vector<int32_t> new_chat(root.live.ids.begin(), root.live.ids.end());
+        new_chat.push_back(424242);
+        const auto hit = sp.best(new_chat, {}, root.cvec, 0.0, 0);
+        check(bool(hit) && hit.tokens == (int64_t) root.live.ids.size() && hit.live && hit.file_bytes == written,
+              "state-ref: the v2 prefix matches a new conversation, the physical size carried");
+        SavedConversation back;
+        check(sp.load(ref_path, back, {}, error), "state-ref: a v2 prefix loads with no flag");
+        check(back.live.ids == root.live.ids && back.checkpoints.size() == 1, "state-ref: round trip");
+        check(back.checkpoints[0].ids == root.checkpoints[0].ids &&
+              back.checkpoints[0].imgs == root.checkpoints[0].imgs && back.checkpoints[0].used == root.checkpoints[0].used,
+              "state-ref: checkpoint ids/imgs/used preserved, not taken from live");
+        check(back.checkpoints[0].gdn == back.live.gdn && back.checkpoints[0].block_pos == back.live.block_pos,
+              "state-ref: the referenced checkpoint's arrays equal the live state's");
+        back.checkpoints[0].gdn[0] ^= 0xff;
+        check(back.checkpoints[0].gdn != back.live.gdn && back.live.gdn == root.live.gdn,
+              "state-ref: the restored checkpoint owns its copy (no aliasing)");
+        // a prefix entry refuses the delta append, the v2 file just as the v1 one
+        size_t wd = 0;
+        check(!sp.spill_delta(sp.find(ref_path), meta_of(root), sources_of(root, 0), 600, wd, error),
+              "state-ref: a prefix entry refuses the delta append");
+        // v2 + memory: a refused RAM load keeps the file, the index entry and the match
+        {
+            SavedConversation wont;
+            wont.live.ids = {42};
+            SessionReadLimits low;
+            size_t calls = 0;
+            low.admit = [&](uint64_t, std::string& w) { ++calls; w = "controlled v2 RAM refusal"; return false; };
+            check(!sp.load(ref_path, wont, low, error) && calls > 0 &&
+                  error.find("controlled v2 RAM refusal") != std::string::npos,
+                  "state-ref: a v2 RAM refusal fails the load");
+            check(wont.live.ids.size() == 1 && wont.live.ids[0] == 42,
+                  "state-ref: the refused load leaves the output alone");
+            check(fs::exists(ref_path) && sp.size() == 1 && bool(sp.best(new_chat, {}, root.cvec, 0.0, 0)),
+                  "state-ref: v2+memory keeps the file and the index entry");
+        }
+        // a foreign identity keeps the v2 file whole, indexes nothing
+        {
+            ConversationSpillCache foreign;
+            check(foreign.open(rdir, SessionFileIdentity{3, 4}, 1ull << 30, error), "state-ref: foreign open");
+            check(foreign.size() == 0 && fs::exists(ref_path),
+                  "state-ref: a foreign identity keeps the v2 file, indexes nothing");
+        }
+        // a torn v2 file: open() reads the sidecar only, so the entry stays indexed and matched; load() rejects the
+        // payload and does not delete the file - the caller decides
+        fs::resize_file(ref_path, fs::file_size(ref_path) - 16);
+        {
+            ConversationSpillCache reopened;
+            check(reopened.open(rdir, id, 1ull << 30, error), "state-ref: reopen with a truncated v2 file");
+            check(reopened.size() == 1, "state-ref: open() does not read the payload, the entry stays indexed");
+            check(bool(reopened.best(new_chat, {}, root.cvec, 0.0, 0)), "state-ref: the sidecar still offers the entry");
+            SavedConversation wont;
+            check(!reopened.load(ref_path, wont, {}, error), "state-ref: load rejects the truncated v2 file");
+            check(fs::exists(ref_path), "state-ref: a rejected load does not delete the file");
+        }
+        fs::remove_all(rdir);
+    }
+
+    // the delta-on accounting around a v2 prefix: the budget counts the v2 file AND its v2 sidecar (the .sess
+    // version says nothing about the .meta sidecar); the reopen keeps the match; the budget still evicts ordinary
+    // conversations before a prefix; the delta append path itself is untouched by the flag
+    {
+        const fs::path ddir = fs::temp_directory_path() / "strata_spill_state_ref_delta_test";
+        fs::remove_all(ddir);
+        SavedConversation root = sample(600);
+        root.checkpoints.clear();
+        {
+            ConversationCheckpoint cp = root.live;
+            cp.ids.assign(root.live.ids.begin(), root.live.ids.begin() + 300);
+            cp.imgs = {{5, 0x777}};
+            cp.used = 77;
+            root.checkpoints.push_back(cp);
+        }
+        ConversationSpillCache d;
+        check(d.open(ddir, id, 1ull << 30, error, true), "state-ref delta-on: open");
+        size_t written = 0;
+        check(d.spill_streamed(meta_of(root), sources_of(root, 0), written, error, true, true, true),
+              "state-ref delta-on: v2 prefix save");
+        const std::string ref_path = d.newest_path();
+        const uint64_t sidecar = fs::file_size(fs::path(ref_path).replace_extension(".meta"));
+        check(d.bytes() == written + sidecar, "state-ref delta-on: the budget counts the v2 file and its sidecar");
+        check(d.has_prefix(root.live.ids, {}, root.cvec) && d.prefix_count() == 1,
+              "state-ref delta-on: indexed as a prefix");
+        std::vector<int32_t> new_chat(root.live.ids.begin(), root.live.ids.end());
+        new_chat.push_back(424242);
+        // two ordinary conversations, then a tight budget: an ordinary one goes, the v2 prefix stays
+        SavedConversation c1s = sample(1000);
+        size_t w1 = 0;
+        check(d.spill_streamed(meta_of(c1s), sources_of(c1s, 0), w1, error), "state-ref delta-on: conversation 1");
+        const std::string c1 = d.newest_path();
+        SavedConversation c2s = sample(900);
+        size_t w2 = 0;
+        check(d.spill_streamed(meta_of(c2s), sources_of(c2s, 0), w2, error), "state-ref delta-on: conversation 2");
+        const uint64_t m1 = fs::file_size(fs::path(c1).replace_extension(".meta"));
+        const uint64_t m2 = fs::file_size(fs::path(d.newest_path()).replace_extension(".meta"));
+        ConversationSpillCache tight;
+        check(tight.open(ddir, id, written + sidecar + std::max(w1 + m1, w2 + m2) + 16, error, true),
+              "state-ref delta-on: reopen with a tight budget");
+        check(tight.prefix_count() == 1 && tight.has_prefix(root.live.ids, {}, root.cvec),
+              "state-ref delta-on: the v2 prefix survives the budget, still a prefix after the reopen");
+        check(tight.size() == 2, "state-ref delta-on: an ordinary conversation was evicted, not the prefix");
+        const auto hit = tight.best(new_chat, {}, root.cvec, 0.0, 0);
+        check(bool(hit) && hit.path == ref_path, "state-ref delta-on: the reopened v2 prefix still matches");
+        // the delta append path is untouched: a REF-eligible conversation still appends a v1 record
+        ConversationSpillCache ch;
+        const fs::path cdir = ddir / "chain";
+        check(ch.open(cdir, id, 1ull << 30, error, true), "state-ref delta-on: chain open");
+        SavedConversation base = sample(800);
+        size_t wb = 0;
+        check(ch.spill_streamed(meta_of(base), sources_of(base, 0), wb, error), "state-ref delta-on: chain base");
+        SavedConversation grown = base;
+        for (int i = 0; i < 100; ++i) grown.live.ids.push_back(int32_t(6000 + i));
+        grown.checkpoints.push_back(checkpoint(grown.live.ids.size(), 9));
+        size_t wr = 0;
+        check(ch.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), wr, error),
+              "state-ref delta-on: append over a REF-eligible state still works");
+        SessionDeltaRecord rec;
+        uint64_t next = 0;
+        check(session_delta_read(fs::path(ch.newest_path()).replace_extension(".dlog").string(), 0, wr, id, {}, rec,
+                                 next, error) && next == wr && rec.meta.live.ids == grown.live.ids,
+              "state-ref delta-on: the record is still a v1 record and reads back");
+        fs::remove_all(ddir);
+    }
+
     std::printf("conversation_spill_test: %d checks passed\n", checks);
     return 0;
 }

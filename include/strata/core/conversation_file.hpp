@@ -124,6 +124,10 @@ struct SessionStatus {
     bool published = false;
     // write (POSIX): this filesystem cannot flush a folder (fsync EINVAL); the save succeeded without that flush
     bool dir_flush_unsupported = false;
+    // read/apply: the opened file's header is verified; 1 or 2, its .sess format version (0 = no verified header).
+    // Together with a read failure of SessionError::memory this says the refusal is a v2 file's RAM admission, not a
+    // bad file: the caller keeps the file and its cache index entry
+    uint32_t file_version = 0;
 };
 
 // Progress of a file transfer: (bytes done, bytes in the file).  A write reports once when its temporary file is
@@ -151,6 +155,10 @@ struct SessionWriteOptions {
     SessionPhase phase;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
     std::function<int(const char* step)> fault;
+    // --conversation-cache-disk-state-ref, prefix saves only: a non-live checkpoint whose five running-state arrays
+    // are all byte-identical to the live state's is written as on-disk references to it (format v2) instead of a
+    // second copy.  No hit: the file stays byte-identical v1.  Has no effect on the v1 byte layout.
+    bool state_ref = false;
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
@@ -181,6 +189,8 @@ struct SessionKvSource {
 // Counts the exact size of a complete `.sess` file, including its header and trailer, using the serialization counting
 // path. Sources are counted at their full size; this does not read sources, copy GPU data, or perform file I/O.
 // On failure, `error` explains whether the conversation is invalid or its size cannot be represented.
+// The v1 size estimate is used for ordinary/delta decisions without REF; it is not a general v2 file estimate
+// (v2 descriptor overhead and REF savings are excluded).
 bool session_file_full_bytes(const SavedConversation& image, const std::vector<SessionKvSource>& sources,
                              uint64_t& bytes, std::string& error);
 
@@ -245,7 +255,8 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
 
-// ---- Streaming reads: a session whose K/V does not fit in RAM.  Two passes over one file, format v1 unchanged.
+// ---- Streaming reads: a session whose K/V does not fit in RAM.  Two passes over one file: format v1 unchanged,
+// and format v2 (state-ref) served by the same two passes.
 //
 // `session_file_read_streamed` reads and validates the whole file once, without materializing the K/V: `meta` gets
 // the running state and the K/V headers (its K/V buffers stay empty), the whole payload hash is checked, and when
@@ -257,7 +268,9 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // compares it to the file's trailer.  The first applied block is the gate: everything before it can still be
 // refused cleanly, a divergence found after it (a same-size edit, or a torn re-read) ends the caller - the caller
 // must not go on.  An atomic replacement that is itself self-consistent and keeps the same sizes is NOT detected:
-// the file must have no writer but this engine.  Peak RAM: two 16 MiB buffers and `meta`.
+// the file must have no writer but this engine.  For a format-v2 file the caller must pass finite bounds with
+// `bounds->admit` non-null; the legacy no-bounds form remains for compatibility but does not provide v2 admission
+// protection.  Peak RAM: two 16 MiB buffers and `meta`.
 //
 // `layer` counts as the save wrote them (main layers, then the draft); `part` 0..4 is k, v, k_scale, v_scale,
 // pooled; `offset` is within the part.
@@ -268,7 +281,16 @@ bool session_file_read_streamed(const std::string& path, const SessionFileIdenti
                                 SessionStatus* status = nullptr);
 bool session_file_apply_streamed(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
                                  const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
-                                 SessionStatus* status = nullptr);
+                                 SessionStatus* status = nullptr, const SessionReadLimits* bounds = nullptr);
+// Finite read limits exactly bounding what re-parsing a file whose validated metadata is `meta` may allocate (the
+// counts and state-array sizes of `meta` itself, as the delta apply pass derives its bounds from the expected
+// record).  An apply pass of a format-v2 file uses these instead of the unlimited defaults, so its parse can never
+// allocate beyond what the read pass admitted; `out.admit` is left to the caller.
+void session_read_bounds_from_meta(const SavedConversation& meta, SessionReadLimits& out);
+// The ADDITIONAL RAM peak of the streaming apply pass while the read pass's metadata is still resident: the apply
+// pass's freshly parsed metadata (bounded by `bounds`), one 16 MiB K/V block and the small I/O state.  The resident
+// read-pass metadata is not counted again; streamed K/V payload bytes are excluded.
+uint64_t session_stream_apply_peak_bytes(const SessionReadLimits& bounds);
 // The RAM preflight of the streaming read of a `file_bytes` file: the two block buffers, the small vectors and the
 // running-state metadata the limits admit; the K/V itself stays on disk.
 uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits);

@@ -148,6 +148,91 @@ bool rejects(const fs::path& p, const SessionFileIdentity& id, const char* expec
     }
     return !ok && !error.empty();
 }
+
+// ---- format v2 (--conversation-cache-disk-state-ref): a checkpoint whose five running-state arrays (gdn, ple, tails,
+// dead, block_pos) are all byte-identical to the live state's is stored as REF descriptors of it; ids/imgs/used are
+// saved as before.  homo() builds such a checkpoint with its own ids/imgs/used (those never take part in the decision).
+uint64_t checkpoint_state_bytes(const ConversationCheckpoint& c) {
+    return c.gdn.size() + c.ple.size() + c.tails.size() + c.dead.size() + c.block_pos.size();
+}
+ConversationCheckpoint homo(const ConversationCheckpoint& live, size_t tokens, uint64_t used, uint64_t imghash) {
+    ConversationCheckpoint c;
+    c.ids.assign(live.ids.begin(), live.ids.begin() + (std::ptrdiff_t) tokens);
+    c.imgs = {{7, imghash}};
+    c.gdn = live.gdn; c.ple = live.ple; c.tails = live.tails; c.dead = live.dead; c.block_pos = live.block_pos;
+    c.used = used;
+    return c;
+}
+uint32_t file_version_of(const std::vector<char>& d) {
+    uint32_t v = 0; std::memcpy(&v, d.data() + 8, 4); return v;
+}
+
+// A hand serializer for the frozen v2 grammar (u64 codec, u64 logical, u64 stored, bytes[stored] per array, in the
+// order gdn, ple, tails, dead, block_pos).  The writer only emits all-five REF groups, but the reader must accept any
+// legal RAW/REF mix, so reader fixtures are built byte by byte here.
+struct V2Fixture {
+    std::vector<char> file;                            // the whole file: header, payload, trailer
+    std::vector<std::array<size_t, 5>> codec;          // file offset of each array's codec word; [0] is live, else i+1
+};
+void fx_bytes(std::vector<char>& v, const void* p, size_t n) {
+    const char* c = static_cast<const char*>(p);
+    v.insert(v.end(), c, c + n);
+}
+void fx_u64(std::vector<char>& v, uint64_t x) { fx_bytes(v, &x, 8); }
+void fx_i64(std::vector<char>& v, int64_t x) { fx_bytes(v, &x, 8); }
+void fx_checkpoint(std::vector<char>& p, V2Fixture& fx, size_t who, const ConversationCheckpoint& c,
+                   const std::array<bool, 5>& ref) {
+    fx_u64(p, c.ids.size());
+    fx_bytes(p, c.ids.data(), c.ids.size() * sizeof(int32_t));
+    fx_u64(p, c.imgs.size());
+    for (const auto& k : c.imgs) { fx_i64(p, k.start); fx_u64(p, k.hash); }
+    const auto put = [&](const auto& arr, size_t which) {
+        fx.codec[who][which] = p.size() + 64;        // the file offset (the 64-byte header precedes the payload)
+        fx_u64(p, ref[which] ? 1 : 0);
+        fx_u64(p, (uint64_t) arr.size());
+        fx_u64(p, ref[which] ? 0 : (uint64_t) arr.size());
+        if (!ref[which]) fx_bytes(p, arr.data(), arr.size());
+    };
+    put(c.gdn, 0); put(c.ple, 1); put(c.tails, 2); put(c.dead, 3); put(c.block_pos, 4);
+    fx_u64(p, c.used);
+}
+V2Fixture fx_v2(const SavedConversation& s, const std::vector<std::array<bool, 5>>& refs,
+                const SessionFileIdentity& id) {
+    V2Fixture fx;
+    fx.codec.resize(1 + s.checkpoints.size());
+    std::vector<char> p;
+    for (int64_t g : s.geometry) fx_i64(p, g);
+    fx_i64(p, s.layer_lo); fx_i64(p, s.layer_hi); fx_u64(p, s.cvec ? 1 : 0);
+    fx_checkpoint(p, fx, 0, s.live, {false, false, false, false, false});
+    fx_u64(p, s.checkpoints.size());
+    for (size_t i = 0; i < s.checkpoints.size(); ++i) fx_checkpoint(p, fx, i + 1, s.checkpoints[i], refs[i]);
+    fx_u64(p, s.kv.size());
+    for (const auto& k : s.kv) {
+        fx_i64(p, k.format); fx_i64(p, k.cells); fx_i64(p, k.heads); fx_i64(p, k.head_dim);
+        fx_i64(p, k.page_size); fx_i64(p, k.pooled_rows); fx_i64(p, k.idx_dim);
+        const ConversationBuffer* parts[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+        for (const ConversationBuffer* b : parts) {
+            fx_u64(p, b->size());
+            b->visit(0, b->size(), [&](const uint8_t* q, size_t c, size_t) { fx_bytes(p, q, c); return true; });
+        }
+    }
+    std::vector<char> h(64, 0);
+    std::memcpy(h.data(), "STRSESS\x01", 8);
+    const uint32_t version = 2, hsize = 64;
+    const uint64_t payload = p.size();
+    std::memcpy(h.data() + 8, &version, 4); std::memcpy(h.data() + 12, &hsize, 4);
+    std::memcpy(h.data() + 16, &id.model, 8); std::memcpy(h.data() + 24, &id.config, 8);
+    std::memcpy(h.data() + 32, &payload, 8);
+    const uint64_t hh = session_hash64(h.data(), 56, 0);
+    std::memcpy(h.data() + 56, &hh, 8);
+    fx.file = h;
+    fx.file.insert(fx.file.end(), p.begin(), p.end());
+    const uint64_t ph = session_hash64(p.data(), p.size(), 0);
+    fx_u64(fx.file, ph);
+    fx_bytes(fx.file, "STRSEND\x01", 8);
+    return fx;
+}
+void fx_patch(std::vector<char>& f, size_t off, uint64_t v) { std::memcpy(f.data() + off, &v, 8); }
 } // namespace
 
 int main() {
@@ -241,10 +326,11 @@ int main() {
     // other model or other configuration
     check(rejects(good, {id.model ^ 1, id.config}, "model"), "different model fingerprint rejected");
     check(rejects(good, {id.model, id.config ^ 1}, "config"), "different configuration rejected");
-    // wrong version: header field patched and header hash recomputed so only the version differs
+    // wrong version: header field patched and header hash recomputed so only the version differs.  (Version 2 is now
+    // the state-ref format, so the unsupported-version probe must use a version no reader accepts.)
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");
@@ -1309,6 +1395,569 @@ int main() {
         check(::stat(link.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600, "the session file is mode 0600");
     }
 #endif
+
+    // ---- format v2 (--conversation-cache-disk-state-ref, PLAN §6): prefix saves whose deepest checkpoint's five
+    // running-state arrays are all byte-identical to the live state's store one copy on disk and reference it.
+    {
+        SavedConversation h = sample();
+        h.checkpoints = {homo(h.live, 10, 999, 0xbeefull)};
+        const fs::path v1p = dir / "ref-v1.bin", v2p = dir / "ref-v2.bin";
+        check(session_file_write(v1p.string(), h, id, written, error), "v2ref: the same image writes v1 without the flag");
+        const size_t v1_size = written;
+        SessionWriteOptions sro;
+        sro.state_ref = true;
+        check(session_file_write(v2p.string(), h, id, written, error, sro), "v2ref: a homomorphic prefix writes with the flag");
+        const std::vector<char> v2file = slurp(v2p);
+        // a REF hit emits version 2; a miss (or the flag off) stays byte-identical v1
+        check(file_version_of(v2file) == 2, "v2ref: a REF hit emits version 2");
+        check(file_version_of(slurp(v1p)) == 1, "v2ref: without the flag the file is v1");
+        // exact whole-file savings: one live + one REF checkpoint saves state_bytes - 160 (the five v1 length words
+        // become 24-byte descriptors for the live and the checkpoint); the returned bytes close with the file size
+        const uint64_t state_bytes = checkpoint_state_bytes(h.checkpoints[0]);
+        check(state_bytes == checkpoint_state_bytes(h.live), "v2ref: the fixture's checkpoint arrays equal the live state's");
+        check(v1_size - v2file.size() == state_bytes - 160, "v2ref: exact whole-file savings state_bytes - 160");
+        check(written == v2file.size() && written == fs::file_size(v2p), "v2ref: returned bytes are the file's size");
+        // write-once sizing: the file is written at its final size in one pass (progress reaches the total, nothing
+        // is written and truncated after)
+        {
+            const fs::path pp = dir / "ref-once.bin";
+            SessionWriteOptions once;
+            once.state_ref = true;
+            std::vector<std::pair<uint64_t, uint64_t>> seen;
+            once.progress = [&](uint64_t d, uint64_t t) { seen.push_back({d, t}); };
+            check(session_file_write(pp.string(), h, id, written, error, once), "v2ref: write-once pass");
+            check(seen.size() >= 2 && seen.back() == std::make_pair(uint64_t(written), uint64_t(written)),
+                  "v2ref: the single pass reports to the final size");
+        }
+        // the hand serializer must reproduce the writer's bytes exactly, or the mutation fixtures below prove nothing
+        {
+            V2Fixture fx = fx_v2(h, {{true, true, true, true, true}}, id);
+            check(fx.file == v2file, "v2ref: the hand v2 serializer reproduces the writer's bytes");
+        }
+        // round trip: the checkpoint's arrays come back byte-identical; its own ids/imgs/used are preserved; the
+        // restored checkpoint does not alias the live state (no read-side sharing)
+        {
+            SavedConversation back;
+            size_t n = 0;
+            check(session_file_read(v2p.string(), id, back, n, error) && same(back, h), "v2ref: round trip is identical");
+            check(back.checkpoints[0].ids == h.checkpoints[0].ids && back.checkpoints[0].imgs == h.checkpoints[0].imgs &&
+                  back.checkpoints[0].used == h.checkpoints[0].used, "v2ref: ids/imgs/used kept their stored values");
+            back.checkpoints[0].gdn[0] ^= 0xff;
+            check(back.checkpoints[0].gdn != back.live.gdn && back.live.gdn == h.live.gdn,
+                  "v2ref: the restored checkpoint is an independent copy, not a reference into live");
+            back.live.ple[0] ^= 0xff;
+            check(back.live.ple != back.checkpoints[0].ple && back.checkpoints[0].ple == h.checkpoints[0].ple,
+                  "v2ref: editing the live state does not touch the restored checkpoint");
+        }
+        // all-five discipline: one byte different in ANY of the five arrays, or any length different, falls back to
+        // the byte-identical v1 file for the whole image
+        for (int which = 0; which < 5; ++which) {
+            for (int mode = 0; mode < 2; ++mode) {   // 0: one byte changed, 1: one byte longer
+                SavedConversation s = sample();
+                ConversationCheckpoint cp = homo(s.live, 10, 77, 0xabc);
+                const auto one_byte = [](auto& v) { v[0] ^= 0xff; };
+                const auto one_more = [](auto& v) { v.push_back(1); };
+                switch (which) {
+                    case 0: mode ? one_more(cp.gdn) : one_byte(cp.gdn); break;
+                    case 1: mode ? one_more(cp.ple) : one_byte(cp.ple); break;
+                    case 2: mode ? one_more(cp.tails) : one_byte(cp.tails); break;
+                    case 3: mode ? one_more(cp.dead) : one_byte(cp.dead); break;
+                    default: mode ? one_more(cp.block_pos) : one_byte(cp.block_pos); break;
+                }
+                s.checkpoints = {cp};
+                const fs::path a = dir / "ref-mut-a.bin", b = dir / "ref-mut-b.bin";
+                check(session_file_write(a.string(), s, id, written, error), "v2ref: mutation baseline writes");
+                check(session_file_write(b.string(), s, id, written, error, sro), "v2ref: mutated state writes with the flag");
+                check(slurp(a) == slurp(b) && file_version_of(slurp(b)) == 1,
+                      mode ? "v2ref: a length change in one array keeps the whole file v1"
+                           : "v2ref: a one-byte change in one array keeps the whole file v1");
+            }
+        }
+        // partial groups: only the homomorphic checkpoints are referenced; the formula stays exact
+        {
+            SavedConversation s = sample();
+            s.checkpoints = {homo(s.live, 10, 1, 0xa1), checkpoint(500, 3), homo(s.live, 500, 2, 0xb2)};
+            const uint64_t sb = checkpoint_state_bytes(s.live);
+            const fs::path a = dir / "ref-part-a.bin", b = dir / "ref-part-b.bin";
+            check(session_file_write(a.string(), s, id, written, error), "v2ref: partial baseline writes");
+            check(session_file_write(b.string(), s, id, written, error, sro), "v2ref: partial groups write with the flag");
+            check(file_version_of(slurp(b)) == 2, "v2ref: a partial hit still emits version 2");
+            check(slurp(a).size() - slurp(b).size() == 2 * sb - 80 * 4,
+                  "v2ref: two REF checkpoints save 2*state_bytes - 80*(N+1) exactly");
+            SavedConversation back; size_t n = 0;
+            check(session_file_read(b.string(), id, back, n, error) && same(back, s),
+                  "v2ref: partial groups round trip byte-identically");
+        }
+        // no checkpoint at all: the flag has nothing to reference and the file stays v1
+        {
+            SavedConversation s = sample();
+            s.checkpoints.clear();
+            const fs::path b = dir / "ref-none.bin";
+            check(session_file_write(b.string(), s, id, written, error, sro) && file_version_of(slurp(b)) == 1,
+                  "v2ref: no checkpoint, the flag stays v1");
+        }
+        // empty running-state arrays: the hit still works and the file is exactly 160 bytes LARGER (a tiny state has
+        // no savings; the test asserts the formula, not a sign)
+        {
+            SavedConversation e = sample();
+            e.live.ids = {9, 8, 7};
+            e.live.imgs.clear();
+            e.live.gdn.clear(); e.live.ple.clear(); e.live.tails.clear(); e.live.dead.clear();
+            e.live.block_pos.clear();
+            ConversationCheckpoint cp = homo(e.live, 1, 5, 3);
+            cp.ids = {9};
+            e.checkpoints = {cp};
+            e.kv.clear();
+            const fs::path a = dir / "ref-empty-a.bin", b = dir / "ref-empty-b.bin";
+            check(session_file_write(a.string(), e, id, written, error), "v2ref: empty baseline writes");
+            const size_t empty_v1 = written;
+            check(session_file_write(b.string(), e, id, written, error, sro) && file_version_of(slurp(b)) == 2,
+                  "v2ref: empty arrays still hit REF");
+            check(written == empty_v1 + 160, "v2ref: an empty state is exactly 160 bytes larger (descriptor overhead)");
+            SavedConversation back; size_t n = 0;
+            check(session_file_read(b.string(), id, back, n, error) && same(back, e),
+                  "v2ref: empty arrays round trip");
+        }
+        // huge/overflow boundaries: a REF descriptor whose logical length is not the live array's is refused at the
+        // semantic check; a RAW stored count past the remaining payload is refused before any allocation; a v2 count
+        // above the engine's limit is refused exactly like v1
+        {
+            V2Fixture fx = fx_v2(h, {{true, true, true, true, true}}, id);
+            std::vector<char> d = fx.file;
+            fx_patch(d, fx.codec[1][0] + 8, h.live.gdn.size() + (uint64_t(1) << 40));
+            const fs::path p = dir / "ref-huge.bin"; spit(p, d);
+            SavedConversation keep; size_t n = 0;
+            check(!session_file_read(p.string(), id, keep, n, error) &&
+                  error.find("differs from the live state's") != std::string::npos,
+                  "v2ref: a REF logical length past the live array's is refused (no huge allocation)");
+        }
+        {
+            V2Fixture fx = fx_v2(h, {{true, true, true, true, true}}, id);
+            std::vector<char> d = fx.file;
+            fx_patch(d, fx.codec[0][0] + 8, uint64_t(3) << 40);      // the live gdn is RAW: logical
+            fx_patch(d, fx.codec[0][0] + 16, uint64_t(3) << 40);     // stored: would consume bytes that are not there
+            const fs::path p = dir / "ref-overflow.bin"; spit(p, d);
+            check(rejects(p, id, "element count exceeds the payload"),
+                  "v2ref: a stored count past the remaining payload is refused before allocation");
+        }
+        {
+            SessionReadLimits l;
+            l.max_state_bytes = {16, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+            check(rejects(v2p, id, "exceeds this engine's limit", l),
+                  "v2ref: an over-limit state array is refused with the v1 limit wording");
+        }
+    }
+
+    // header-hash / version / reserved (PLAN 6.3, corrected): a patched version or reserved field with a RECOMPUTED
+    // header hash reaches the unsupported-version / invalid-header checks; without the recompute the header checksum
+    // fires first
+    {
+        const fs::path p = dir / "hdr.bin";
+        {   // version 3, hash recomputed: unsupported version (v2 is a valid version now, so probe with 3)
+            auto d = image;
+            const uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
+            const uint64_t hh = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &hh, 8);
+            spit(p, d);
+            check(rejects(p, id, "unsupported version"), "v2hdr: a recomputed version 3 is an unsupported version");
+        }
+        {   // the same patch without the recompute: the header checksum is what refuses it
+            auto d = image;
+            const uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
+            spit(p, d);
+            check(rejects(p, id, "header checksum"), "v2hdr: an unrecomputed version patch fails the header checksum");
+        }
+        {   // a reserved field set, hash recomputed: invalid header fields
+            auto d = image;
+            const uint64_t r = 1; std::memcpy(d.data() + 40, &r, 8);
+            const uint64_t hh = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &hh, 8);
+            spit(p, d);
+            check(rejects(p, id, "invalid header"), "v2hdr: a set reserved field with a recomputed hash is an invalid header");
+        }
+        {   // a v1-labelled file holding a v2 payload is refused during the parse, before any output is replaced.
+            // The rejection lands inside the v1 grammar's count check (the v2 descriptor words misread as v1 counts),
+            // so the error text is an implementation detail - asserted to pin the failure point, not promised by PLAN
+            SavedConversation h2 = sample();
+            h2.checkpoints = {homo(h2.live, 10, 5, 9)};
+            V2Fixture fx = fx_v2(h2, {{true, true, true, true, true}}, id);
+            auto d = fx.file;
+            const uint32_t v = 1; std::memcpy(d.data() + 8, &v, 4);
+            const uint64_t hh = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &hh, 8);
+            spit(p, d);
+            SavedConversation keep = original; size_t n = 0;
+            SessionStatus st;
+            const bool ok = session_file_read(p.string(), id, keep, n, error, {}, &st);
+            if (ok || error.find("element count exceeds the payload") == std::string::npos)
+                std::fprintf(stderr, "  v1-labelled v2hdr: error was: %s\n", error.c_str());
+            check(!ok && st.error == SessionError::invalid && st.file_version == 1 && n == 0 &&
+                  same(keep, original) && error.find("element count exceeds the payload") != std::string::npos,
+                  "v2hdr: a v1-labelled v2 payload is refused as invalid, the output untouched");
+        }
+        {   // the mirror: a v2-labelled file holding a v1 payload is refused the same way - the v2 reader sees the
+            // v1 state lengths as codec words
+            auto d = image;
+            const uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+            const uint64_t hh = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &hh, 8);
+            spit(p, d);
+            SavedConversation keep = original; size_t n = 0;
+            SessionStatus st;
+            const bool ok = session_file_read(p.string(), id, keep, n, error, {}, &st);
+            if (ok || error.find("unknown state array codec") == std::string::npos)
+                std::fprintf(stderr, "  v2-labelled v1hdr: error was: %s\n", error.c_str());
+            check(!ok && st.error == SessionError::invalid && st.file_version == 2 && n == 0 &&
+                  same(keep, original) && error.find("unknown state array codec") != std::string::npos,
+                  "v2hdr: a v2-labelled v1 payload is refused as invalid, the output untouched");
+        }
+        {   // the same v1-labelled v2 payload through the streamed read pass and the apply pass: both dispatch on the
+            // header's version, so both refuse before any output (the metadata, the byte count, the sink) is touched
+            SavedConversation h2 = sample();
+            h2.checkpoints = {homo(h2.live, 10, 5, 9)};
+            V2Fixture fx = fx_v2(h2, {{true, true, true, true, true}}, id);
+            auto d = fx.file;
+            const uint32_t v = 1; std::memcpy(d.data() + 8, &v, 4);
+            const uint64_t hh = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &hh, 8);
+            const fs::path s = dir / "hdr-str.bin"; spit(s, d);
+            SavedConversation meta = original; size_t n = 0;
+            SessionStatus st;
+            const bool ok = session_file_read_streamed(s.string(), id, meta, n, error, {}, nullptr, &st);
+            if (ok || error.find("element count exceeds the payload") == std::string::npos)
+                std::fprintf(stderr, "  streamed v1-labelled v2hdr: error was: %s\n", error.c_str());
+            check(!ok && st.error == SessionError::invalid && st.file_version == 1 && n == 0 &&
+                  same(meta, original) && error.find("element count exceeds the payload") != std::string::npos,
+                  "v2hdr: the streamed read pass refuses a v1-labelled v2 payload, the metadata untouched");
+            size_t sink_calls = 0;
+            const bool aok = session_file_apply_streamed(s.string(), id,
+                  [&](size_t, size_t, uint64_t, const void*, size_t) { ++sink_calls; return true; },
+                  {}, error, &st);
+            if (aok || error.find("element count exceeds the payload") == std::string::npos)
+                std::fprintf(stderr, "  apply v1-labelled v2hdr: error was: %s\n", error.c_str());
+            check(!aok && sink_calls == 0 && st.error == SessionError::invalid && st.file_version == 1 &&
+                  error.find("element count exceeds the payload") != std::string::npos,
+                  "v2hdr: the apply pass refuses a v1-labelled v2 payload before the first sink byte");
+        }
+    }
+
+    // descriptor hash coverage (PLAN 6.3): the trailer's payload hash is recomputed independently over the whole
+    // payload, descriptors included
+    {
+        SavedConversation h2 = sample();
+        h2.checkpoints = {homo(h2.live, 10, 999, 0xbeefull)};
+        SessionWriteOptions sro; sro.state_ref = true;
+        const fs::path p = dir / "ref-hash.bin";
+        check(session_file_write(p.string(), h2, id, written, error, sro), "v2hash: write");
+        const std::vector<char> d = slurp(p);
+        const size_t payload = d.size() - 64 - 16;
+        uint64_t stored = 0; std::memcpy(&stored, d.data() + d.size() - 16, 8);
+        check(session_hash64(d.data() + 64, payload, 0) == stored,
+              "v2hash: the payload hash covers the descriptors (independent recompute matches the trailer)");
+    }
+
+    // mixed RAW/REF reader fixture (PLAN 6.2): the writer never emits a partial reference, but the grammar allows any
+    // legal mix; a checkpoint may hold REF arrays beside RAW ones, and RAW checkpoints may coexist with REF ones
+    {
+        SavedConversation m = sample();
+        m.checkpoints = {homo(m.live, 10, 11, 0xc1), checkpoint(500, 6)};
+        V2Fixture fx = fx_v2(m, {{true, true, false, false, false}, {false, false, false, false, false}}, id);
+        const fs::path p = dir / "ref-mixed.bin";
+        spit(p, fx.file);
+        SavedConversation back; size_t n = 0;
+        check(session_file_read(p.string(), id, back, n, error) && same(back, m),
+              "v2mix: a hand-built RAW/REF-per-array fixture reads back byte-identically");
+        check(file_version_of(fx.file) == 2 && back.checkpoints[1].gdn == m.checkpoints[1].gdn,
+              "v2mix: the RAW checkpoint's arrays are its own bytes");
+    }
+
+    // semantic codec/descriptor refusals (PLAN 6.3): each illegal field is rejected at the semantic check with the
+    // file's version known (2) and the caller's output object untouched
+    {
+        SavedConversation h = sample();
+        h.checkpoints = {homo(h.live, 10, 999, 0xbeefull), checkpoint(500, 6)};
+        const auto expect_bad = [&](const char* label, std::vector<std::pair<size_t, uint64_t>> patches,
+                                    const char* want) {
+            V2Fixture fx = fx_v2(h, {{true, true, true, true, true}, {false, false, false, false, false}}, id);
+            for (const auto& [off, value] : patches) fx_patch(fx.file, off, value);
+            const fs::path p = dir / "ref-bad.bin";
+            spit(p, fx.file);
+            SavedConversation keep = sample();
+            const SavedConversation before = keep;
+            size_t n = 0;
+            SessionStatus st;
+            const bool ok = session_file_read(p.string(), id, keep, n, error, {}, &st);
+            if (ok || error.find(want) == std::string::npos)
+                std::fprintf(stderr, "  %s: error was: %s\n", label, error.c_str());
+            check(!ok && error.find(want) != std::string::npos, label);
+            check(st.error == SessionError::invalid && st.file_version == 2, "  (bad file, version known)");
+            check(same(keep, before), "  (the caller's output is untouched)");
+        };
+        V2Fixture base = fx_v2(h, {{true, true, true, true, true}, {false, false, false, false, false}}, id);
+        expect_bad("v2bad: an unknown codec is rejected at the semantic check", {{base.codec[1][0], 7}},
+                   "unknown state array codec");
+        expect_bad("v2bad: the live state cannot reference itself", {{base.codec[0][0], 1}},
+                   "the live state cannot reference itself");
+        expect_bad("v2bad: a REF array stores no bytes", {{base.codec[1][1] + 16, 8}},
+                   "a REF state array stores no bytes");
+        expect_bad("v2bad: a REF length must equal the live array's", {{base.codec[1][2] + 8, h.live.tails.size() + 8}},
+                   "a REF state array's length differs from the live state's");
+        expect_bad("v2bad: a RAW stored size must equal its logical size",
+                   {{base.codec[2][3] + 16, h.checkpoints[1].dead.size() + 8}},
+                   "a RAW state array's stored size differs from its logical size");
+        expect_bad("v2bad: a RAW logical size must equal its stored size",
+                   {{base.codec[2][4] + 8, h.checkpoints[1].block_pos.size() + 1}},
+                   "a RAW state array's stored size differs");
+        expect_bad("v2bad: a RAW count past the payload is refused before allocation",
+                   {{base.codec[2][0] + 8, uint64_t(1) << 40}, {base.codec[2][0] + 16, uint64_t(1) << 40}},
+                   "element count exceeds the payload");
+    }
+
+    // truncation at the actual first rejection point (PLAN 6.3): any cut shortens the file, so the header's size
+    // field mismatches the file before the payload is parsed; the failure is 'invalid' and the output is untouched
+    {
+        SavedConversation h = sample();
+        h.checkpoints = {homo(h.live, 10, 999, 0xbeefull)};
+        SessionWriteOptions sro; sro.state_ref = true;
+        const fs::path p = dir / "ref-cut.bin";
+        check(session_file_write(p.string(), h, id, written, error, sro), "v2cut: write");
+        const std::vector<char> whole = slurp(p);
+        for (size_t cut : {whole.size() - 1, whole.size() - 8, whole.size() - 16, whole.size() - 17, whole.size() / 2}) {
+            const fs::path c = dir / "ref-cut-t.bin";
+            spit(c, std::vector<char>(whole.begin(), whole.begin() + (std::ptrdiff_t) cut));
+            SavedConversation keep; size_t n = 0;
+            SessionStatus st;
+            check(!session_file_read(c.string(), id, keep, n, error, {}, &st) &&
+                  error.find("does not match the header") != std::string::npos && st.error == SessionError::invalid,
+                  "v2cut: a truncated v2 file is refused at the header size mismatch");
+        }
+        // a payload byte flipped inside the K/V region parses and is caught by the payload hash
+        auto d = whole;
+        d[d.size() / 2] ^= 0x40;
+        const fs::path f = dir / "ref-cut-f.bin";
+        spit(f, d);
+        check(rejects(f, id, "payload checksum"), "v2cut: a flipped payload byte fails the payload hash");
+    }
+
+    // v2 memory admission (PLAN 6.4): the read keeps the v1 upfront screen, then checks EVERY real allocation point
+    // (ids/imgs, the live RAW arrays, each checkpoint's REF/RAW arrays, the checkpoint and K/V directories, the K/V
+    // buffers).  Refusing at each point in turn must give a memory failure with the file's version known (2), never
+    // touching the caller's output; the per-point asks price single allocations, not a running total.
+    {
+        SavedConversation h = sample();
+        h.checkpoints = {homo(h.live, 10, 999, 0xbeefull)};
+        SessionWriteOptions sro; sro.state_ref = true;
+        const fs::path p = dir / "ref-adm.bin";
+        check(session_file_write(p.string(), h, id, written, error, sro), "v2adm: write");
+        std::vector<uint64_t> asks;
+        SessionReadLimits all;
+        all.admit = [&](uint64_t need, std::string&) { asks.push_back(need); return true; };
+        SavedConversation back; size_t n = 0;
+        check(session_file_read(p.string(), id, back, n, error, all) && same(back, h), "v2adm: an admitting read succeeds");
+        check(asks.size() > 1 && asks[0] == session_read_peak_bytes(fs::file_size(p)),
+              "v2adm: the upfront screen is the v1 ask, then per-allocation checks follow");
+        bool per_allocation = true;
+        for (size_t i = 1; i < asks.size(); ++i) per_allocation = per_allocation && asks[i] <= asks[0];
+        check(per_allocation, "v2adm: per-allocation asks price single allocations, not a cumulative total");
+        for (size_t allow = 0; allow + 1 < asks.size(); ++allow) {
+            SessionReadLimits l;
+            size_t calls = 0;
+            l.admit = [&](uint64_t, std::string& w) { ++calls; w = "controlled v2 refusal"; return calls <= allow + 1; };
+            SavedConversation keep; size_t n2 = 0;
+            SessionStatus st;
+            check(!session_file_read(p.string(), id, keep, n2, error, l, &st) &&
+                  st.error == SessionError::memory && st.file_version == 2 &&
+                  error.find("controlled v2 refusal") != std::string::npos,
+                  "v2adm: every allocation point can refuse with a memory failure (v2 known)");
+        }
+        {   // refusing the upfront screen itself is a memory failure too, with the version already verified
+            SessionReadLimits l;
+            l.admit = [](uint64_t, std::string& w) { w = "controlled v2 refusal"; return false; };
+            SavedConversation keep; size_t n2 = 0;
+            SessionStatus st;
+            check(!session_file_read(p.string(), id, keep, n2, error, l, &st) &&
+                  st.error == SessionError::memory && st.file_version == 2,
+                  "v2adm: the upfront screen refusal is memory, the v2 file distinguished from a bad file");
+        }
+    }
+
+    // the v2 physical size gate (PLAN 3.4/6.4): an all-RAW v2 file (a legal layout the writer never emits) can be
+    // larger than the v1-derived bound - only just, so this uses a tiny conversation where the bound's slack is
+    // smaller than the descriptor overhead.  The v2 bound (the v1 bound plus 80*(1+max_checkpoints)) must admit it;
+    // a v1 file past the v1-derived bound is refused exactly as before, and the absolute file cap binds v2 too
+    {
+        SavedConversation t = sample();
+        t.live.ids = {1, 2, 3};
+        t.live.imgs.clear();
+        t.checkpoints = {homo(t.live, 3, 9, 5)};
+        t.kv.clear();
+        const fs::path hv1 = dir / "gate-v1.bin";
+        check(session_file_write(hv1.string(), t, id, written, error), "v2gate: v1 write");
+        auto exact = [&] {
+            SessionReadLimits l;
+            l.max_tokens = 3; l.max_checkpoints = 1; l.max_kv_layers = 0;
+            l.geometry = t.geometry;
+            l.layer_range = std::make_pair(t.layer_lo, t.layer_hi);
+            l.max_state_bytes = {4099, 77, 301, 64, 8};
+            return l;
+        };
+        check(session_read_max_file_bytes(exact()) >= fs::file_size(hv1) &&
+              session_read_max_file_bytes(exact()) < fs::file_size(hv1) + 160,
+              "v2gate: the v1-derived bound keeps its v1 slack (smaller than the v2 descriptor overhead here)");
+        V2Fixture raw = fx_v2(t, {{false, false, false, false, false}}, id);
+        check(raw.file.size() == fs::file_size(hv1) + 160,
+              "v2gate: all-RAW v2 is exactly 80*(1+N) bytes over the v1 encoding");
+        check(raw.file.size() > session_read_max_file_bytes(exact()),
+              "v2gate: the all-RAW v2 file is past the v1-derived bound");
+        const fs::path hv2 = dir / "gate-v2raw.bin";
+        spit(hv2, raw.file);
+        SavedConversation back; size_t n = 0;
+        check(session_file_read(hv2.string(), id, back, n, error, exact()) && same(back, t),
+              "v2gate: the v2 physical bound admits a file the v1-derived bound would not");
+        {
+            SessionReadLimits tight = exact();
+            tight.max_state_bytes[0] = 4039;
+            const uint64_t v1bound = session_read_max_file_bytes(tight);
+            check(v1bound < fs::file_size(hv1), "v2gate: the tightened bound is below the v1 file's size");
+            check(rejects(hv1, id, "exceeds this engine's limit", tight),
+                  "v2gate: a v1 file past the v1-derived bound is still refused");
+            check(raw.file.size() > v1bound + 160 && rejects(hv2, id, "exceeds this engine's limit", tight),
+                  "v2gate: v2 admits only the descriptor slack, not more");
+        }
+        {
+            SessionReadLimits cap;
+            cap.max_file_bytes = raw.file.size() - 1;
+            check(rejects(hv2, id, "exceeds this engine's limit", cap),
+                  "v2gate: the absolute file cap binds a v2 file too");
+        }
+    }
+
+    // v2 streamed read + apply (PLAN 6.4): the read pass admits its blocks and metadata per allocation; the apply
+    // pass, with the read pass's metadata still resident, is bounded by the read pass and asks one additional peak
+    // before the first sink byte - a refusal there applies nothing and changes nothing
+    {
+        SavedConversation h = sample();
+        h.checkpoints = {homo(h.live, 10, 999, 0xbeefull)};
+        SessionWriteOptions sro; sro.state_ref = true;
+        const fs::path p = dir / "ref-str.bin";
+        check(session_file_write(p.string(), h, id, written, error, sro), "v2str: write");
+        std::vector<uint64_t> asks;
+        SessionReadLimits lim;
+        lim.admit = [&](uint64_t need, std::string&) { asks.push_back(need); return true; };
+        SavedConversation meta;
+        std::vector<std::array<uint64_t, 5>> sizes;
+        size_t n = 0;
+        check(session_file_read_streamed(p.string(), id, meta, n, error, lim, &sizes), "v2str: the read pass succeeds");
+        check(asks.size() > 1 && asks[0] == session_read_stream_peak_bytes(fs::file_size(p), lim),
+              "v2str: the read pass screens upfront, then checks each allocation (the I/O block included)");
+        for (size_t allow = 0; allow + 1 < asks.size(); ++allow) {
+            SessionReadLimits l;
+            size_t calls = 0;
+            l.admit = [&](uint64_t, std::string& w) { ++calls; w = "controlled v2 refusal"; return calls <= allow + 1; };
+            SavedConversation m2; size_t n2 = 0;
+            SessionStatus st;
+            check(!session_file_read_streamed(p.string(), id, m2, n2, error, l, nullptr, &st) &&
+                  st.error == SessionError::memory && st.file_version == 2,
+                  "v2str: every read-pass allocation point can refuse with a memory failure (v2 known)");
+        }
+        check(same_checkpoint(meta.live, h.live) && same_checkpoint(meta.checkpoints[0], h.checkpoints[0]),
+              "v2str: the read pass restores the referenced checkpoint's state");
+        // the apply pass's finite bounds come from the read pass's metadata, not from open limits
+        SessionReadLimits bounds;
+        session_read_bounds_from_meta(meta, bounds);
+        check(bounds.max_checkpoints == meta.checkpoints.size() && bounds.max_kv_layers == meta.kv.size() &&
+              bounds.geometry && *bounds.geometry == meta.geometry &&
+              bounds.max_state_bytes[0] == h.live.gdn.size() && bounds.max_state_bytes[0] == meta.checkpoints[0].gdn.size(),
+              "v2str: the apply bounds derive from the read pass's metadata");
+        // an admitted apply delivers the K/V byte-identically and asks exactly one additional peak
+        {
+            SessionReadLimits b2 = bounds;
+            size_t ask_calls = 0;
+            uint64_t asked = 0;
+            b2.admit = [&](uint64_t need, std::string&) { ++ask_calls; asked = need; return true; };
+            std::vector<std::vector<uint8_t>> parts(meta.kv.size() * 5);
+            size_t biggest = 0;
+            check(session_file_apply_streamed(p.string(), id,
+                  [&](size_t layer, size_t part, uint64_t offset, const void* data, size_t len) {
+                      std::vector<uint8_t>& out = parts[layer * 5 + part];
+                      if (offset != out.size()) return false;
+                      const uint8_t* q = static_cast<const uint8_t*>(data);
+                      out.insert(out.end(), q, q + len);
+                      if (len > biggest) biggest = len;
+                      return true;
+                  }, sizes, error, nullptr, &b2), "v2str: an admitted apply succeeds");
+            check(ask_calls == 1 && asked == session_stream_apply_peak_bytes(bounds),
+                  "v2str: the apply pass asks exactly its additional coexisting peak");
+            check(biggest > 0 && biggest <= (16u << 20), "v2str: blocks are at most 16 MiB");
+            bool same_part = true;
+            for (size_t i = 0; same_part && i < meta.kv.size(); ++i) {
+                const ConversationBuffer* bufs[5] = {&h.kv[i].k, &h.kv[i].v, &h.kv[i].k_scale, &h.kv[i].v_scale,
+                                                     &h.kv[i].pooled};
+                for (size_t p2 = 0; p2 < 5; ++p2) {
+                    std::vector<uint8_t> want;
+                    bufs[p2]->visit(0, bufs[p2]->size(), [&](const uint8_t* q, size_t c, size_t) {
+                        want.insert(want.end(), q, q + c);
+                        return true;
+                    });
+                    same_part = same_part && parts[i * 5 + p2] == want;
+                }
+            }
+            check(same_part, "v2str: the applied K/V equals the image byte for byte");
+        }
+        // a refusal before the first sink byte: nothing is applied, the file is byte-identical, the failure is memory
+        {
+            SessionReadLimits low;
+            session_read_bounds_from_meta(meta, low);
+            size_t ask_calls = 0, sink_calls = 0;
+            low.admit = [&](uint64_t, std::string& w) { ++ask_calls; w = "controlled apply refusal"; return false; };
+            const std::vector<char> before = slurp(p);
+            SessionStatus st;
+            check(!session_file_apply_streamed(p.string(), id,
+                  [&](size_t, size_t, uint64_t, const void*, size_t) { ++sink_calls; return true; },
+                  sizes, error, &st, &low) &&
+                  sink_calls == 0 && ask_calls == 1 &&
+                  st.error == SessionError::memory && st.file_version == 2 &&
+                  error.find("controlled apply refusal") != std::string::npos,
+                  "v2str: the apply pass refuses before the first sink byte when the coexisting peak is denied");
+            check(slurp(p) == before, "v2str: a refused apply leaves the file byte-identical");
+        }
+        // the pre-feature call form (no bounds) still applies a v2 file
+        check(session_file_apply_streamed(p.string(), id,
+              [](size_t, size_t, uint64_t, const void*, size_t) { return true; }, sizes, error),
+              "v2str: the legacy apply form (no bounds) still serves a v2 file");
+    }
+
+    // the delta writer never takes the flag: a record for a homomorphic state is still a v1 record, sized and read
+    // exactly as before (PLAN 6.5: delta encoding and size goldens unchanged)
+    {
+        SavedConversation grown = sample();
+        grown.live.ids.push_back(4242);
+        grown.checkpoints = {homo(grown.live, 10, 77, 7)};
+        SavedConversation meta = grown;
+        meta.kv.clear();
+        std::vector<SessionKvSource> sources;
+        for (const auto& k : grown.kv) {
+            SessionKvSource s;
+            s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
+            s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
+            const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+            for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
+            s.read = [parts](size_t part, size_t offset, void* dst, size_t c2) {
+                return parts[part]->read(dst, offset, c2);
+            };
+            sources.push_back(std::move(s));
+        }
+        const fs::path log = dir / "ref-delta.dlog";
+        SessionWriteOptions sro; sro.state_ref = true;   // ignored by the delta writer
+        uint64_t rec = 0;
+        bool overflow = false;
+        const uint64_t estimate = session_delta_record_bytes(meta, sources, &overflow);
+        check(!overflow && estimate > 0 &&
+              session_delta_write(log.string(), 0, meta, sources, (int64_t) grown.live.ids.size(), id, rec, error, sro) &&
+              rec == estimate && (uint64_t) fs::file_size(log) == rec,
+              "v2delta: the delta writer ignores the flag and sizes the record exactly as before");
+        SessionDeltaRecord read_back;
+        uint64_t next = 0;
+        check(session_delta_read(log.string(), 0, rec, id, {}, read_back, next, error) && next == rec &&
+              read_back.meta.live.ids == grown.live.ids,
+              "v2delta: the record is still a v1 record and reads back");
+        fs::remove(log);
+    }
 
     fs::remove_all(dir);
     std::printf("conversation_file_test: %d checks passed\n", checks);

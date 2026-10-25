@@ -537,7 +537,7 @@ bool ConversationSpillCache::entry_files_valid(const Entry& entry) const {
 }
 
 bool ConversationSpillCache::load(const std::string& path, SavedConversation& image, const SessionReadLimits& limits,
-                                  std::string& error) const {
+                                  std::string& error, SessionStatus* status) const {
     if (!enabled_) { error = "spill cache is disabled"; return false; }
     const size_t index = find(path);
     if (index >= entries_.size()) {
@@ -549,7 +549,7 @@ bool ConversationSpillCache::load(const std::string& path, SavedConversation& im
         return false;
     }
     size_t bytes = 0;
-    return session_file_read(path, identity_, image, bytes, error, limits);
+    return session_file_read(path, identity_, image, bytes, error, limits, status);
 }
 
 std::filesystem::path ConversationSpillCache::next_stem(bool prefix) {
@@ -619,7 +619,8 @@ bool ConversationSpillCache::spill(const SavedConversation& image, std::string& 
 }
 
 bool ConversationSpillCache::spill_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
-                                            size_t& bytes, std::string& error, bool durable, bool prefix) {
+                                            size_t& bytes, std::string& error, bool durable, bool prefix,
+                                            bool state_ref) {
     bytes = 0;
     if (!enabled_) return false;
     if (meta.live.ids.empty() || !meta.stage_images.empty() || !meta.kv.empty()) {
@@ -630,6 +631,7 @@ bool ConversationSpillCache::spill_streamed(const SavedConversation& meta, const
     const std::string session = stem.string() + ".sess";
     SessionWriteOptions wo;
     wo.durable = durable;
+    wo.state_ref = state_ref;   // only a prefix save passes this on; ordinary saves and the delta writer never do
     SessionStatus st;
     if (!session_file_write(session, meta, kv, identity_, bytes, error, wo, &st)) {
         std::filesystem::remove(session, ec);

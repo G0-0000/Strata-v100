@@ -1222,6 +1222,9 @@ Oversized snapshots or host allocation failures fall back to ordinary prompt pro
 advanced N tokens past the copy it would supersede; a turn that grew by a few hundred tokens keeps the older copy
 instead of writing a whole snapshot that the next turn drops. The cost is that a resume from the older copy reads up
 to N tokens again (#2265).
+`--conversation-cache-min-tokens N` (default 0) sets the minimum length for parking a conversation in the RAM cache.
+At a switch, an outgoing conversation shorter than N tokens is not copied into a RAM slot, so short side requests do
+not evict longer conversations. The minimum itself is included, and this gate does not disable the cache.
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
 RAM headroom remain available: the engine checks before allocation (against the
 snapshot's estimated size, less the K/V it already retains) and again after capture.
@@ -1417,8 +1420,9 @@ each parser allocation, counts are checked against the record and engine limits 
 admitted. The final preflight prices the read/apply overlap (record metadata, checkpoint and layer arrays, and one
 bounded I/O block), not the log's length: K/V payload streams through the block and is never resident. Checkpoint-tail
 bookkeeping is admitted before reserve, and the chain/sidecar comparison and apply preflight both finish before any
-live state is changed. An admission refusal is a cache miss; it does not invalidate or remove the chain. With the flag
-off, new sidecars stay the baseline v1 bytes and eviction keeps first-spilled-first order; existing v1
+live state is changed. An admission refusal is a cache miss; it does not invalidate or remove the chain. With
+`--conversation-cache-disk-delta` off, new sidecars stay the baseline v1 bytes (RHT does not change their format) and
+eviction keeps first-spilled-first order; existing v1
 sidecars remain readable.
 
 Disk-only mode also keeps **prefix entries** (`strata-conv-prefix-N`): when a conversation is saved, its shared
@@ -1444,7 +1448,8 @@ descriptor words): on the current cache contents that is an arithmetic estimate 
 snapshot directory - a space estimate from the files' contents, not a measured run of the new format. ids, images and
 `used` are not part of the comparison and are still saved per checkpoint. The flag is off by default, takes no value,
 needs `--conversation-cache-disk-only` (without it the engine warns and turns it off), and applies to prefix saves
-only: ordinary spills, SAVE and the delta writer always write whole files, and the delta chain format is unchanged.
+only: ordinary spills, SAVE and the delta writer always write whole files, and the delta chain format is unchanged by
+this flag.
 
 A v2 file is read back with the flag on or off. Each reference is resolved against the file's live state, which the
 reader parses first, and copied into its own vector - so a restore still holds two independent copies of the state in
@@ -1455,6 +1460,16 @@ The flag is not part of the configuration identity, so turning it on or off does
 written by an older engine version keep their old identity and stay on disk, unindexed and outside the disk budget. A
 binary that does not know format v2 refuses the file as invalid and may delete it, so back up prefix files before
 downgrading. Follow the standing production rule: never roll back or delete cache files by hand without authorization.
+
+**RHT codec for ordinary disk-only entries (`--conversation-cache-disk-state-codec-rht`, opt-in; needs
+`--conversation-cache-disk-only`).** This separate flag selects a lossy RHT+INT16 codec for recurrent GDN state in
+ordinary base `.sess` files and `.dlog` records. Convolution values remain f32 RAW. Prefix entries are excluded and
+keep their existing f32 RAW/REF representation; slot SAVE and RAM-cache spills also remain unchanged. The flag is off
+by default, so default bytes stay unchanged. Encoding starts from the f32 state already in memory and streams to the
+output through bounded helper scratch rather than making a full temporary f32 copy or a second compressed-state
+buffer. Runtime state remains f32. RHT changes state values; this is not a generation-quality acceptance claim. A base
+file or delta record uses codec 2 only when at least one descriptor actually selects RHT; otherwise it stays in the
+prior format, including non-finite or unsupported RAW fallback.
 
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore

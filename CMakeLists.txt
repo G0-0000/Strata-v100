@@ -8,9 +8,9 @@
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.50 LANGUAGES CXX)
+project(strata VERSION 0.1.51 LANGUAGES CXX)
 # Fork-local revision (G0-0000/Strata-v100): a numeric LOCAL_REVISION at the repo root appends one
-# more version segment (0.1.50 -> 0.1.50.<rev>). Appending literally keeps it working whatever segment count
+# more version segment (0.1.51 -> 0.1.51.<rev>). Appending literally keeps it working whatever segment count
 # upstream's project() line carries. Upstream never ships the file, so merges leave it untouched.
 # Runs before the STRATA_ENABLE_SYCL branch below so that early-return path sees the revised
 # PROJECT_VERSION too; sycl/CMakeLists.txt re-parses this file's literal project() line and applies

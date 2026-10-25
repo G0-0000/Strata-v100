@@ -1217,14 +1217,7 @@ keeps one conversation holding the pin. When the outgoing conversation fits only
 in the parked one's room, it keeps its place and the parked one is moved in
 whole, as before.
 Oversized snapshots or host allocation failures fall back to ordinary prompt processing.
-`--conversation-cache-min-tokens N` (default 0 = park every conversation) parks only conversations of at least N
-tokens. A parked conversation costs one of the slots whatever its length, and parking is a switch-time decision, so a
-client that interleaves short side requests with one long conversation spends the cache on the side requests and, once
-it is full, evicts the long one oldest-first - exactly the reuse it wanted. Setting the minimum above the side
-requests' length keeps the long conversation parked. The check runs before `make_room()`, so a skipped park evicts
-nothing and stores nothing; the log line is `conversation cache: skip parking (N tokens, below the M minimum;
-parked=P)`. 0 is the pre-flag behaviour and the flag leaves the answers untouched - it only decides which
-conversations keep a slot.
+
 `--conversation-cache-park-gain N` (opt-in, default 0 = park every turn) parks a conversation again only after it
 advanced N tokens past the copy it would supersede; a turn that grew by a few hundred tokens keeps the older copy
 instead of writing a whole snapshot that the next turn drops. The cost is that a resume from the older copy reads up
@@ -1322,6 +1315,121 @@ The engine log reports parking, restoration, bytes, evictions, individual snapsh
 sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
 retention for diagnostic comparisons. Parked snapshots are not
 persisted across restarts; the session files below are.
+
+**Disk tier for the parked conversations (opt-in).** Set `--conversation-cache-spill-dir DIR` to keep a parked
+conversation when RAM pressure or `--conversation-cache-slots` evicts it: the evicted conversation is written to DIR
+as an ordinary session file (the same format and model/configuration identity as the slot save/restore below), so a
+later request - or a restart - can read it back. The directory is scanned at the next start, and a request that
+matches a spilled conversation resumes from it even though it is no longer in RAM. The cache is still off unless
+`--conversation-cache-mib` is nonzero, and `--prompt-cache 0` or `--conversation-cache-slots 0` disables it.
+`--conversation-cache-disk-mib N` caps this model's spill files at 8192 MiB by default; `0` disables the disk tier.
+The index holds at most 256 conversations and evicts the oldest first. On a clean `QUIT` or stdin close, Strata
+captures the active conversation and spills the parked ones before it exits. Use a separate directory per model.
+
+Each spilled conversation is a session file (`.sess`) plus a small metadata sidecar (`.meta`) that holds only its
+token and image lists, so a new request finds the best disk match without reading the conversation's K/V. A file
+whose recorded model or configuration identity differs is refused, and a sidecar whose session file is missing, or
+whose own checksum fails, is removed when the directory is scanned. The identity is the same model fingerprint and
+configuration fingerprint the session files below are bound to, so a spilled conversation and a hand-saved session
+file are interchangeable.
+
+The identity fingerprint covers the engine version and the resolved configuration, so changing either one - a
+Strata upgrade, or a config change (new flags, a different `--kv` or rope setting) - makes every file already in
+the directory a foreign identity. Rebuilding the same version with the same config does not orphan anything. Those files are
+**kept** — never auto-deleted, not indexed, and outside `--conversation-cache-disk-mib`'s budget, so the disk
+space they hold is invisible to the eviction and only the startup warning (`spill file(s) ... belong to another
+model/config identity`) reports their count and bytes. Use one spill directory per model **and** config, and when
+the config changes, clear the old files by hand:
+
+```bash
+rm -f DIR/strata-conv-*.sess DIR/strata-conv-*.meta
+```
+
+`--conversation-cache-similarity F` sets the least longest-common-prefix fraction of the new prompt a disk hit may
+offer (the fraction is `common_prefix_tokens / new_prompt_tokens`, and must be strictly greater than F);
+`--conversation-cache-n-min N` sets the least common-prefix token count. Both default to 0, which keeps every exact
+prefix the RAM cache would have used. Even when a candidate passes the threshold, Strata restores only a saved
+checkpoint whose token and image keys are an exact prefix of the new prompt; the last prompt token stays unread so
+the next verify window starts in the right position.
+
+A disk hit is read into host RAM before it is restored: it must fit the configured RAM cache budget and leave the
+`--conversation-cache-min-free-mib` physical-memory floor available, or the request reads the prompt normally. The
+engine logs spill, restore, stale-file and disk-budget events. The disk tier keeps the existing single-GPU parking
+limit: with `--layer-split` the disk tier stays off.
+
+**The conversation cache on disk only (`--conversation-cache-disk-only`).** With `--conversation-cache-spill-dir DIR`
+and this flag, the conversation cache needs no RAM budget (`--conversation-cache-mib` is not used). When a request
+switches to another conversation, the outgoing one is written to DIR the way a session SAVE writes it: the running
+state and the deepest checkpoint are copied, the K/V is streamed from its pools into the file. When a conversation
+comes back, it is read the way a streaming RESTORE reads it: a read pass checks the whole file before anything on the
+GPU changes (a bad file is dropped and the prompt is read as usual), then the K/V goes into the pools 16 MiB at a
+time. The new file is written before the conversation's older copies are removed, so a failed write loses nothing,
+and no conversation is refused for its size: `--conversation-cache-disk-mib` is the only limit. The agent's next
+turn of the same conversation (it resumes at the newest turn checkpoint) writes nothing.
+`--conversation-cache-min-tokens N` is the single WRITE gate for disk saves: switch-time saves and the clean-shutdown
+flush require at least N tokens in the outgoing conversation. The default 0 imposes no minimum.
+A clean shutdown writes the live conversation when it meets the same minimum, so the next start can continue it. Single
+GPU, without `--batch` or `--peer-device`.
+Measured on a Ryzen AI Max+ 395 (gfx1151, the iGPU alone, internal NVMe; Qwen3.8-Flash-Next with K-quant experts,
+`--spec 4 --mtp --lookup-chain 3 --kv int8`). Three agent conversations take turns, each a 9-12K-token first prompt
+plus ~1.1K tokens a turn, with an engine restart after 9 requests:
+
+| | prompt read per later turn | turns resumed (of 12) |
+|---|---:|---:|
+| no conversation cache | 11.4-22.3 s (nothing reused) | 0 |
+| `--conversation-cache-disk-only` | 2.3-3.6 s (88-94% reused) | 12 |
+
+A switch wrote 360-443 MiB in 181-196 ms; a return read it back in 291-351 ms (the read pass ~150 ms of it), and in
+275-361 ms with every spill file pushed out of the page cache first (`fincore`: 0 bytes resident). Process
+memory (RssAnon) peaked 0.6 GiB above a run without the cache during a switch and ended 0.15 GiB above it; no
+conversation stays in RAM. Greedy replies matched the run without the cache for 13 of 15 turns; the other two
+match the RAM cache's restore of the same state (a restore and a full read of the prompt round differently).
+
+**Delta chains (`--conversation-cache-disk-delta`, opt-in; needs `--conversation-cache-disk-only`).** With this flag a
+switch does not rewrite the conversation's file: it appends one delta record to a `<stem>.dlog` file beside the base,
+holding the running state and only the K/V pages from the first changed cell on (the base file's K/V stays), and a
+`<stem>.dchain` manifest publishes the log's committed length - an interrupted append's torn tail is cut before the
+next record and never read. A returning conversation restores the base the streaming way, then every record in order,
+each writing at its recorded offset; a same-size edit between the two passes is refused by the record's payload hash
+before more is applied. Before the restore, the chain's last record must match the sidecar in full (ids, images,
+checkpoint lengths): the sidecar is published after the manifest, and a crash between the two is a clean miss, never
+a mix of two saves' state. The spill directory's budget counts the bytes charged to each entry: its
+session file and, for a chain, the log file (including any uncommitted tail), manifest and stamped v2
+sidecar. A legacy v1 sidecar is deliberately unaccounted, preserving the baseline session-file-only
+exact-fit and below-fit boundaries. Removal updates each entry's ledger as each artifact actually
+disappears; a partial group stays quarantined with its manifest and sidecar retained as ownership
+metadata, cannot match, load or append, and can be retried after a restart without charging an earlier
+removal twice. Required base, sidecar, log and manifest paths must be regular files. Deletion does not
+follow symlinks and debits only the bytes that entry had already been charged, never a symlink target's
+size. In a base-only run (including delta-off), a valid chain is kept and accounted but is not offered to
+the plain snapshot loader or evicted just because that restore mode cannot replay it; it cleanly misses
+and recomputes. Disk-only delta mode can restore compatible chains. Manifest publication uses an
+exclusive temp: after creation, any write or close failure stops publication and removes that owned
+temp (or reports a cleanup failure); a pre-existing temp is never removed on a failed exclusive create. When a chain's records outgrow
+the base file (by default two fifths of it, at least 64 MiB), or a conversation arrives whose K/V prefix
+no longer matches the chain on disk, the next switch writes a whole file as before, and prefix entries
+always write whole files. Delta mode must be enabled separately with `--conversation-cache-disk-delta`. The two-fifths
+chain limit has a 64 MiB minimum. Strata also writes a whole file rather than a delta when the next delta record alone
+would be at least as large as the exact full `.sess` snapshot. The same limit applies to the accumulated chain plus the
+next record, with overflow handled as over the limit. The chain's records are validated in the streaming restore's read pass and applied one at
+a time. The read pass keeps only the newest record's metadata; it does not build a per-record offset index. Before
+each parser allocation, counts are checked against the record and engine limits and the actual vector storage is
+admitted. The final preflight prices the read/apply overlap (record metadata, checkpoint and layer arrays, and one
+bounded I/O block), not the log's length: K/V payload streams through the block and is never resident. Checkpoint-tail
+bookkeeping is admitted before reserve, and the chain/sidecar comparison and apply preflight both finish before any
+live state is changed. An admission refusal is a cache miss; it does not invalidate or remove the chain. With the flag
+off, new sidecars stay the baseline v1 bytes and eviction keeps first-spilled-first order; existing v1
+sidecars remain readable.
+
+Disk-only mode also keeps **prefix entries** (`strata-conv-prefix-N`): when a conversation is saved, its shared
+opening is saved once more on its own, once per distinct opening. That is the deepest `"strata_prefix"` checkpoint on
+the live path when the request pinned one, else the root (the first turn boundary at least `--prompt-cache-root`
+tokens in). A new conversation that opens the same way - a coding agent's next session - resumes from it instead of
+reading its system prompt and tools again. Prefix entries are never removed as superseded, the disk budget evicts
+every ordinary conversation before one of them, and they survive a restart. With a client that sends
+`"strata_prefix"` at the end of Claude Code's `<system-reminder>` blocks, a new session's first turn reused 13,434
+of 15,924 tokens and took 4.7 s instead of 15.7 s; after an engine restart, 5.1 s (the 420 MiB entry restored in
+326 ms).
 
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
@@ -1424,12 +1532,21 @@ only its own temporary file. Once the rename is done the old file is gone: if th
 fails with `published` set - the new file's bytes are complete and flushed, but its name may not survive a power loss.
 A filesystem that cannot flush a folder (`EINVAL`) is not a failure; the engine logs it. A restore opens `path` without following a symbolic link (or a Windows reparse point) and refuses
 anything but a regular file with one name; it checks the size, the header, both fingerprints (before the payload is
-parsed; the first 16 MiB block, header included, is already read), that the parse's peak (the image, the read buffer, the per-segment overhead) fits in RAM above the parking
+parsed; the first 16 MiB block, header included, is already read), that the read's peak (the running state metadata,
+two 16 MiB block buffers and the small vectors) fits in RAM above the parking
 floor (`--conversation-cache-min-free-mib`), the file's size against the largest this session can restore, the
 geometry and layer range before any state array, and every count against the bytes left and this session's exact
-limits (context and cells, checkpoints, layers, each running-state array, each K/V part) before allocating it, the payload hash
-and then the usual snapshot validation - all before any device write, and a refusal leaves the current session as it
-was. A transfer failure after the device writes began ends the engine (`FATAL`) rather than decode from a partial
+limits (context and cells, checkpoints, layers, each running-state array, each K/V part) before allocating it, and the payload hash
+- all before any device write, and a refusal leaves the current session as it was. The K/V itself is not held in RAM:
+after the running state and the K/V headers were validated against this engine, the engine reads the file again and
+copies the K/V into its pools a 16 MiB block at a time; this is what restores a session larger than RAM. The apply
+pass is bound to the read pass: a file whose K/V layer count or any part size differs from what the read pass saw is
+refused before that layer or part is applied, and the payload hash is recomputed and compared to the file's trailer
+at the end. The first applied block is the gate - everything before it can still be refused cleanly; a divergence
+found after it (a same-size edit, or a torn re-read) ends the engine, since the remaining bytes cannot be told apart.
+A complete atomic replacement that is itself self-consistent and keeps the same sizes is not detected: the file must
+have no writer but this engine. A transfer failure after the device
+writes began ends the engine (`FATAL`) rather than decode from a partial
 state; the server reports `500` and starts it again. A restore does not park the outgoing session. Not supported with
 `--layer-split`, `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
 `--prompt-cache 0` (the RAM conversation cache need not be on). On Linux the file

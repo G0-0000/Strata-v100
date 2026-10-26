@@ -81,6 +81,35 @@ uint64_t load64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v;
 // (tmpfs, a filesystem that refuses an aligned direct transfer, or STRATA_SESSION_BUFFERED=1).  Windows and other
 // systems: ordinary buffered I/O, same blocks.
 constexpr size_t kAlign = 4096, kBlock = 16u << 20;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+uint64_t sat_mul(uint64_t a, uint64_t b) { return a && b > UINT64_MAX / a ? UINT64_MAX : a * b; }
+
+uint64_t host_page_size() {
+    static const uint64_t page = [] {
+#ifdef _WIN32
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        return info.dwPageSize ? (uint64_t) info.dwPageSize : (uint64_t) kAlign;
+#else
+        const long value = ::sysconf(_SC_PAGESIZE);
+        return value > 0 ? (uint64_t) value : (uint64_t) kAlign;
+#endif
+    }();
+    return page;
+}
+
+uint64_t round_allocation_pages(uint64_t bytes) {
+    if (bytes == 0) return 0;
+    const uint64_t page = host_page_size();
+    const uint64_t remainder = bytes % page;
+    return remainder == 0 ? bytes : sat_add(bytes, page - remainder);
+}
+
+uint64_t allocation_bytes(uint64_t count, size_t element_size) {
+    return round_allocation_pages(sat_mul(count, (uint64_t) element_size));
+}
+
 #ifdef _WIN32
 struct AlignedFree { void operator()(uint8_t* p) const { _aligned_free(p); } };
 using Aligned = std::unique_ptr<uint8_t, AlignedFree>;
@@ -173,7 +202,7 @@ public:
     }
     // a session to restore: the name itself is opened, never what a link or reparse point there points to; it must be
     // an ordinary disk file with one name
-    bool open_session(const std::string& path, uint64_t& size) {
+    bool open_session(const std::string& path, uint64_t& size, bool = true) {
         std::wstring w;
         if (!wide(path, w)) { refused_ = true; error_ = "the path is not valid UTF-8"; return false; }
         h_ = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -208,8 +237,35 @@ public:
         size = (uint64_t) s.QuadPart;
         return true;
     }
+    // a spill chain's append log: an existing file of ours opened read+write, or created (the append path).  No
+    // reparse-point follow: a link where the log should be is refused, never written through.
+    bool open_append(const std::string& path, uint64_t& size) {
+        std::wstring w;
+        if (!wide(path, w)) { refused_ = true; error_ = "the path is not valid UTF-8"; return false; }
+        h_ = CreateFileW(w.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (h_ == INVALID_HANDLE_VALUE) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(h_, &info)) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) { refused_ = true; error_ = "a link or reparse point, not a file"; return false; }
+        if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || GetFileType(h_) != FILE_TYPE_DISK) {
+            refused_ = true;
+            error_ = "not a regular file";
+            return false;
+        }
+        if (info.nNumberOfLinks != 1) { refused_ = true; error_ = "the file has more than one name (hard link)"; return false; }
+        size = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+        return true;
+    }
     bool is_open() const { return h_ != INVALID_HANDLE_VALUE; }
     bool direct() const { return false; }
+    bool seek(uint64_t offset) {
+        LARGE_INTEGER at{};
+        at.QuadPart = (LONGLONG) offset;
+        if (SetFilePointerEx(h_, at, nullptr, FILE_BEGIN)) return true;
+        { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
+        return false;
+    }
     bool write_all(const uint8_t* p, size_t n) {
         while (n) {
             DWORD w = 0;
@@ -354,8 +410,9 @@ public:
         return true;
     }
     // a session to restore: the name itself is opened, never what a symbolic link there points to; it must be a
-    // regular file with one name (no hard link to a file elsewhere).  Checked on the opened descriptor.
-    bool open_session(const std::string& path, uint64_t& size) {
+    // regular file with one name (no hard link to a file elsewhere).  Checked on the opened descriptor. Delta readers
+    // pass false: their scalar fields use arbitrary byte offsets that cannot satisfy O_DIRECT alignment.
+    bool open_session(const std::string& path, uint64_t& size, bool allow_direct = true) {
         fd_ = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);   // NONBLOCK: a FIFO cannot hang
         if (fd_ < 0) {
             refused_ = errno == ELOOP;
@@ -370,7 +427,7 @@ public:
         const int fl = ::fcntl(fd_, F_GETFL);
         if (fl >= 0) ::fcntl(fd_, F_SETFL, fl & ~O_NONBLOCK);
         size = (uint64_t) st.st_size;
-        try_direct();
+        if (allow_direct) try_direct();
         return true;
     }
     // a model input: links followed (model folders are often linked)
@@ -383,8 +440,31 @@ public:
         size = (uint64_t) st.st_size;
         return true;
     }
+    // a spill chain's append log: an existing file of ours opened read+write, or created (the append path).  O_NOFOLLOW
+    // (a symbolic link where the log should be is refused), no O_DIRECT (records start on arbitrary offsets).
+    bool open_append(const std::string& path, uint64_t& size) {
+        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd_ < 0) {
+            refused_ = errno == ELOOP;
+            kind_ = errno_kind(errno);
+            error_ = errno == ELOOP ? std::string("a symbolic link, not a file") : std::string(std::strerror(errno));
+            return false;
+        }
+        struct stat st {};
+        if (::fstat(fd_, &st) != 0) { kind_ = errno_kind(errno); error_ = std::strerror(errno); return false; }
+        if (!S_ISREG(st.st_mode)) { refused_ = true; error_ = "not a regular file"; return false; }
+        if (st.st_nlink != 1) { refused_ = true; error_ = "the file has more than one name (hard link)"; return false; }
+        size = (uint64_t) st.st_size;
+        return true;
+    }
     bool is_open() const { return fd_ >= 0; }
     bool direct() const { return direct_; }
+    bool seek(uint64_t offset) {
+        if (::lseek(fd_, (off_t) offset, SEEK_SET) >= 0) return true;
+        kind_ = errno_kind(errno);
+        error_ = std::strerror(errno);
+        return false;
+    }
     bool write_all(const uint8_t* p, size_t n) {
         while (n) {
             const ssize_t w = ::write(fd_, p, n);
@@ -653,11 +733,27 @@ struct Out {
         const size_t size = s.sizes[part];
         u64(size);
         if (!f) { count(size); return; }
+        read_from(s, part, 0, size);
+    }
+    // a delta record's K/V part: the offset it starts at, its length, and the bytes from there
+    void source_tail(const SessionKvSource& s, size_t part) {
+        const size_t full = s.sizes[part];
+        const size_t first = std::min(s.first_bytes[part], full);
+        const size_t size = full - first;
+        u64(first);
+        u64(size);
+        if (!f) { count(size); return; }
+        read_from(s, part, first, size);
+    }
+    bool read_failed = false;
+    std::string read_error;
+private:
+    void read_from(const SessionKvSource& s, size_t part, size_t first, size_t size) {
         for (size_t at = 0; at < size && ok;) {
             size_t room = 0;
             uint8_t* d = f->span(room);
             const size_t c = std::min(room, size - at);
-            if (!s.read || !s.read(part, at, d, c)) {
+            if (!s.read || !s.read(part, first + at, d, c)) {
                 ok = false;
                 read_failed = true;
                 if (s.error) read_error = s.error();
@@ -669,8 +765,6 @@ struct Out {
             at += c;
         }
     }
-    bool read_failed = false;
-    std::string read_error;
 };
 
 void put_kv_header(Out& o, int format, int64_t cells, int64_t heads, int64_t head_dim, int64_t page_size,
@@ -707,6 +801,30 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
     }
 }
 
+// ---- delta records (--conversation-cache-disk-delta): the same meta prefix as a session file, then the K/V each
+// part as (offset, size, bytes).  The payload hash covers the record's header fields too, so an edit anywhere in it
+// is refused by the read pass.
+constexpr uint64_t kDeltaVersion = 1;
+constexpr char kDeltaMagic[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
+
+void put_delta_record(Out& o, const SessionFileIdentity& id, int64_t first_token, const SavedConversation& s,
+                      const std::vector<SessionKvSource>& kv) {
+    o.raw(kDeltaMagic, 8);
+    o.u64(kDeltaVersion);
+    o.u64(id.model); o.u64(id.config);
+    o.i64(first_token);
+    for (int64_t g : s.geometry) o.i64(g);
+    o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
+    put_checkpoint(o, s.live);
+    o.u64(s.checkpoints.size());
+    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    o.u64(kv.size());
+    for (const auto& k : kv) {
+        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+        for (size_t part = 0; part < 5; ++part) o.source_tail(k, part);
+    }
+}
+
 // ---- parsing: every count is checked against the bytes left and the caller's limits before anything is allocated
 struct In {
     FileSource* f;
@@ -714,6 +832,10 @@ struct In {
     uint64_t left;
     std::string& error;
     const SessionReadLimits& limits;
+    // Streaming K/V sizes: `record_kv` receives them (the read pass); `verify_kv`, set from the read pass's list,
+    // makes this walk refuse a file whose layer count or any part size differs (the apply pass).  At most one set.
+    std::vector<std::array<uint64_t, 5>>* record_kv = nullptr;
+    const std::vector<std::array<uint64_t, 5>>* verify_kv = nullptr;
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
@@ -735,10 +857,13 @@ struct In {
         if (n > (uint64_t) std::numeric_limits<size_t>::max() / (elem ? elem : 1)) return fail("element count too large");
         return true;
     }
+    template<class T> bool resize(std::vector<T>& v, uint64_t n) {
+        v.resize((size_t) n);
+        return true;
+    }
     template<class T> bool vec(std::vector<T>& v, uint64_t limit = UINT64_MAX) {
         uint64_t n = 0;
-        if (!count(n, sizeof(T), limit)) return false;
-        v.resize((size_t) n);
+        if (!count(n, sizeof(T), limit) || !resize(v, n)) return false;
         return raw(v.data(), (size_t) n * sizeof(T));
     }
     bool buffer(ConversationBuffer& b, size_t part) {
@@ -751,18 +876,21 @@ struct In {
     }
 };
 
-bool get_checkpoint(In& in, ConversationCheckpoint& c) {
+// The meta prefix is shared by session files and delta records: any reader with raw/u64/i64/count/vec/fail/limits
+// works (In over a session file, DeltaIn over a record).
+template<class R>
+bool get_checkpoint_t(R& in, ConversationCheckpoint& c) {
     if (!in.vec(c.ids, in.limits.max_tokens)) return false;
     uint64_t n = 0;
-    if (!in.count(n, 16, in.limits.max_tokens)) return false;
-    c.imgs.resize((size_t) n);
+    if (!in.count(n, 16, in.limits.max_tokens) || !in.resize(c.imgs, n)) return false;
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
     return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+template<class R>
+bool get_meta_prefix_t(R& in, SavedConversation& s) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -774,12 +902,20 @@ bool get_payload(In& in, SavedConversation& s) {
         return in.fail("saved with another layer range than this runtime's");
     if (cvec > 1) return in.fail("invalid cvec flag");
     s.cvec = cvec == 1;
-    if (!get_checkpoint(in, s.live)) return false;
+    if (!get_checkpoint_t(in, s.live)) return false;
     uint64_t n = 0;
     // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
-    if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
-    s.checkpoints.resize((size_t) n);
-    for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
+    if (!in.count(n, 72, in.limits.max_checkpoints) || !in.resize(s.checkpoints, n)) return false;
+    for (auto& c : s.checkpoints) if (!get_checkpoint_t(in, c)) return false;
+    return true;
+}
+
+bool get_checkpoint(In& in, ConversationCheckpoint& c) { return get_checkpoint_t(in, c); }
+bool get_meta_prefix(In& in, SavedConversation& s) { return get_meta_prefix_t(in, s); }
+
+bool get_payload(In& in, SavedConversation& s) {
+    if (!get_meta_prefix(in, s)) return false;
+    uint64_t n = 0;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
     s.kv.resize((size_t) n);
     for (auto& k : s.kv) {
@@ -791,6 +927,127 @@ bool get_payload(In& in, SavedConversation& s) {
         k.format = (int) format;
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
+    }
+    return true;
+}
+
+// A delta record's reader: bounded reads at an absolute file offset, hashing every payload byte (the trailer is read
+// without hashing, as in read_impl).  The read pass records each part's offset and size; the apply pass (verify) makes
+// this walk refuse a record whose layer set, K/V headers, offsets or sizes differ from the read pass's record before
+// that part is touched.
+struct DeltaIn {
+    RawFile* f;
+    uint64_t at, end;
+    SessionHasher hash;
+    std::string& error;
+    const SessionReadLimits& limits;
+    std::vector<std::array<uint64_t, 5>>* record_kv = nullptr;
+    std::vector<std::array<uint64_t, 5>>* record_offset = nullptr;
+    const SessionDeltaRecord* verify = nullptr;
+    SessionError kind = SessionError::invalid;
+    size_t kv_layer = 0;
+    bool fail(const std::string& m) { if (error.empty()) error = "delta record: " + m; return false; }
+    bool raw(void* p, size_t c) {
+        if (c > end - at) return fail("record ends early");
+        if (c && !f->read_at(at, static_cast<uint8_t*>(p), c)) { kind = f->kind(); return fail("read error: " + f->error()); }
+        hash.update(p, c);
+        at += c;
+        return true;
+    }
+    bool tail(void* p, size_t c) {   // the trailer: read, not hashed
+        if (c > end - at) return fail("record ends early");
+        if (c && !f->read_at(at, static_cast<uint8_t*>(p), c)) { kind = f->kind(); return fail("read error: " + f->error()); }
+        at += c;
+        return true;
+    }
+    bool u64(uint64_t& v) { return raw(&v, 8); }
+    bool i64(int64_t& v) { return raw(&v, 8); }
+    bool count(uint64_t& n, size_t elem, uint64_t limit = UINT64_MAX) {
+        if (!u64(n)) return false;
+        if (elem && n > (end - at) / elem) return fail("element count exceeds the record");
+        if (n > limit) return fail("element count " + std::to_string(n) + " exceeds this engine's limit " +
+                                   std::to_string(limit));
+        if (n > (uint64_t) std::numeric_limits<size_t>::max() / (elem ? elem : 1)) return fail("element count too large");
+        return true;
+    }
+    bool prepare_allocation(uint64_t count, size_t element_size) {
+        if (element_size && count > (uint64_t) std::numeric_limits<size_t>::max() / element_size)
+            return fail("allocation size exceeds this build");
+        const uint64_t need = allocation_bytes(count, element_size);
+        if (need == UINT64_MAX) return fail("allocation size overflows");
+        if (need && limits.admit) {
+            std::string why;
+            if (!limits.admit(need, why)) {
+                kind = SessionError::memory;
+                if (error.empty()) error = "delta record: " +
+                    (why.empty() ? std::string("RAM admission refused") : why);
+                return false;
+            }
+        }
+        return true;
+    }
+    template<class T> bool resize(std::vector<T>& v, uint64_t n) {
+        if (n > v.max_size()) return fail("element count exceeds this container's maximum");
+        if (!prepare_allocation(n, sizeof(T))) return false;
+        const size_t count = (size_t) n;
+        if (count) v.reserve(count);   // these parser-owned vectors start empty; no geometric growth or old/new overlap
+        v.resize(count);
+        return true;
+    }
+    template<class T> bool resize_zero(std::vector<T>& v, uint64_t n) {
+        if (!resize(v, n)) return false;
+        std::fill(v.begin(), v.end(), T{});
+        return true;
+    }
+    template<class T> bool vec(std::vector<T>& v, uint64_t limit = UINT64_MAX) {
+        uint64_t n = 0;
+        if (!count(n, sizeof(T), limit) || !resize(v, n)) return false;
+        return raw(v.data(), (size_t) n * sizeof(T));
+    }
+};
+
+// The streaming read: the same walk, but every K/V part's bytes are read through one 16 MiB block and hashed, never
+// kept; a `sink` (the apply pass) gets each block as it is read.  When `in.record_kv` is set the part sizes are
+// recorded for the caller; when `in.verify_kv` is set (the apply pass) the file must have exactly the layer count
+// and part sizes the read pass saw, checked before that layer or part is applied.
+bool get_payload_streamed(In& in, SavedConversation& s, const SessionKvBlock& sink) {
+    if (!get_meta_prefix(in, s)) return false;
+    uint64_t n = 0;
+    if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
+    if (in.verify_kv && in.verify_kv->size() != (size_t) n)
+        return in.fail("K/V layer count differs from the read pass");
+    s.kv.resize((size_t) n);
+    if (in.record_kv) in.record_kv->assign((size_t) n, {});
+    Aligned block;
+    if (n) {
+        block = aligned_block();
+        if (!block) { in.kind = SessionError::memory; return in.fail("out of memory for the K/V read block"); }
+    }
+    for (size_t l = 0; l < (size_t) n; ++l) {
+        auto& k = s.kv[l];
+        in.kv_layer = l;
+        int64_t format = 0;
+        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
+        k.format = (int) format;
+        for (size_t part = 0; part < 5; ++part) {
+            uint64_t size = 0;
+            const uint64_t limit = l < in.limits.max_kv_bytes.size() ? in.limits.max_kv_bytes[l][part] : UINT64_MAX;
+            if (!in.count(size, 1, limit)) return false;
+            if (in.record_kv) (*in.record_kv)[l][part] = size;
+            if (in.verify_kv && size != (*in.verify_kv)[l][part])
+                return in.fail("K/V part size differs from the read pass");
+            for (uint64_t at = 0; at < size; at += kBlock) {
+                const size_t c = (size_t) std::min<uint64_t>(kBlock, size - at);
+                if (!in.raw(block.get(), c)) return false;
+                if (sink && !sink(l, part, at, block.get(), c)) {
+                    if (in.error.empty()) in.error = "session file: the K/V sink failed";
+                    in.kind = SessionError::io;
+                    return false;
+                }
+            }
+        }
     }
     return true;
 }
@@ -992,11 +1249,6 @@ bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint6
     return true;
 }
 
-namespace {
-uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
-uint64_t sat_mul(uint64_t a, uint64_t b) { return a && b > UINT64_MAX / a ? UINT64_MAX : a * b; }
-} // namespace
-
 uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
     const uint64_t open = UINT64_MAX;
     if (l.max_tokens == open || l.max_checkpoints == open || l.max_kv_layers == open) return l.max_file_bytes;
@@ -1021,6 +1273,58 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
     const uint64_t segments = file_bytes / kBlock + 1;
     // the parsed image (about the payload), the read buffer, a page per buffer segment, the small vectors
     return sat_add(sat_add(sat_add(file_bytes, kBlock), sat_mul(segments, 4096)), uint64_t(1) << 20);
+}
+
+namespace {
+uint64_t session_meta_peak_bytes(const SessionReadLimits& limits, bool include_kv_layers) {
+    const uint64_t states = sat_add(limits.max_checkpoints, 1);
+    uint64_t one_checkpoint = allocation_bytes(limits.max_tokens, sizeof(int32_t));
+    one_checkpoint = sat_add(one_checkpoint, allocation_bytes(limits.max_tokens, sizeof(ConversationImageKey)));
+    for (uint64_t bytes : limits.max_state_bytes) one_checkpoint = sat_add(one_checkpoint, round_allocation_pages(bytes));
+
+    uint64_t total = sizeof(SavedConversation);
+    total = sat_add(total, allocation_bytes(limits.max_checkpoints, sizeof(ConversationCheckpoint)));
+    if (include_kv_layers)
+        total = sat_add(total, allocation_bytes(limits.max_kv_layers, sizeof(ConversationKv)));
+    total = sat_add(total, sat_mul(states, one_checkpoint));
+    return total;
+}
+} // namespace
+
+uint64_t session_read_meta_peak_bytes(const SessionReadLimits& limits) {
+    // The live checkpoint and every accepted checkpoint; their vectors allocate once from empty and are bounded by
+    // the same counts and byte limits the parser checks.  Page rounding covers each independent vector allocation.
+    return session_meta_peak_bytes(limits, true);
+}
+
+uint64_t session_delta_walk_peak_bytes(const SessionReadLimits& limits) {
+    // The read pass has one populated result plus its empty caller-owned output object. During apply, the already-read
+    // expected record coexists with a parser SavedConversation. The base/latest metadata is already live and remains
+    // accounted for by available memory; this incremental need never includes log length or streamed K/V payload.
+    uint64_t record = session_meta_peak_bytes(limits, true);
+    record = sat_add(record, sizeof(SessionDeltaRecord) - sizeof(SavedConversation));
+    const uint64_t layer_parts = allocation_bytes(limits.max_kv_layers, sizeof(std::array<uint64_t, 5>));
+    record = sat_add(record, sat_mul(2, layer_parts));
+
+    const uint64_t scratch = sat_add(kBlock, sizeof(DeltaIn) + sizeof(RawFile) + sizeof(Aligned) + 64);
+    const uint64_t read_peak = sat_add(sat_add(record, sizeof(SessionDeltaRecord)), scratch);
+    const uint64_t apply_peak = sat_add(sat_add(record, session_meta_peak_bytes(limits, false)), scratch);
+    return std::max(read_peak, apply_peak);
+}
+
+uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits) {
+    // the reader's block and the block a K/V part is moved through, plus the small vectors
+    uint64_t n = sat_add(sat_mul(2, kBlock), uint64_t(1) << 20);
+    // the parsed running-state metadata: the live checkpoint and every checkpoint the limits accept, each bounded
+    // by the tokens and state bytes the engine allows (an open limit can hold no more than the file itself)
+    uint64_t cp = sat_mul(limits.max_tokens, sizeof(int32_t) + sizeof(ConversationImageKey));
+    for (uint64_t b : limits.max_state_bytes) cp = sat_add(cp, b);
+    cp = sat_add(cp, 64);
+    const uint64_t checkpoints = limits.max_checkpoints == UINT64_MAX ? file_bytes : sat_mul(limits.max_checkpoints, cp);
+    n = sat_add(n, std::min(sat_add(cp, checkpoints), file_bytes));
+    // one hash per <= 16 MiB block moved, and the per-layer directories (a tiny term, bounded by the file)
+    n = sat_add(n, sat_mul(file_bytes / kBlock + 1, 6 * sizeof(uint64_t)));
+    return n;
 }
 
 namespace {
@@ -1171,34 +1475,11 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
 }
 
 namespace {
-bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
-               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
-    error.clear();
-    st = {};
-    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
-    RawFile raw;
-    uint64_t size = 0;
-    if (!raw.open_session(path, size)) {
-        st.error = raw.refused() ? SessionError::invalid : raw.kind();
-        error = "session file: " + path + ": " + raw.error();
-        return false;
-    }
-    if (size < kHeader + kTrailer) { error = "session file: size " + std::to_string(size) + " is below the minimum"; return false; }
-    const uint64_t max_size = session_read_max_file_bytes(limits);
-    if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
-        error = "session file: size " + std::to_string(size) + " exceeds this engine's limit" +
-                (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
-        return false;
-    }
-    FileSource f(raw);
-    if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
-    // installed before the first block (the header's) is read: every block reports, the first one included
-    if (limits.progress) f.progress.emplace(limits.progress);
-    f.expected = size;
-    uint8_t h[kHeader];
-    if (!f.read(h, kHeader)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
+// The header every read checks first: magic, version, fields, size and both fingerprints, leaving `payload` set.
+bool header_ok(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, uint64_t& payload,
+               std::string& error) {
     uint32_t version = 0, hsize = 0;
-    uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+    uint64_t model = 0, config = 0, r0 = 0, r1 = 0, hh = 0;
     std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
     std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
@@ -1213,26 +1494,141 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
                 std::to_string(kHeader + payload + kTrailer) + ")";
         return false;
     }
+    return true;
+}
+
+// A read's prologue: open the file by its name (never what a symbolic link there points to), bound its size, and
+// read and check the header.  On success the source is positioned after the header and `payload` is set.
+struct ReadFile {
+    RawFile raw;
+    FileSource source;
+    uint64_t size = 0;
+    ReadFile() : source(raw) {}
+    bool open(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
+              uint64_t& payload, std::string& error, SessionStatus& st) {
+        if (!raw.open_session(path, size)) {
+            st.error = raw.refused() ? SessionError::invalid : raw.kind();
+            error = "session file: " + path + ": " + raw.error();
+            return false;
+        }
+        if (size < kHeader + kTrailer) {
+            error = "session file: size " + std::to_string(size) + " is below the minimum";
+            return false;
+        }
+        const uint64_t max_size = session_read_max_file_bytes(limits);
+        if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
+            error = "session file: size " + std::to_string(size) + " exceeds this engine's limit" +
+                    (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
+            return false;
+        }
+        if (!source.ok()) { st.error = SessionError::memory; error = "session file: " + source.error(); return false; }
+        // installed before the first block (the header's) is read: every block reports, the first one included
+        if (limits.progress) source.progress.emplace(limits.progress);
+        source.expected = size;
+        uint8_t h[kHeader];
+        if (!source.read(h, kHeader)) {
+            st.error = source.kind();
+            error = "session file: header read error: " + source.error();
+            return false;
+        }
+        return header_ok(h, size, id, payload, error);
+    }
+};
+
+bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
+    ReadFile rf;
+    uint64_t payload = 0;
+    if (!rf.open(path, id, limits, payload, error, st)) return false;
     if (limits.admit) {
         std::string why;
-        if (!limits.admit(session_read_peak_bytes(size), why)) {
+        if (!limits.admit(session_read_peak_bytes(rf.size), why)) {
             st.error = SessionError::memory;
             error = "session file: " + why;
             return false;
         }
     }
     SavedConversation parsed;
-    In in{&f, SessionHasher(0), payload, error, limits};
+    In in{&rf.source, SessionHasher(0), payload, error, limits};
     if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
-    if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
+    if (!rf.source.read(t, kTrailer)) { st.error = rf.source.kind(); error = "session file: trailer read error: " + rf.source.error(); return false; }
     uint64_t ph = 0;
     std::memcpy(&ph, t, 8);
     if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
     image = std::move(parsed);
-    bytes = (size_t) size;
+    bytes = (size_t) rf.size;
+    st.error = SessionError::none;
+    return true;
+}
+
+// The read pass of a streaming restore: the whole file is validated without materializing the K/V (see
+// conversation_file.hpp).  The apply pass re-walks the same file with a sink, bound by the K/V sizes recorded here.
+bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& meta,
+                      size_t& bytes, std::string& error, const SessionReadLimits& limits,
+                      std::vector<std::array<uint64_t, 5>>* kv_part_bytes, SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;
+    ReadFile rf;
+    uint64_t payload = 0;
+    if (!rf.open(path, id, limits, payload, error, st)) return false;
+    if (limits.admit) {
+        std::string why;
+        if (!limits.admit(session_read_stream_peak_bytes(rf.size, limits), why)) {
+            st.error = SessionError::memory;
+            error = "session file: " + why;
+            return false;
+        }
+    }
+    SavedConversation parsed;
+    In in{&rf.source, SessionHasher(0), payload, error, limits};
+    in.record_kv = kv_part_bytes;
+    if (!get_payload_streamed(in, parsed, {})) { st.error = in.kind; return false; }
+    if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
+    uint8_t t[kTrailer];
+    if (!rf.source.read(t, kTrailer)) { st.error = rf.source.kind(); error = "session file: trailer read error: " + rf.source.error(); return false; }
+    uint64_t ph = 0;
+    std::memcpy(&ph, t, 8);
+    if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
+    if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
+    meta = std::move(parsed);
+    bytes = (size_t) rf.size;
+    st.error = SessionError::none;
+    return true;
+}
+
+// The apply pass: the file is walked again and every K/V block goes to the sink.  `kv_part_bytes` is the read
+// pass's list: this walk refuses a file whose layer count or part sizes differ before applying that layer or part,
+// so the sink only ever sees the bytes the read pass admitted.  The payload hash is recomputed and compared to the
+// trailer at the end - a same-size divergence since the read pass ends the caller (fail-stop).  Any failure past
+// the first sink call leaves the caller's state partly written - the caller must fail-stop.
+bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
+                       const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
+                       SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;
+    ReadFile rf;
+    uint64_t payload = 0;
+    if (!rf.open(path, id, SessionReadLimits{}, payload, error, st)) return false;
+    SessionReadLimits open;   // the read pass checked the engine's bounds; this walk only hands the K/V over
+    SavedConversation parsed;   // re-parsed, then discarded
+    In in{&rf.source, SessionHasher(0), payload, error, open};
+    in.verify_kv = &kv_part_bytes;
+    if (!get_payload_streamed(in, parsed, sink)) { st.error = in.kind; return false; }
+    if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
+    uint8_t t[kTrailer];
+    if (!rf.source.read(t, kTrailer)) { st.error = rf.source.kind(); error = "session file: trailer read error: " + rf.source.error(); return false; }
+    uint64_t ph = 0;
+    std::memcpy(&ph, t, 8);
+    if (ph != in.hash.digest()) { error = "session file: the file changed since the read pass (payload checksum)"; return false; }
+    if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
     st.error = SessionError::none;
     return true;
 }
@@ -1251,6 +1647,413 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     }
     if (status) *status = st;
     return ok;
+}
+
+bool session_file_read_streamed(const std::string& path, const SessionFileIdentity& id, SavedConversation& meta,
+                                size_t& bytes, std::string& error, const SessionReadLimits& limits,
+                                std::vector<std::array<uint64_t, 5>>* kv_part_bytes, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = read_stream_impl(path, id, meta, bytes, error, limits, kv_part_bytes, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+bool session_file_apply_streamed(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
+                                 const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
+                                 SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = apply_stream_impl(path, id, sink, kv_part_bytes, error, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+// ---- delta records: the append, the read pass and the apply pass (see conversation_file.hpp)
+namespace {
+bool delta_write_impl(const std::string& path, uint64_t at, const SavedConversation& meta,
+                      const std::vector<SessionKvSource>& kv, int64_t first_token, const SessionFileIdentity& id,
+                      uint64_t& bytes, std::string& error, const SessionWriteOptions& opt, SessionStatus& st) {
+    st = {};
+    st.error = SessionError::invalid;   // refusals before any disk access
+    if (has_stage_parts(meta)) { error = "delta record: layer-split state cannot be saved"; return false; }
+    if (!meta.kv.empty()) { error = "delta record: the metadata must not carry K/V buffers"; return false; }
+    for (const auto& s : kv)
+        for (size_t p = 0; p < 5; ++p)
+            if (s.first_bytes[p] > s.sizes[p]) { error = "delta record: a K/V offset is past its part"; return false; }
+    Out sizing;
+    put_delta_record(sizing, id, first_token, meta, kv);
+    if (sizing.overflow || sizing.n > UINT64_MAX - kTrailer) {
+        error = "delta record: the state is too large for this build";
+        return false;
+    }
+    const uint64_t total = sizing.n + kTrailer;   // the payload hash and the end marker
+    st.error = SessionError::io;
+    if (opt.min_free_bytes) {
+        uint64_t avail = 0;
+        if (!free_space(path, avail)) { error = "delta record: cannot read the free disk space for " + path; return false; }
+        if (avail < total || avail - total < opt.min_free_bytes) {
+            st.error = SessionError::storage;
+            error = "delta record: not enough disk space (" + std::to_string(total >> 20) + " MiB plus a reserve of " +
+                    std::to_string(opt.min_free_bytes >> 20) + " MiB needed, " + std::to_string(avail >> 20) +
+                    " MiB free)";
+            return false;
+        }
+    }
+    RawFile raw;
+    uint64_t have = 0;
+    if (!raw.open_append(path, have)) {
+        st.error = raw.refused() ? SessionError::invalid : raw.kind();
+        error = "delta record: cannot open " + path + ": " + raw.error();
+        return false;
+    }
+    // the committed end is the append point: anything past it (an interrupted append) is dropped before writing
+    if (!raw.truncate(at) || !raw.seek(at)) {
+        st.error = raw.kind();
+        error = "delta record: cannot position " + path + " at " + std::to_string(at) + ": " + raw.error();
+        return false;
+    }
+    FileSink f(raw);
+    if (!f.ok()) { st.error = SessionError::memory; error = "delta record: " + f.error(); return false; }
+    if (opt.progress) f.progress.emplace(opt.progress);
+    f.phase = opt.phase;
+    f.expected = total;
+    if (f.progress) (*f.progress)(0, total);
+    const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
+    f.write_fault = injected(fault, "write");
+    f.flush_fault = injected(fault, "file_flush");
+    SessionHasher hash(0);
+    Out out;
+    out.f = &f;
+    out.hash = &hash;
+    put_delta_record(out, id, first_token, meta, kv);
+    bool ok = out.ok && out.n == sizing.n;
+    if (ok) {
+        const uint64_t ph = hash.digest();
+        ok = f.write(&ph, 8) && f.write(kEnd, 8);
+    }
+    ok = f.finish(opt.durable) && ok;
+    if (!ok) {
+        const std::string why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
+                                                : f.error();
+        st.error = out.read_failed ? SessionError::io : f.kind();
+        error = "delta record: writing " + path + " failed" + (why.empty() ? std::string() : ": " + why);
+        return false;
+    }
+    st.error = SessionError::none;
+    bytes = total;
+    return true;
+}
+
+bool delta_read_impl(const std::string& path, uint64_t at0, uint64_t limit, const SessionFileIdentity& id,
+                     const SessionReadLimits& limits, SessionDeltaRecord& out, uint64_t& next, std::string& error,
+                     SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;
+    RawFile f;
+    uint64_t size = 0;
+    if (!f.open_session(path, size, false)) {
+        st.error = f.refused() ? SessionError::invalid : f.kind();
+        error = "delta record: " + path + ": " + f.error();
+        return false;
+    }
+    const uint64_t end = std::min(size, limit);
+    if (at0 >= end || end - at0 < 8 * 6) { error = "delta record: " + path + ": no record at this offset"; return false; }
+    DeltaIn in{&f, at0, end, SessionHasher(0), error, limits};
+    char magic[8];
+    uint64_t version = 0, model = 0, config = 0;
+    int64_t first_token = 0;
+    if (!in.raw(magic, 8) || std::memcmp(magic, kDeltaMagic, 8) != 0 || !in.u64(version) || version != kDeltaVersion ||
+        !in.u64(model) || !in.u64(config) || !in.i64(first_token)) {
+        st.error = in.kind;
+        return false;
+    }
+    if (model != id.model || config != id.config) {
+        error = "delta record: saved with another model or engine configuration";
+        return false;
+    }
+    // built aside and moved into `out` only once the whole record checked out: a failure leaves the caller's record
+    // as it was
+    SessionDeltaRecord result;
+    SavedConversation& parsed = result.meta;
+    if (!get_meta_prefix_t(in, parsed)) { st.error = in.kind; return false; }
+    uint64_t n = 0;
+    if (!in.count(n, 96, limits.max_kv_layers)) { st.error = in.kind; return false; }
+    if (!in.resize(parsed.kv, n) || !in.resize_zero(result.kv_offset, n) || !in.resize_zero(result.kv_bytes, n)) {
+        st.error = in.kind;
+        return false;
+    }
+    Aligned block;
+    if (n) {
+        if (!in.prepare_allocation(kBlock, 1)) { st.error = in.kind; return false; }
+        block = aligned_block();
+        if (!block) { st.error = SessionError::memory; error = "delta record: out of memory for the K/V read block"; return false; }
+    }
+    for (size_t l = 0; l < (size_t) n; ++l) {
+        auto& k = parsed.kv[l];
+        in.kv_layer = l;
+        int64_t format = 0;
+        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) { st.error = in.kind; return false; }
+        if (format < INT32_MIN || format > INT32_MAX) { in.fail("invalid K/V format"); st.error = in.kind; return false; }
+        k.format = (int) format;
+        for (size_t part = 0; part < 5; ++part) {
+            uint64_t part_at = 0, part_bytes = 0;
+            if (!in.u64(part_at) || !in.u64(part_bytes)) { st.error = in.kind; return false; }
+            const uint64_t max = l < limits.max_kv_bytes.size() ? limits.max_kv_bytes[l][part] : UINT64_MAX;
+            if (part_at > max || part_bytes > max - part_at) {
+                in.fail("K/V part beyond this engine's limit");
+                st.error = SessionError::invalid;
+                return false;
+            }
+            result.kv_offset[l][part] = part_at;
+            result.kv_bytes[l][part] = part_bytes;
+            for (uint64_t done = 0; done < part_bytes;) {
+                const size_t c = (size_t) std::min<uint64_t>(kBlock, part_bytes - done);
+                if (!in.raw(block.get(), c)) { st.error = in.kind; return false; }
+                done += (uint64_t) c;
+            }
+        }
+    }
+    uint64_t ph = 0;
+    char endm[8];
+    if (!in.tail(&ph, 8) || !in.tail(endm, 8)) { st.error = in.kind; return false; }
+    if (ph != in.hash.digest()) { error = "delta record: payload checksum mismatch"; return false; }
+    if (std::memcmp(endm, kEnd, 8) != 0) { error = "delta record: bad end marker"; return false; }
+    result.first_token = first_token;
+    out = std::move(result);
+    next = in.at;
+    st.error = SessionError::none;
+    return true;
+}
+
+bool delta_apply_limits(const SessionDeltaRecord& expected, SessionReadLimits& limits, std::string& error) {
+    if (expected.meta.kv.size() != expected.kv_offset.size() ||
+        expected.kv_offset.size() != expected.kv_bytes.size()) {
+        error = "delta record: the expected layer directories differ";
+        return false;
+    }
+    limits.max_tokens = 0;
+    limits.max_checkpoints = expected.meta.checkpoints.size();
+    limits.max_kv_layers = expected.meta.kv.size();
+    limits.geometry = expected.meta.geometry;
+    limits.layer_range = std::make_pair(expected.meta.layer_lo, expected.meta.layer_hi);
+    limits.max_state_bytes.fill(0);
+    auto include = [&](const ConversationCheckpoint& checkpoint) {
+        limits.max_tokens = std::max<uint64_t>(limits.max_tokens, checkpoint.ids.size());
+        limits.max_tokens = std::max<uint64_t>(limits.max_tokens, checkpoint.imgs.size());
+        limits.max_state_bytes[0] = std::max<uint64_t>(limits.max_state_bytes[0], checkpoint.gdn.size());
+        limits.max_state_bytes[1] = std::max<uint64_t>(limits.max_state_bytes[1], checkpoint.ple.size());
+        limits.max_state_bytes[2] = std::max<uint64_t>(limits.max_state_bytes[2], checkpoint.tails.size());
+        limits.max_state_bytes[3] = std::max<uint64_t>(limits.max_state_bytes[3], checkpoint.dead.size());
+        limits.max_state_bytes[4] = std::max<uint64_t>(limits.max_state_bytes[4], checkpoint.block_pos.size());
+    };
+    include(expected.meta.live);
+    for (const ConversationCheckpoint& checkpoint : expected.meta.checkpoints) include(checkpoint);
+    return true;
+}
+
+bool delta_apply_impl(const std::string& path, uint64_t at0, const SessionFileIdentity& id,
+                      const SessionDeltaRecord& expected, const SessionKvBlock& sink, std::string& error,
+                      SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;
+    RawFile f;
+    uint64_t size = 0;
+    if (!f.open_session(path, size, false)) {
+        st.error = f.refused() ? SessionError::invalid : f.kind();
+        error = "delta record: " + path + ": " + f.error();
+        return false;
+    }
+    if (at0 >= size || size - at0 < 8 * 6) { error = "delta record: " + path + ": no record at this offset"; return false; }
+    SessionReadLimits bounded;
+    if (!delta_apply_limits(expected, bounded, error)) { st.error = SessionError::invalid; return false; }
+    DeltaIn in{&f, at0, size, SessionHasher(0), error, bounded};
+    char magic[8];
+    uint64_t version = 0, model = 0, config = 0;
+    int64_t first_token = 0;
+    if (!in.raw(magic, 8) || std::memcmp(magic, kDeltaMagic, 8) != 0 || !in.u64(version) || version != kDeltaVersion ||
+        !in.u64(model) || !in.u64(config) || !in.i64(first_token)) { st.error = in.kind; return false; }
+    if (model != id.model || config != id.config) {
+        error = "delta record: saved with another model or engine configuration";
+        return false;
+    }
+    if (first_token != expected.first_token) { in.fail("the record's first token differs from the read pass"); st.error = in.kind; return false; }
+    SavedConversation parsed;
+    if (!get_meta_prefix_t(in, parsed)) { st.error = in.kind; return false; }
+    if (parsed.live.ids.size() != expected.meta.live.ids.size() || parsed.geometry != expected.meta.geometry ||
+        parsed.layer_lo != expected.meta.layer_lo || parsed.layer_hi != expected.meta.layer_hi ||
+        parsed.cvec != expected.meta.cvec || parsed.checkpoints.size() != expected.meta.checkpoints.size()) {
+        in.fail("the record differs from the read pass");
+        st.error = in.kind;
+        return false;
+    }
+    uint64_t n = 0;
+    if (!in.count(n, 96, bounded.max_kv_layers)) { st.error = in.kind; return false; }
+    if (n != expected.kv_offset.size()) { in.fail("K/V layer count differs from the read pass"); st.error = in.kind; return false; }
+    Aligned block;
+    if (n) {
+        if (!in.prepare_allocation(kBlock, 1)) { st.error = in.kind; return false; }
+        block = aligned_block();
+        if (!block) { st.error = SessionError::memory; error = "delta record: out of memory for the K/V read block"; return false; }
+    }
+    for (size_t l = 0; l < (size_t) n; ++l) {
+        in.kv_layer = l;
+        int64_t format = 0, cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
+        if (!in.i64(format) || !in.i64(cells) || !in.i64(heads) || !in.i64(head_dim) ||
+            !in.i64(page_size) || !in.i64(pooled_rows) || !in.i64(idx_dim)) { st.error = in.kind; return false; }
+        const ConversationKv& want = expected.meta.kv[l];
+        if (format != want.format || cells != want.cells || heads != want.heads || head_dim != want.head_dim ||
+            page_size != want.page_size || pooled_rows != want.pooled_rows || idx_dim != want.idx_dim) {
+            in.fail("a K/V header differs from the read pass");
+            st.error = in.kind;
+            return false;
+        }
+        for (size_t part = 0; part < 5; ++part) {
+            uint64_t part_at = 0, part_bytes = 0;
+            if (!in.u64(part_at) || !in.u64(part_bytes)) { st.error = in.kind; return false; }
+            if (part_at != expected.kv_offset[l][part] || part_bytes != expected.kv_bytes[l][part]) {
+                in.fail("a K/V part size differs from the read pass");
+                st.error = in.kind;
+                return false;
+            }
+            for (uint64_t done = 0; done < part_bytes;) {
+                const size_t c = (size_t) std::min<uint64_t>(kBlock, part_bytes - done);
+                if (!in.raw(block.get(), c)) { st.error = in.kind; return false; }
+                if (sink && !sink(l, part, part_at + done, block.get(), c)) {
+                    if (error.empty()) error = "delta record: the K/V sink failed";
+                    st.error = SessionError::io;
+                    return false;
+                }
+                done += (uint64_t) c;
+            }
+        }
+    }
+    uint64_t ph = 0;
+    char endm[8];
+    if (!in.tail(&ph, 8) || !in.tail(endm, 8)) { st.error = in.kind; return false; }
+    if (ph != in.hash.digest()) { error = "delta record: the record changed since the read pass (payload checksum)"; return false; }
+    if (std::memcmp(endm, kEnd, 8) != 0) { error = "delta record: bad end marker"; return false; }
+    st.error = SessionError::none;
+    return true;
+}
+} // namespace
+
+bool session_delta_write(const std::string& path, uint64_t at, const SavedConversation& meta,
+                         const std::vector<SessionKvSource>& kv, int64_t first_token, const SessionFileIdentity& id,
+                         uint64_t& bytes, std::string& error, const SessionWriteOptions& options, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = delta_write_impl(path, at, meta, kv, first_token, id, bytes, error, options, st);
+    } catch (const std::bad_alloc&) {
+        error = "delta record: out of memory while writing " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+bool session_delta_read(const std::string& path, uint64_t at, uint64_t limit, const SessionFileIdentity& id,
+                        const SessionReadLimits& limits, SessionDeltaRecord& out, uint64_t& next, std::string& error,
+                        SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = delta_read_impl(path, at, limit, id, limits, out, next, error, st);
+    } catch (const std::bad_alloc&) {
+        error = "delta record: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+bool session_delta_apply(const std::string& path, uint64_t at, const SessionFileIdentity& id,
+                         const SessionDeltaRecord& expected, const SessionKvBlock& sink, std::string& error,
+                         SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = delta_apply_impl(path, at, id, expected, sink, error, st);
+    } catch (const std::bad_alloc&) {
+        error = "delta record: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+uint64_t session_delta_record_bytes(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                                    bool* overflow) {
+    if (overflow) *overflow = false;
+    Out sizing;
+    put_delta_record(sizing, SessionFileIdentity{}, 0, meta, kv);
+    if (sizing.overflow || sizing.n > UINT64_MAX - kTrailer) {
+        if (overflow) *overflow = true;
+        return 0;
+    }
+    return sizing.n + kTrailer;
+}
+
+bool session_file_full_bytes(const SavedConversation& image, const std::vector<SessionKvSource>& sources,
+                             uint64_t& bytes, std::string& error) {
+    bytes = 0;
+    error.clear();
+    if (has_stage_parts(image)) {
+        error = "session file: layer-split state cannot be saved";
+        return false;
+    }
+    if (!image.kv.empty()) {
+        error = "session file: K/V given both in the image and as sources";
+        return false;
+    }
+    Out sizing;
+    put_payload(sizing, image, &sources);
+    if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
+        sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
+        error = "session file: the state is too large for this build";
+        return false;
+    }
+    bytes = sizing.n + kHeader + kTrailer;
+    return true;
+}
+
+bool session_delta_first_bytes(SessionKvSource& s, int64_t kept_tokens, bool index, int64_t idx_block,
+                               int64_t idx_key_dim, std::string& error) {
+    if (kept_tokens < 0 || s.page_size <= 0 || s.cells < 0 || (index && (idx_block <= 0 || idx_key_dim <= 0))) {
+        error = "delta record: invalid geometry for a K/V offset";
+        return false;
+    }
+    const int64_t whole_cells = (kept_tokens / s.page_size) * s.page_size;
+    for (size_t part = 0; part < 5; ++part) {
+        const size_t keep = part == 4
+            ? (index ? size_t(kept_tokens / idx_block) * (size_t) idx_key_dim * 4 : 0)
+            : (s.cells ? (s.sizes[part] / (size_t) s.cells) * (size_t) whole_cells : 0);
+        if (keep > s.sizes[part]) {
+            error = "delta record: a K/V offset is past its part";
+            return false;
+        }
+        s.first_bytes[part] = keep;
+    }
+    return true;
 }
 
 } // namespace strata::core

@@ -833,7 +833,11 @@ struct Options {
     /// --conversation-cache-disk-delta: with --conversation-cache-disk-only, a switch away appends only the K/V that
     /// changed since the state the disk already holds (the base file's K/V stays), instead of rewriting the file
     bool conversation_cache_disk_delta = false;
-    int64_t conversation_cache_disk_delta_percent = 40; // delta 链压实阈值；最低 64 MiB
+    int64_t conversation_cache_disk_delta_percent = 40; // delta-chain compaction limit; minimum 64 MiB
+    /// --conversation-cache-disk-state-ref: a prefix entry whose checkpoint's running state is byte-identical to
+    /// its live state is written once (format v2): the checkpoint's five state arrays become on-disk references to
+    /// the live copy. Prefix saves only; not part of the config identity.
+    bool conversation_cache_disk_state_ref = false;
     int64_t conversation_cache_disk_mib = 8192;   // the spill directory's limit (0 = off)
     double conversation_cache_similarity = 0.0;   // least LCP/new-prompt fraction a disk hit may offer (range [0,1))
     int64_t conversation_cache_n_min = 0;         // least common-prefix tokens a disk hit may offer
@@ -1013,6 +1017,11 @@ void usage() {
                   "  --conversation-cache-disk-delta-percent N  delta chain limit as a percent of the base file\n"
                   "                       (default 40; range 1..100; 64 MiB minimum). Does not enable\n"
                   "                       --conversation-cache-disk-delta, which must be set separately\n"
+                  "  --conversation-cache-disk-state-ref  --conversation-cache-disk-only: a prefix entry whose\n"
+                  "                       checkpoint's running state is byte-identical to its live state is written\n"
+                  "                       once - the checkpoint's five state arrays become on-disk references to the\n"
+                  "                       live copy (session file format v2) - saving one full state copy per prefix\n"
+                  "                       file (default off; prefix saves only; not part of the config identity)\n"
                  "  --conversation-cache-disk-mib N  --serve: the spill directory's limit (default 8192; 0 = off)\n"
                  "  --conversation-cache-similarity F  --serve: least common-prefix fraction a disk hit may offer\n"
                  "                       (default 0 = any; range [0,1))\n"
@@ -3267,6 +3276,7 @@ int main(int argc, char** argv) {
             }
             o.conversation_cache_disk_delta_percent = number;
         }
+        else if (a == "--conversation-cache-disk-state-ref") o.conversation_cache_disk_state_ref = true;
         else if (a == "--conversation-cache-similarity") {
             const std::string value = next("--conversation-cache-similarity");
             char* end = nullptr;
@@ -3595,6 +3605,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata serve: warning: --conversation-cache-disk-delta needs --conversation-cache-disk-only; "
                              "it is off\n");
         o.conversation_cache_disk_delta = false;
+    }
+    if (o.serve && o.conversation_cache_disk_state_ref && !o.conversation_cache_disk_only) {
+        std::fprintf(stderr, "strata serve: warning: --conversation-cache-disk-state-ref needs --conversation-cache-disk-only; "
+                             "it is off\n");
+        o.conversation_cache_disk_state_ref = false;
     }
     if (o.serve && !o.conversation_cache_spill_dir.empty() && !o.conversation_cache_disk_only &&
         (o.conversation_cache_mib == 0 || o.prompt_cache == 0 || o.conversation_cache_slots == 0 ||
@@ -10595,7 +10610,8 @@ int main(int argc, char** argv) {
                 meta.live = *root;   // the running state at the root, not the live tail's
                 meta.live.pinned = false;
                 size_t bytes = 0;
-                if (!conversation_spill.spill_streamed(meta, sources, bytes, e, true, true)) {
+                if (!conversation_spill.spill_streamed(meta, sources, bytes, e, true, true,
+                                                       o.conversation_cache_disk_state_ref)) {
                     std::fprintf(stderr, "strata serve: conversation cache: prefix save failed (%s)\n", e.c_str());
                     return;
                 }
@@ -13983,6 +13999,10 @@ int main(int argc, char** argv) {
                     strata::core::SavedConversation image;   // running state + K/V headers; the K/V buffers stay empty
                     std::vector<std::array<uint64_t, 5>> file_kv;   // the K/V sizes exactly as the read pass parsed them
                     size_t bytes = 0;
+                    // a verified format-v2 file: the apply pass gets finite bounds from the read meta and admits its
+                    // additional peak before the first block reaches the device
+                    strata::core::SessionReadLimits restore_apply_limits;
+                    const strata::core::SessionReadLimits* restore_apply = nullptr;
                     try {
                         // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every
                         // state and K/V part), checked as the file is parsed and before each array is allocated; the
@@ -14009,6 +14029,11 @@ int main(int argc, char** argv) {
                         if (!strata::core::session_file_read_streamed(path, id, image, bytes, err, limits, &file_kv, &st)) {
                             refuse(err, st.error);
                             continue;
+                        }
+                        if (st.file_version == 2u) {
+                            strata::core::session_read_bounds_from_meta(image, restore_apply_limits);
+                            restore_apply_limits.admit = limits.admit;
+                            restore_apply = &restore_apply_limits;
                         }
                     } catch (const std::bad_alloc&) {
                         refuse("not enough RAM to read the session", strata::core::SessionError::memory);
@@ -14057,7 +14082,7 @@ int main(int argc, char** argv) {
                         return targets[layer].apply(part, offset, data, n, err);
                     };
                     strata::core::SessionStatus st2;
-                    if (!strata::core::session_file_apply_streamed(path, id, sink, file_kv, err, &st2)) {
+                    if (!strata::core::session_file_apply_streamed(path, id, sink, file_kv, err, &st2, restore_apply)) {
                         if (!touched) {
                             // the file changed or failed before the first block: the session is as it was
                             live_ok = true;
@@ -14575,6 +14600,7 @@ int main(int argc, char** argv) {
             size_t disk_in_bytes = 0;
             int64_t disk_in_tokens = 0;
             bool disk_in_live = false;
+            bool disk_file_v2 = false;   // the read pass verified a format-v2 (state-ref) file: the apply pass gets finite bounds
             double disk_read_ms = 0;
             if (disk_only && !disk_match.path.empty() && disk_match.tokens > std::max(resume, slot_tokens)) {
                 const auto td = Clock::now();
@@ -14612,6 +14638,7 @@ int main(int argc, char** argv) {
                         if (!strata::core::session_file_read_streamed(disk_match.path, spill_identity, disk_meta,
                                                                       disk_in_bytes, le, limits, &disk_file_kv, &st))
                             return false;
+                        disk_file_v2 = st.file_version == 2u;
                         // --conversation-cache-disk-delta: the base plus every committed record.  The last record
                         // holds the state the sidecar (and so the match) describes; the base holds the K/V its own
                         // record appended to.  Every record is validated here, before anything touches the device.
@@ -14778,11 +14805,16 @@ int main(int argc, char** argv) {
                             } else {
                                 strata::core::SavedConversation restored;
                                 std::string spill_error;
-                                if (!conversation_spill.load(disk_match.path, restored, limits, spill_error)) {
+                                strata::core::SessionStatus load_st;
+                                if (!conversation_spill.load(disk_match.path, restored, limits, spill_error, &load_st)) {
                                     std::fprintf(stderr, "strata serve: conversation cache: discard unreadable disk conversation (%s)\n",
                                                  spill_error.c_str());
-                                    std::string erase_error;
-                                    conversation_spill.erase(disk_match.path, erase_error);
+                                    if (!(load_st.error == strata::core::SessionError::memory && load_st.file_version == 2u)) {
+                                        // a verified v2 file refused for RAM keeps its file and index entry; a bad
+                                        // file (or a v1 failure, as before) goes
+                                        std::string erase_error;
+                                        conversation_spill.erase(disk_match.path, erase_error);
+                                    }
                                     conversation_spill.unpin(disk_match.path);
                                 } else if (restored.bytes() > ram_budget) {
                                     std::fprintf(stderr, "strata serve: conversation cache: disk conversation exceeds the RAM cache budget after loading\n");
@@ -15088,8 +15120,27 @@ int main(int argc, char** argv) {
                         return targets[layer].apply(part, offset, data, n, err);
                     };
                     strata::core::SessionStatus st2;
+                    strata::core::SessionReadLimits disk_apply_limits;
+                    const strata::core::SessionReadLimits* disk_apply = nullptr;
+                    if (disk_file_v2) {
+                        // The apply pass re-parses metadata while the read pass's copy is still resident. Bound the
+                        // allocation from validated metadata and admit only the apply pass's additional peak before
+                        // the first block reaches the device. A format-v2 file is a prefix entry and spill_delta
+                        // refuses prefixes, so `disk_meta` here is the base file's own metadata.
+                        strata::core::session_read_bounds_from_meta(disk_meta, disk_apply_limits);
+                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        disk_apply_limits.admit = [floor](uint64_t need, std::string& why) {
+                            if (strata::core::conversation_memory_admit(strata::core::available_host_bytes(), need,
+                                                                        floor))
+                                return true;
+                            why = "not enough RAM for the apply pass: " + std::to_string(need >> 20) +
+                                  " MiB plus the --conversation-cache-min-free-mib floor";
+                            return false;
+                        };
+                        disk_apply = &disk_apply_limits;
+                    }
                     bool restored_ok = strata::core::session_file_apply_streamed(disk_in_path, spill_identity, sink,
-                                                                                 disk_file_kv, err, &st2);
+                                                                                 disk_file_kv, err, &st2, disk_apply);
                     // --conversation-cache-disk-delta: re-walk only the committed prefix. Each record is read and
                     // applied before advancing; offsets are not retained per record and no uncommitted suffix is used.
                     uint64_t record_at = 0;
@@ -15122,8 +15173,14 @@ int main(int argc, char** argv) {
                         }
                         std::fprintf(stderr, "strata serve: conversation cache: disk hit skipped (%s)\n", err.c_str());
                         err.clear();
-                        std::string erase_error;
-                        conversation_spill.erase(disk_in_path, erase_error);
+                        if (!(st2.error == strata::core::SessionError::memory &&
+                              (st2.file_version == 2u || disk_file_v2))) {
+                            // a verified v2 file refused for RAM keeps its file and index entry for a later attempt
+                            // (`disk_file_v2` covers a refusal before the header re-verified the version: the read
+                            // pass proved it); anything else here is a bad file
+                            std::string erase_error;
+                            conversation_spill.erase(disk_in_path, erase_error);
+                        }
                     } else {
                         for (auto& t : targets)
                             if (!t.finish(err)) {

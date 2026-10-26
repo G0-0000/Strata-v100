@@ -10606,7 +10606,7 @@ int main(int argc, char** argv) {
             strata::core::ConversationSpillWrite base;
             strata::core::ConversationSpillDeltaWrite chain;
             strata::core::SavedConversation meta;
-            strata::core::ConversationIds drop_ids;
+            std::vector<int32_t> drop_ids;
             std::vector<strata::core::ConversationImageKey> drop_imgs;
             std::vector<strata::core::ConversationCheckpoint> drop_checkpoints;
             bool cvec = false;

@@ -2379,7 +2379,7 @@ int main() {
             rht::Layout layout{};
             if (!rht::layout_from(s.geometry, s.layer_lo, s.layer_hi, layout)) std::abort();
             auto finite_state = [&](uint8_t seed) {
-                auto state = named_bytes_of((size_t) layout.logical, seed);
+                auto state = bytes_of((size_t) layout.logical, seed);
                 for (size_t at = 0; at < state.size(); at += sizeof(float)) {
                     const int value = (int) ((at / sizeof(float)) % 127) - 63;
                     const float f = (float) value * 0.001f + (float) seed * 0.01f;

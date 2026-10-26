@@ -164,6 +164,10 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(rht_state_codec_test src/core/rht_state_codec_test.cpp)
   target_include_directories(rht_state_codec_test PRIVATE include)
   add_test(NAME rht_state_codec_test COMMAND rht_state_codec_test)
+  # host benchmark of the session file/delta writers' stage timings at production geometry (not a test:
+  # it writes ~1 GB per round to a scratch dir it removes; run it by hand)
+  add_executable(conversation_file_bench src/core/conversation_file_bench.cpp src/core/conversation_file.cpp)
+  target_include_directories(conversation_file_bench PRIVATE include)
 endif()
 
 if(STRATA_HIP_GFX906)

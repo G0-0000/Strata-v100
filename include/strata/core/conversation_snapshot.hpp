@@ -122,11 +122,15 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const QsaState& draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
-// checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
-// synchronized and must not run the session until the file is written.
+// checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft. Caller has
+// synchronized and must not run the session until the file writer's sources-released notification (or its failure
+// exit). The old synchronous callers wait for the whole file. If move_checkpoints is non-null it must be
+// &view.checkpoints: after a successful capture those checkpoints are moved into meta instead of copied again,
+// preserving their pages and naming them conv_cache; the source vector is empty. A failed capture does not move them.
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
-                                   const ModelGeometry& g, const QsaState& draft, std::string& error);
+                                   const ModelGeometry& g, const QsaState& draft, std::string& error,
+                                   std::vector<ConversationCheckpoint>* move_checkpoints = nullptr);
 // --conversation-cache-disk-delta: the same sources, but each keeps its part's full size and starts at the first
 // page (or indexer row) at or after `unchanged_tokens`, the tokens whose K/V still matches the state the record's
 // base already holds (the same keep rule conversation_kv_save applies; the per-part arithmetic is
@@ -135,6 +139,13 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
 bool conversation_snapshot_sources_delta(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                          const ConversationView& view, const SessionState& session,
                                          const ModelGeometry& g, const QsaState& draft, int64_t unchanged_tokens,
+                                         std::string& error);
+// The offset half of the same operation, for a capture conversation_snapshot_sources already produced: sets each
+// source's first_bytes exactly as conversation_snapshot_sources_delta would, without touching the session again.
+// `upto` is the capture's token count.  The caller has synchronized and must not run the session until the record
+// is written; a full base write ignores first_bytes, so the same sources can be reused for a base fallback.
+bool conversation_snapshot_delta_offsets(std::vector<SessionKvSource>& sources, const SessionState& session,
+                                         const ModelGeometry& g, int64_t upto, int64_t unchanged_tokens,
                                          std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);

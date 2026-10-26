@@ -331,7 +331,10 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
-                                   const QsaState& draft, std::string& error) {
+                                   const QsaState& draft, std::string& error,
+                                   std::vector<ConversationCheckpoint>* move_checkpoints) {
+    if (move_checkpoints && move_checkpoints != &view.checkpoints)
+        return fail(error, "moved checkpoints must be the capture view's checkpoints");
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
     SavedConversation captured;
     captured.geometry = geometry_key(g);
@@ -339,7 +342,8 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     captured.live.ids.assign(view.ids.begin(), view.ids.end());
     captured.live.imgs = view.images;
     captured.cvec = view.cvec;
-    captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints, vma_class::conv_cache);
+    if (!move_checkpoints)
+        captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints, vma_class::conv_cache);
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss);
@@ -347,16 +351,19 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
     if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
+    if (move_checkpoints) {
+        captured.checkpoints = std::move(*move_checkpoints);
+        for (ConversationCheckpoint& c : captured.checkpoints)
+            conversation_checkpoint_rename(c, vma_class::conv_cache);
+    }
     meta = std::move(captured);
     sources = std::move(out);
     return true;
 }
 
-bool conversation_snapshot_sources_delta(SavedConversation& meta, std::vector<SessionKvSource>& sources,
-                                         const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
-                                         const QsaState& draft, int64_t unchanged_tokens, std::string& error) {
-    if (!conversation_snapshot_sources(meta, sources, view, ss, g, draft, error)) return false;
-    const int64_t upto = (int64_t) view.ids.size();
+bool conversation_snapshot_delta_offsets(std::vector<SessionKvSource>& sources, const SessionState& ss,
+                                         const ModelGeometry& g, int64_t upto, int64_t unchanged_tokens,
+                                         std::string& error) {
     if (unchanged_tokens < 0 || unchanged_tokens > upto) {
         error = "conversation snapshot: invalid unchanged prefix for a delta record";
         return false;
@@ -370,6 +377,13 @@ bool conversation_snapshot_sources_delta(SavedConversation& meta, std::vector<Se
         if (!session_delta_first_bytes(sources[i], kept, index, idx_block, g.idx_key_dim, error)) return false;
     }
     return true;
+}
+
+bool conversation_snapshot_sources_delta(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                         const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                         const QsaState& draft, int64_t unchanged_tokens, std::string& error) {
+    if (!conversation_snapshot_sources(meta, sources, view, ss, g, draft, error)) return false;
+    return conversation_snapshot_delta_offsets(sources, ss, g, (int64_t) view.ids.size(), unchanged_tokens, error);
 }
 
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,

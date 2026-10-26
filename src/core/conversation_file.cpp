@@ -6,9 +6,11 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <unordered_map>
 #include <optional>
@@ -18,6 +20,8 @@
 #include <random>
 #include <string>
 #include <system_error>
+#include <thread>
+#include <type_traits>
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -51,7 +55,20 @@ constexpr uint32_t kVersion = 1;
 // descriptors, and an ordinary disk save may use RHT for GDN. Without either a REF descriptor or RHT state, bytes
 // remain the version-1 format.
 constexpr uint32_t kVersionV2 = 2;
+// Version 3 is the K/V-first layout for the disk-only background-state path (--conversation-cache-disk-background-
+// state): geometry, layer range and cvec, then the K/V headers and payload, then the same v2 state descriptors, so
+// the K/V sources are read (and released) before any state is serialized. Opt-in: default writes stay v1/v2.
+constexpr uint32_t kVersionV3 = 3;
 constexpr size_t kHeader = 64, kTrailer = 16;
+
+using TimingClock = std::chrono::steady_clock;
+uint64_t timing_ns(TimingClock::time_point since) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(TimingClock::now() - since).count();
+}
+void timing_add(uint64_t* counter, TimingClock::time_point since) {
+    if (counter) *counter += timing_ns(since);
+}
+
 // per checkpoint the v2 descriptors add 5 x 16 B over v1's five 8 B length words (live included)
 constexpr uint64_t kV2DescriptorSlack = 80;
 
@@ -640,26 +657,34 @@ public:
     bool finish(bool durable) {
         if (!f_.is_open()) return false;
         if (fault_) { f_.close(); return false; }
+        const auto finish_started = timings ? TimingClock::now() : TimingClock::time_point{};
         const size_t padded = f_.direct() ? (used_ + kAlign - 1) / kAlign * kAlign : used_;
         std::memset(buf_.get() + used_, 0, padded - used_);
+        const auto write_started = timings ? TimingClock::now() : TimingClock::time_point{};
         bool ok = f_.write_all(buf_.get(), padded);
+        if (timings) timing_add(&timings->os_write_ns, write_started);
         if (ok && used_ && progress) (*progress)(total_, expected);   // the last, partial block
         ok = ok && (padded == used_ || f_.truncate(total_));
         if (ok && durable && phase) phase("flush", total_);
         if (ok && durable && flush_fault) { fail_with(flush_fault); ok = false; }
         ok = ok && (!durable || f_.sync());
         ok = f_.close() && ok;
+        if (timings) timing_add(&timings->finish_ns, finish_started);
         return ok;
     }
     std::optional<Ticker> progress;
     SessionPhase phase;
     uint64_t expected = 0;
     int write_fault = 0, flush_fault = 0;   // tests: errno values injected at the first block write / the file flush
+    SessionWriteTimings* timings = nullptr;
 private:
     void fail_with(int e) { fault_ = true; fault_kind_ = errno_kind(e); fault_msg_ = std::strerror(e); }
     bool drain() {
         if (write_fault) { fail_with(write_fault); return false; }
-        if (!f_.write_all(buf_.get(), used_)) return false;
+        const auto started = timings ? TimingClock::now() : TimingClock::time_point{};
+        const bool ok = f_.write_all(buf_.get(), used_);
+        if (timings) timing_add(&timings->os_write_ns, started);
+        if (!ok) return false;
         used_ = 0;
         if (progress) (*progress)(total_, expected);
         return true;
@@ -671,6 +696,209 @@ private:
     std::string fault_msg_;
     size_t used_ = 0;
     uint64_t total_ = 0;
+};
+
+// The background-state write sink (SessionWriteOptions::background_state): FileSink's producer face (span/commit/
+// write/finish) over two pre-allocated 16 MiB aligned buffers. A single writer thread owns every OS write, the tail
+// truncate/flush/close and the per-block progress reports; the producer fills and pads one buffer while the writer
+// drains the other and blocks when both are queued (backpressure). Every wait's predicate includes failed_, so a
+// writer-thread failure wakes a blocked producer instead of deadlocking; finish() and the destructor both join the
+// thread (it is never detached). The writer reports block progress and the flush phase; the caller observes
+// `timings` only after finish() returns, and the join orders the threads.
+class AsyncFileSink {
+public:
+    explicit AsyncFileSink(RawFile& f) : f_(f) {
+        slots_[0].buf = aligned_block();
+        slots_[1].buf = aligned_block();
+        if (!slots_[0].buf || !slots_[1].buf) return;   // ok() == false: report memory, start no thread
+        started_ = true;
+        th_ = std::thread([this] { run(); });
+    }
+    ~AsyncFileSink() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            quit_ = true;
+            abandon_ = true;   // the file is unfinished: the Publisher (or the caller) removes the temporary
+        }
+        cv_.notify_all();
+        if (th_.joinable()) th_.join();
+    }
+    AsyncFileSink(const AsyncFileSink&) = delete;
+    AsyncFileSink& operator=(const AsyncFileSink&) = delete;
+    bool ok() const { return started_; }
+    std::string error() const {
+        if (!started_) return "out of memory for the write buffers";
+        std::lock_guard<std::mutex> lk(m_);
+        return failed_ ? fault_msg_ : f_.error();
+    }
+    SessionError kind() const {
+        if (!started_) return SessionError::memory;
+        std::lock_guard<std::mutex> lk(m_);
+        return failed_ ? fault_kind_ : f_.kind();
+    }
+    // room in the fill buffer for in-place production (avoids a staging copy), FileSink's contract
+    uint8_t* span(size_t& room) {
+        room = kBlock - slots_[fill_].used;
+        return slots_[fill_].buf.get() + slots_[fill_].used;
+    }
+    bool commit(size_t n) {
+        slots_[fill_].used += n;
+        total_ += n;
+        std::unique_lock<std::mutex> lk(m_);
+        if (failed_) return false;
+        if (slots_[fill_].used < kBlock) return true;
+        pend_[(pend_head_ + pend_count_) % 2] = fill_;
+        ++pend_count_;
+        cv_.notify_one();
+        cv_.wait(lk, [&] { return failed_ || free_count_ != 0; });
+        if (failed_) return false;
+        fill_ = free_[free_head_];
+        free_head_ = (free_head_ + 1) % 2;
+        --free_count_;
+        return true;
+    }
+    bool write(const void* p, size_t n) {
+        const uint8_t* s = static_cast<const uint8_t*>(p);
+        while (n) {
+            size_t room = 0;
+            uint8_t* d = span(room);
+            const size_t c = std::min(room, n);
+            std::memcpy(d, s, c);
+            if (!commit(c)) return false;
+            s += c; n -= c;
+        }
+        return true;
+    }
+    // the tail block (padded for direct I/O) is queued here; the truncate/flush/close run on the writer thread while
+    // this waits for it, then the thread is joined
+    bool finish(bool durable) {
+        if (!started_) return false;
+        const auto finish_started = timings ? TimingClock::now() : TimingClock::time_point{};
+        {
+            std::unique_lock<std::mutex> lk(m_);
+            if (!failed_) {
+                const size_t used = slots_[fill_].used;
+                const size_t padded = f_.direct() ? (used + kAlign - 1) / kAlign * kAlign : used;
+                if (padded) {
+                    std::memset(slots_[fill_].buf.get() + used, 0, padded - used);
+                    slots_[fill_].used = padded;
+                    tail_slot_ = fill_;
+                    pend_[(pend_head_ + pend_count_) % 2] = fill_;
+                    ++pend_count_;
+                }
+                tail_used_ = used;
+                finish_padded_ = padded;
+                finish_total_ = total_;
+                finish_durable_ = durable;
+            }
+            quit_ = true;
+            cv_.notify_all();
+            cv_.wait(lk, [&] { return done_; });
+        }
+        if (th_.joinable()) th_.join();
+        const bool ok = !failed_ && finish_ok_;
+        if (timings) timing_add(&timings->finish_ns, finish_started);
+        return ok;
+    }
+    std::optional<Ticker> progress;
+    SessionPhase phase;
+    uint64_t expected = 0;
+    int write_fault = 0, flush_fault = 0;   // tests: errno values injected at the first block write / the file flush
+    SessionWriteTimings* timings = nullptr;
+private:
+    struct Slot { Aligned buf; size_t used = 0; };
+    void fail_locked(SessionError kind, std::string msg) {
+        if (!failed_) {
+            failed_ = true;
+            fault_kind_ = kind;
+            fault_msg_ = std::move(msg);
+        }
+        cv_.notify_all();
+    }
+    void fail(SessionError kind, std::string msg) {
+        std::lock_guard<std::mutex> lk(m_);
+        fail_locked(kind, std::move(msg));
+    }
+    void run() {
+        bool fault_applied = false;
+        std::unique_lock<std::mutex> lk(m_);
+        try {
+            for (;;) {
+                cv_.wait(lk, [&] { return quit_ || pend_count_ != 0; });
+                if (pend_count_ == 0) break;   // quit with the queue drained
+                const size_t idx = pend_[pend_head_];
+                pend_head_ = (pend_head_ + 1) % 2;
+                --pend_count_;
+                const size_t used = slots_[idx].used;
+                const bool tail = idx == tail_slot_;
+                if (!failed_ && write_fault && !fault_applied) {
+                    fault_applied = true;
+                    fail_locked(errno_kind(write_fault), std::strerror(write_fault));
+                }
+                if (!failed_) {
+                    const auto started = timings ? TimingClock::now() : TimingClock::time_point{};
+                    lk.unlock();
+                    const bool ok = f_.write_all(slots_[idx].buf.get(), used);
+                    lk.lock();
+                    if (timings) timing_add(&timings->os_write_ns, started);
+                    if (!ok) fail_locked(f_.kind(), f_.error());
+                    else {
+                        written_ = tail ? finish_total_ : written_ + used;
+                        if (progress) {
+                            lk.unlock();
+                            (*progress)(written_, expected);
+                            lk.lock();
+                        }
+                    }
+                }
+                slots_[idx].used = 0;
+                free_[(free_head_ + free_count_) % 2] = idx;
+                ++free_count_;
+                cv_.notify_all();
+            }
+            if (!abandon_) {
+                lk.unlock();
+                finish_steps();
+                lk.lock();
+            }
+        } catch (...) {
+            if (!lk.owns_lock()) lk.lock();
+            fail_locked(SessionError::io, "session file: the background writer failed");
+        }
+        done_ = true;
+        lk.unlock();
+        if (f_.is_open()) f_.close();
+        cv_.notify_all();
+    }
+    // the tail block's write happened in run(); here the file is cut back to its exact size, flushed and closed.
+    // Called without m_ held (it invokes callbacks and fail()).
+    void finish_steps() {
+        bool ok = !failed_ && f_.is_open();
+        if (ok && finish_padded_ != tail_used_) ok = f_.truncate(finish_total_);
+        if (ok && finish_durable_ && phase) phase("flush", finish_total_);
+        if (ok && finish_durable_ && flush_fault) {
+            ok = false;
+            fail(errno_kind(flush_fault), std::strerror(flush_fault));
+        }
+        if (ok && finish_durable_) ok = f_.sync();
+        ok = f_.close() && ok;
+        finish_ok_ = ok;
+    }
+    Slot slots_[2];
+    RawFile& f_;
+    std::thread th_;
+    mutable std::mutex m_;   // error()/kind() are const like FileSink's
+    std::condition_variable cv_;
+    size_t fill_ = 0;
+    size_t pend_[2] = {}, pend_head_ = 0, pend_count_ = 0;       // queued, unwritten slots (FIFO)
+    size_t free_[2] = {1, 0}, free_head_ = 0, free_count_ = 1;   // slots the producer may fill (slot 0 is first)
+    size_t tail_slot_ = SIZE_MAX;
+    size_t tail_used_ = 0, finish_padded_ = 0;
+    uint64_t total_ = 0, written_ = 0, finish_total_ = 0;
+    bool started_ = false, quit_ = false, abandon_ = false, done_ = false, failed_ = false, finish_durable_ = false,
+         finish_ok_ = false;
+    SessionError fault_kind_ = SessionError::io;
+    std::string fault_msg_;
 };
 
 class FileSource {
@@ -713,20 +941,43 @@ private:
 };
 
 // ---- serialization: the same walk counts (f == nullptr) and writes
+// The sources-released notification (SessionWriteOptions::on_sources_released): fires exactly once, at the point
+// where no further SessionKvSource::read call can be made.  The v3 payload calls fire() right after its K/V section;
+// every later exit (a failed source read, a write fault, a failed publish) relies on the destructor, so a caller
+// blocked on the notification is woken on every path.  Never constructed for a refusal before any disk access.
+struct SourcesReleased {
+    explicit SourcesReleased(const std::function<void()>& fn) : fn_(&fn) {}
+    ~SourcesReleased() { fire(); }
+    void fire() {
+        if (fn_ && *fn_ && !fired_) { fired_ = true; (*fn_)(); }
+    }
+private:
+    const std::function<void()>* fn_;
+    bool fired_ = false;
+};
+
 struct Out {
     FileSink* f = nullptr;
+    AsyncFileSink* af = nullptr;   // set instead of f when the background-state sink owns the OS writes
     SessionHasher* hash = nullptr;
+    SessionWriteTimings* timings = nullptr;
+    SourcesReleased* released = nullptr;
     uint64_t n = 0;
     bool ok = true, overflow = false;
     void count(uint64_t c) {
         if (c > UINT64_MAX - n) { overflow = true; ok = false; return; }
         n += c;
     }
+    // the walk addresses either sink through the same face; a sizing pass sets neither (counting only)
+    bool writing() const { return f != nullptr || af != nullptr; }
+    uint8_t* span(size_t& room) { return f ? f->span(room) : af->span(room); }
+    bool commit(size_t n2) { return f ? f->commit(n2) : af->commit(n2); }
+    bool sink_write(const void* p, size_t c) { return f ? f->write(p, c) : af->write(p, c); }
     void raw(const void* p, size_t c) {
         count(c);
-        if (!f || !ok || !c) return;
+        if (!writing() || !ok || !c) return;
         if (hash) hash->update(p, c);
-        ok = f->write(p, c);
+        ok = sink_write(p, c);
     }
     void u64(uint64_t v) { raw(&v, 8); }
     void i64(int64_t v) { raw(&v, 8); }
@@ -739,7 +990,7 @@ struct Out {
     void source(const SessionKvSource& s, size_t part) {
         const size_t size = s.sizes[part];
         u64(size);
-        if (!f) { count(size); return; }
+        if (!writing()) { count(size); return; }
         read_from(s, part, 0, size);
     }
     // a delta record's K/V part: the offset it starts at, its length, and the bytes from there
@@ -749,7 +1000,7 @@ struct Out {
         const size_t size = full - first;
         u64(first);
         u64(size);
-        if (!f) { count(size); return; }
+        if (!writing()) { count(size); return; }
         read_from(s, part, first, size);
     }
     bool read_failed = false;
@@ -758,9 +1009,12 @@ private:
     void read_from(const SessionKvSource& s, size_t part, size_t first, size_t size) {
         for (size_t at = 0; at < size && ok;) {
             size_t room = 0;
-            uint8_t* d = f->span(room);
+            uint8_t* d = span(room);
             const size_t c = std::min(room, size - at);
-            if (!s.read || !s.read(part, first + at, d, c)) {
+            const auto started = timings ? TimingClock::now() : TimingClock::time_point{};
+            const bool read = s.read && s.read(part, first + at, d, c);
+            if (timings) timing_add(&timings->kv_source_ns, started);
+            if (!read) {
                 ok = false;
                 read_failed = true;
                 if (s.error) read_error = s.error();
@@ -768,7 +1022,7 @@ private:
             }
             if (hash) hash->update(d, c);
             count(c);
-            ok = ok && f->commit(c);
+            ok = ok && commit(c);
             at += c;
         }
     }
@@ -777,6 +1031,13 @@ private:
 void put_kv_header(Out& o, int format, int64_t cells, int64_t heads, int64_t head_dim, int64_t page_size,
                    int64_t pooled_rows, int64_t idx_dim) {
     for (int64_t v : {int64_t(format), cells, heads, head_dim, page_size, pooled_rows, idx_dim}) o.i64(v);
+}
+
+// the meta prefix every layout shares: geometry, layer range, cvec.  In the v1/v2 payloads it opens the state
+// section; in the K/V-first v3 payload it stands alone before the K/V.
+void put_geo_prefix(Out& o, const SavedConversation& s) {
+    for (int64_t g : s.geometry) o.i64(g);
+    o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
 }
 
 void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
@@ -831,13 +1092,16 @@ void put_state_v2(Out& o, const Vec& v, uint8_t codec, const rht::Layout& layout
     if (codec == 2) {
         o.u64(layout.logical);
         o.u64(layout.stored);
-        if (!o.f) {
+        if (!o.writing()) {
             o.count(layout.stored);
-        } else if (!rht::encode(v.data(), layout, [&](const void* data, size_t bytes) {
-                       o.raw(data, bytes);
-                       return o.ok;
-                   })) {
-            o.ok = false;
+        } else {
+            const auto started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+            const bool encoded = rht::encode(v.data(), layout, [&](const void* data, size_t bytes) {
+                o.raw(data, bytes);
+                return o.ok;
+            });
+            if (o.timings) timing_add(&o.timings->rht_ns, started);
+            if (!encoded) o.ok = false;
         }
         return;
     }
@@ -859,14 +1123,17 @@ void put_checkpoint_v2(Out& o, const ConversationCheckpoint& c, const StateCodec
     o.u64(c.used);
 }
 
-// `ref` holds one flag per checkpoint: all five arrays homomorphic to the live state's -> the whole checkpoint's
-// five arrays become REF descriptors.  The K/V part is byte-identical to v1 (RAW, streamed from `sources` or the
-// captured buffers); only the state arrays are descriptor-coded.
-void put_payload_v2(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources,
-                    const std::vector<char>& ref, const std::vector<StateCodecArray>& codec,
-                    const rht::Layout& layout) {
-    for (int64_t g : s.geometry) o.i64(g);
-    o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
+// the running state, v1 raw coding: the live checkpoint, then the count and the checkpoints
+void put_states(Out& o, const SavedConversation& s) {
+    put_checkpoint(o, s.live);
+    o.u64(s.checkpoints.size());
+    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+}
+
+// the running state, v2 descriptor coding.  `ref` holds one flag per checkpoint: all five arrays homomorphic to
+// the live state's -> the whole checkpoint's five arrays become REF descriptors of it.
+void put_states_v2(Out& o, const SavedConversation& s, const std::vector<StateCodecArray>& codec,
+                   const std::vector<char>& ref, const rht::Layout& layout) {
     put_checkpoint_v2(o, s.live, codec[0], layout);
     o.u64(s.checkpoints.size());
     for (size_t i = 0; i < s.checkpoints.size(); ++i) {
@@ -875,73 +1142,125 @@ void put_payload_v2(Out& o, const SavedConversation& s, const std::vector<Sessio
         if (is_ref) checkpoint_codec.fill(1);
         put_checkpoint_v2(o, s.checkpoints[i], checkpoint_codec, layout);
     }
-    if (sources) {
-        o.u64(sources->size());
-        for (const auto& k : *sources) {
-            put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
-            for (size_t part = 0; part < 5; ++part) o.source(k, part);
-        }
-        return;
+}
+
+// the K/V section: the layer count and, per layer, its header plus the five parts - streamed from `sources`, or
+// the captured buffers of `kv`
+void put_kv_sources(Out& o, const std::vector<SessionKvSource>& sources) {
+    o.u64(sources.size());
+    for (const auto& k : sources) {
+        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+        for (size_t part = 0; part < 5; ++part) o.source(k, part);
     }
-    o.u64(s.kv.size());
-    for (const auto& k : s.kv) {
+}
+
+void put_kv_buffers(Out& o, const std::vector<ConversationKv>& kv) {
+    o.u64(kv.size());
+    for (const auto& k : kv) {
         put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
         o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
     }
 }
 
-void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
-    for (int64_t g : s.geometry) o.i64(g);
-    o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
-    put_checkpoint(o, s.live);
-    o.u64(s.checkpoints.size());
-    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
-    if (sources) {
-        o.u64(sources->size());
-        for (const auto& k : *sources) {
-            put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
-            for (size_t part = 0; part < 5; ++part) o.source(k, part);
-        }
-        return;
-    }
-    o.u64(s.kv.size());
-    for (const auto& k : s.kv) {
-        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
-        o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
-    }
-}
-
-// ---- delta records (--conversation-cache-disk-delta): the same meta prefix as a session file, then the K/V each
-// part as (offset, size, bytes).  The payload hash covers the record's header fields too, so an edit anywhere in it
-// is refused by the read pass.
-constexpr uint64_t kDeltaVersionV1 = 1;
-constexpr uint64_t kDeltaVersion = 2;
-constexpr char kDeltaMagic[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
-
-void put_delta_record(Out& o, const SessionFileIdentity& id, int64_t first_token, const SavedConversation& s,
-                      const std::vector<SessionKvSource>& kv, uint64_t version,
-                      const std::vector<StateCodecArray>& codec, const rht::Layout& layout) {
-    o.raw(kDeltaMagic, 8);
-    o.u64(version);
-    o.u64(id.model); o.u64(id.config);
-    o.i64(first_token);
-    for (int64_t g : s.geometry) o.i64(g);
-    o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
-    if (version == kDeltaVersion) {
-        put_checkpoint_v2(o, s.live, codec[0], layout);
-        o.u64(s.checkpoints.size());
-        for (size_t i = 0; i < s.checkpoints.size(); ++i)
-            put_checkpoint_v2(o, s.checkpoints[i], codec[i + 1], layout);
-    } else {
-        put_checkpoint(o, s.live);
-        o.u64(s.checkpoints.size());
-        for (const auto& c : s.checkpoints) put_checkpoint(o, c);
-    }
+// a delta record's K/V section: per part the offset it starts at, its length, and the bytes from there
+void put_kv_tails(Out& o, const std::vector<SessionKvSource>& kv) {
     o.u64(kv.size());
     for (const auto& k : kv) {
         put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
         for (size_t part = 0; part < 5; ++part) o.source_tail(k, part);
     }
+}
+
+// `ref` holds one flag per checkpoint: all five arrays homomorphic to the live state's -> the whole checkpoint's
+// five arrays become REF descriptors.  The K/V part is byte-identical to v1 (RAW, streamed from `sources` or the
+// captured buffers); only the state arrays are descriptor-coded.  v1/v2 keep the state-first section order.
+void put_payload_v2(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources,
+                    const std::vector<char>& ref, const std::vector<StateCodecArray>& codec,
+                    const rht::Layout& layout) {
+    const auto state_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    put_geo_prefix(o, s);
+    put_states_v2(o, s, codec, ref, layout);
+    if (o.timings) timing_add(&o.timings->state_ns, state_started);
+    const auto kv_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    if (sources) put_kv_sources(o, *sources);
+    else put_kv_buffers(o, s.kv);
+    if (o.timings) timing_add(&o.timings->kv_ns, kv_started);
+}
+
+// the K/V-first v3 payload: the shared geometry prefix, the K/V section (whose source reads finish here), the
+// sources-released notification, then the same v2 state descriptors.
+void put_payload_v3(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources,
+                    const std::vector<char>& ref, const std::vector<StateCodecArray>& codec,
+                    const rht::Layout& layout) {
+    const auto state_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    put_geo_prefix(o, s);
+    if (o.timings) timing_add(&o.timings->state_ns, state_started);
+    const auto kv_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    if (sources) put_kv_sources(o, *sources);
+    else put_kv_buffers(o, s.kv);
+    if (o.timings) timing_add(&o.timings->kv_ns, kv_started);
+    // every K/V source read is done and no more will be made: notify before the state section is serialized
+    if (o.ok && o.released) o.released->fire();
+    const auto states_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    put_states_v2(o, s, codec, ref, layout);
+    if (o.timings) timing_add(&o.timings->state_ns, states_started);
+}
+
+void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
+    const auto state_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    put_geo_prefix(o, s);
+    put_states(o, s);
+    if (o.timings) timing_add(&o.timings->state_ns, state_started);
+    const auto kv_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    if (sources) put_kv_sources(o, *sources);
+    else put_kv_buffers(o, s.kv);
+    if (o.timings) timing_add(&o.timings->kv_ns, kv_started);
+}
+
+// ---- delta records (--conversation-cache-disk-delta): the same framing as a session file, then the K/V each
+// part as (offset, size, bytes).  The payload hash covers the record's header fields too, so an edit anywhere in it
+// is refused by the read pass.  Versions 1/2 put the state section first (like the v1/v2 files); version 3 is the
+// K/V-first layout, the record form of put_payload_v3.
+constexpr uint64_t kDeltaVersionV1 = 1;
+constexpr uint64_t kDeltaVersion = 2;
+constexpr uint64_t kDeltaVersionV3 = 3;
+constexpr char kDeltaMagic[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
+// the record header before the geometry prefix: magic, version, model, config, first_token
+constexpr uint64_t kDeltaHead = 8 + 8 + 8 + 8 + 8;
+// the geometry prefix: 18 geometry words, layer_lo, layer_hi, cvec
+constexpr uint64_t kGeoPrefix = 18 * 8 + 3 * 8;
+// one K/V layer's header (7 words) and one part's (offset, size) framing
+constexpr uint64_t kKvHeaderBytes = 7 * 8, kKvPartBytes = 2 * 8;
+
+void put_delta_record(Out& o, const SessionFileIdentity& id, int64_t first_token, const SavedConversation& s,
+                      const std::vector<SessionKvSource>& kv, uint64_t version,
+                      const std::vector<StateCodecArray>& codec, const rht::Layout& layout) {
+    const auto state_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    o.raw(kDeltaMagic, 8);
+    o.u64(version);
+    o.u64(id.model); o.u64(id.config);
+    o.i64(first_token);
+    put_geo_prefix(o, s);
+    if (o.timings) timing_add(&o.timings->state_ns, state_started);
+    const auto kv_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    if (version == kDeltaVersionV3) {
+        put_kv_tails(o, kv);
+        if (o.timings) timing_add(&o.timings->kv_ns, kv_started);
+        // every K/V source read is done: notify before the state section is serialized
+        if (o.ok && o.released) o.released->fire();
+        const auto states_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+        put_states_v2(o, s, codec, {}, layout);
+        if (o.timings) timing_add(&o.timings->state_ns, states_started);
+        return;
+    }
+    // versions 1 and 2 keep the states-first section order, exactly as written before
+    const auto states_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    if (version == kDeltaVersion) put_states_v2(o, s, codec, {}, layout);
+    else put_states(o, s);
+    if (o.timings) timing_add(&o.timings->state_ns, states_started);
+    const auto kv2_started = o.timings ? TimingClock::now() : TimingClock::time_point{};
+    put_kv_tails(o, kv);
+    if (o.timings) timing_add(&o.timings->kv_ns, kv2_started);
 }
 
 // ---- parsing: every count is checked against the bytes left and the caller's limits before anything is allocated
@@ -1054,8 +1373,9 @@ struct In {
     }
 };
 
-// The meta prefix is shared by session files and delta records: any reader with raw/u64/i64/count/vec/fail/limits
-// works (In over a session file, DeltaIn over a record).
+// The sections are shared by every layout and by delta records: any reader with raw/u64/i64/count/vec/fail/limits
+// works (In over a session file, DeltaIn over a record).  The geometry prefix carries the fail-closed checks: a file
+// of another geometry or layer range allocates nothing.
 template<class R>
 bool get_checkpoint_t(R& in, ConversationCheckpoint& c) {
     if (!in.vec(c.ids, in.limits.max_tokens)) return false;
@@ -1068,7 +1388,7 @@ bool get_checkpoint_t(R& in, ConversationCheckpoint& c) {
 }
 
 template<class R>
-bool get_meta_prefix_t(R& in, SavedConversation& s) {
+bool get_geo_prefix_t(R& in, SavedConversation& s) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -1080,33 +1400,67 @@ bool get_meta_prefix_t(R& in, SavedConversation& s) {
         return in.fail("saved with another layer range than this runtime's");
     if (cvec > 1) return in.fail("invalid cvec flag");
     s.cvec = cvec == 1;
+    return true;
+}
+
+// the running state, v1 raw coding: the live checkpoint first, then the count and the checkpoints
+template<class R>
+bool get_states_raw_t(R& in, SavedConversation& s) {
     if (!get_checkpoint_t(in, s.live)) return false;
     uint64_t n = 0;
-    // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
+    // a checkpoint is at least 8 counts + used = 72 bytes
     if (!in.count(n, 72, in.limits.max_checkpoints) || !in.resize(s.checkpoints, n)) return false;
     for (auto& c : s.checkpoints) if (!get_checkpoint_t(in, c)) return false;
     return true;
 }
 
-bool get_checkpoint(In& in, ConversationCheckpoint& c) { return get_checkpoint_t(in, c); }
+template<class R>
+bool get_meta_prefix_t(R& in, SavedConversation& s) {
+    return get_geo_prefix_t(in, s) && get_states_raw_t(in, s);
+}
+
 bool get_meta_prefix(In& in, SavedConversation& s) { return get_meta_prefix_t(in, s); }
 
-bool get_payload(In& in, SavedConversation& s) {
-    if (!get_meta_prefix(in, s)) return false;
+// the K/V section, materialized into the image: the layer count, per-layer header, the five buffers.  <admit>
+// prices every count-based allocation (the descriptor formats); v1 stays plain, as before.
+template<bool admit>
+bool get_kv_full(In& in, SavedConversation& s) {
     uint64_t n = 0;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
-    s.kv.resize((size_t) n);
-    for (auto& k : s.kv) {
-        in.kv_layer = (size_t) (&k - s.kv.data());
+    if (admit) { if (!in.resize_admitted(s.kv, n)) return false; }
+    else s.kv.resize((size_t) n);
+    for (size_t l = 0; l < (size_t) n; ++l) {
+        auto& k = s.kv[l];
+        in.kv_layer = l;
         int64_t format = 0;
         if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
             !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
         if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
         k.format = (int) format;
-        if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
-            !in.buffer(k.pooled, 4)) return false;
+        if (admit) {
+            if (!in.buffer_admitted(k.k, 0) || !in.buffer_admitted(k.v, 1) || !in.buffer_admitted(k.k_scale, 2) ||
+                !in.buffer_admitted(k.v_scale, 3) || !in.buffer_admitted(k.pooled, 4)) return false;
+        } else {
+            if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) ||
+                !in.buffer(k.v_scale, 3) || !in.buffer(k.pooled, 4)) return false;
+        }
     }
     return true;
+}
+
+bool get_payload(In& in, SavedConversation& s) {
+    if (!get_meta_prefix(in, s)) return false;
+    return get_kv_full<false>(in, s);
+}
+
+// defined with the v2 readers below
+template<class R> bool get_states_v2_t(R& in, SavedConversation& s);
+
+// the K/V-first v3 payload: the shared geometry prefix, the K/V, then the v2 state descriptors
+bool get_payload_v3(In& in, SavedConversation& s) {
+    if (!get_geo_prefix_t(in, s)) return false;
+    if (!get_kv_full<true>(in, s)) return false;
+    return get_states_v2_t(in, s);
 }
 
 // A delta record's reader: bounded reads at an absolute file offset, hashing every payload byte (the trailer is read
@@ -1125,7 +1479,8 @@ struct DeltaIn {
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
     const ConversationCheckpoint* ref_live = nullptr;
-     bool fail(const std::string& m) { if (error.empty()) error = "delta record: " + m; return false; }
+    const char* what = "delta record";   // the error prefix; the v3 session apply borrows this reader for its state section
+     bool fail(const std::string& m) { if (error.empty()) error = std::string(what) + ": " + m; return false; }
      bool account_state_codec(uint64_t codec, uint64_t, uint64_t) { return codec <= 2; }
     bool raw(void* p, size_t c) {
         if (c > end - at) return fail("record ends early");
@@ -1166,7 +1521,7 @@ struct DeltaIn {
             std::string why;
             if (!limits.admit(need, why)) {
                 kind = SessionError::memory;
-                if (error.empty()) error = "delta record: " +
+                if (error.empty()) error = std::string(what) + ": " +
                     (why.empty() ? std::string("RAM admission refused") : why);
                 return false;
             }
@@ -1197,20 +1552,23 @@ struct DeltaIn {
     }
 };
 
-// The streaming read: the same walk, but every K/V part's bytes are read through one 16 MiB block and hashed, never
-// kept; a `sink` (the apply pass) gets each block as it is read.  When `in.record_kv` is set the part sizes are
-// recorded for the caller; when `in.verify_kv` is set (the apply pass) the file must have exactly the layer count
-// and part sizes the read pass saw, checked before that layer or part is applied.
-bool get_payload_streamed(In& in, SavedConversation& s, const SessionKvBlock& sink) {
-    if (!get_meta_prefix(in, s)) return false;
+// The K/V section, streamed: every part's bytes pass through one 16 MiB block and the hasher, never kept; a `sink`
+// (the apply pass) gets each block as it is read.  When `in.record_kv` is set the part sizes are recorded for the
+// caller; when `in.verify_kv` is set (the apply pass) the file must have exactly the layer count and part sizes the
+// read pass saw, checked before that layer or part is applied.  <admit> prices the layer directory and the block
+// (the descriptor formats); v1 stays plain, as before.
+template<bool admit>
+bool get_kv_streamed(In& in, SavedConversation& s, const SessionKvBlock& sink) {
     uint64_t n = 0;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
     if (in.verify_kv && in.verify_kv->size() != (size_t) n)
         return in.fail("K/V layer count differs from the read pass");
-    s.kv.resize((size_t) n);
+    if (admit) { if (!in.resize_admitted(s.kv, n)) return false; }
+    else s.kv.resize((size_t) n);
     if (in.record_kv) in.record_kv->assign((size_t) n, {});
     Aligned block;
     if (n) {
+        if (admit && !in.admit_need(kBlock)) return false;
         block = aligned_block();
         if (!block) { in.kind = SessionError::memory; return in.fail("out of memory for the K/V read block"); }
     }
@@ -1241,6 +1599,11 @@ bool get_payload_streamed(In& in, SavedConversation& s, const SessionKvBlock& si
         }
     }
     return true;
+}
+
+bool get_payload_streamed(In& in, SavedConversation& s, const SessionKvBlock& sink) {
+    if (!get_meta_prefix(in, s)) return false;
+    return get_kv_streamed<false>(in, s, sink);
 }
 
 bool has_stage_parts(const SavedConversation& s) {
@@ -1310,93 +1673,49 @@ bool get_checkpoint_v2(R& in, ConversationCheckpoint& c, bool live,
                         geometry, layer_lo, layer_hi) && in.u64(c.used);
 }
 
+// the running state, v2 descriptor coding.  REF resolves against the file's live checkpoint (parsed first) into an
+// INDEPENDENT vector; RHT decodes into an independent logical-size vector.  ids/imgs/used are never referenced and
+// keep their stored values.  Every layout with descriptor states parses this section the same way (the v2 file
+// states-first, the v3 file states-last); it follows the geo prefix.
 template<class R>
-bool get_meta_prefix_v2(R& in, SavedConversation& s) {
-    for (auto& g : s.geometry) if (!in.i64(g)) return false;
-    // checked before any state array is read: a file of another geometry allocates nothing
-    if (in.limits.geometry && *in.limits.geometry != s.geometry)
-        return in.fail("saved with another model geometry than this runtime's");
-    uint64_t cvec = 0;
-    if (!in.i64(s.layer_lo) || !in.i64(s.layer_hi) || !in.u64(cvec)) return false;
-    if (in.limits.layer_range &&
-        (in.limits.layer_range->first != s.layer_lo || in.limits.layer_range->second != s.layer_hi))
-        return in.fail("saved with another layer range than this runtime's");
-    if (cvec > 1) return in.fail("invalid cvec flag");
-    s.cvec = cvec == 1;
+bool get_states_v2_t(R& in, SavedConversation& s) {
     in.ref_live = &s.live;   // set before the live parse: the descriptor reader resolves REF arrays against it
     if (!get_checkpoint_v2(in, s.live, true, s.geometry, s.layer_lo, s.layer_hi)) return false;
     uint64_t n = 0;
-    // a v2 checkpoint is at least 2 counts + 5 descriptors + used = 144 bytes; a K/V layer at least 7 + 5 = 96
+    // a v2 checkpoint is at least 2 counts + 5 descriptors + used = 144 bytes
     if (!in.count(n, 144, in.limits.max_checkpoints) || !in.resize_admitted(s.checkpoints, n)) return false;
     for (auto& c : s.checkpoints)
         if (!get_checkpoint_v2(in, c, false, s.geometry, s.layer_lo, s.layer_hi)) return false;
     return true;
 }
 
+template<class R>
+bool get_meta_prefix_v2(R& in, SavedConversation& s) {
+    return get_geo_prefix_t(in, s) && get_states_v2_t(in, s);
+}
+
 bool get_payload_v2(In& in, SavedConversation& s) {
     if (!get_meta_prefix_v2(in, s)) return false;
-    uint64_t n = 0;
-    if (!in.count(n, 96, in.limits.max_kv_layers) || !in.resize_admitted(s.kv, n)) return false;
-    for (auto& k : s.kv) {
-        in.kv_layer = (size_t) (&k - s.kv.data());
-        int64_t format = 0;
-        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
-            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
-        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
-        k.format = (int) format;
-        if (!in.buffer_admitted(k.k, 0) || !in.buffer_admitted(k.v, 1) || !in.buffer_admitted(k.k_scale, 2) ||
-            !in.buffer_admitted(k.v_scale, 3) || !in.buffer_admitted(k.pooled, 4)) return false;
-    }
-    return true;
+    return get_kv_full<true>(in, s);
 }
 
 // The streaming v2 read: the state arrays resolve as in get_payload_v2; the K/V part streams through one admitted
 // 16 MiB block exactly as the v1 streamed walk.
 bool get_payload_streamed_v2(In& in, SavedConversation& s, const SessionKvBlock& sink) {
     if (!get_meta_prefix_v2(in, s)) return false;
-    uint64_t n = 0;
-    if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
-    if (in.verify_kv && in.verify_kv->size() != (size_t) n)
-        return in.fail("K/V layer count differs from the read pass");
-    if (!in.resize_admitted(s.kv, n)) return false;
-    if (in.record_kv) in.record_kv->assign((size_t) n, {});
-    Aligned block;
-    if (n) {
-        if (!in.admit_need(kBlock)) return false;
-        block = aligned_block();
-        if (!block) { in.kind = SessionError::memory; return in.fail("out of memory for the K/V read block"); }
-    }
-    for (size_t l = 0; l < (size_t) n; ++l) {
-        auto& k = s.kv[l];
-        in.kv_layer = l;
-        int64_t format = 0;
-        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
-            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
-        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
-        k.format = (int) format;
-        for (size_t part = 0; part < 5; ++part) {
-            uint64_t size = 0;
-            const uint64_t limit = l < in.limits.max_kv_bytes.size() ? in.limits.max_kv_bytes[l][part] : UINT64_MAX;
-            if (!in.count(size, 1, limit)) return false;
-            if (in.record_kv) (*in.record_kv)[l][part] = size;
-            if (in.verify_kv && size != (*in.verify_kv)[l][part])
-                return in.fail("K/V part size differs from the read pass");
-            for (uint64_t at = 0; at < size; at += kBlock) {
-                const size_t c = (size_t) std::min<uint64_t>(kBlock, size - at);
-                if (!in.raw(block.get(), c)) return false;
-                if (sink && !sink(l, part, at, block.get(), c)) {
-                    if (in.error.empty()) in.error = "session file: the K/V sink failed";
-                    in.kind = SessionError::io;
-                    return false;
-                }
-            }
-        }
-    }
-    return true;
+    return get_kv_streamed<true>(in, s, sink);
+}
+
+// the streaming v3 read: the geo prefix, the streamed K/V, then the state descriptors
+bool get_payload_streamed_v3(In& in, SavedConversation& s, const SessionKvBlock& sink) {
+    if (!get_geo_prefix_t(in, s)) return false;
+    if (!get_kv_streamed<true>(in, s, sink)) return false;
+    return get_states_v2_t(in, s);
 }
 
 // header, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
-// header_hash:u64 (session_hash64 of bytes 0..55, seed 0); version 2 is the descriptor-coded state format (below)
+// header_hash:u64 (session_hash64 of bytes 0..55, seed 0); version 2 is the descriptor-coded state format, version 3
+// the K/V-first layout with the same state descriptors (below)
 void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, uint32_t version) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
@@ -1612,7 +1931,7 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes, const SessionReadLimits& l
     // Optional descriptor expansion augments this estimate when a caller already knows it. Readers keep this as an
     // initial screen, then admit each actual logical destination allocation once while parsing.
     const uint64_t parsed_bytes = sat_add(file_bytes,
-        file_version == kVersionV2 ? decoded_state_extra : 0);
+        file_version >= kVersionV2 ? decoded_state_extra : 0);
     const uint64_t segments = parsed_bytes / kBlock + 1;
     return sat_add(sat_add(sat_add(parsed_bytes, kBlock), sat_mul(segments, 4096)), uint64_t(1) << 20);
 }
@@ -1686,7 +2005,7 @@ uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLi
     bool includes_state_allocations = false;
     const uint64_t metadata_bytes = session_stream_metadata_bytes(file_bytes, limits, includes_state_allocations);
     n = sat_add(n, metadata_bytes);
-    if (file_version == kVersionV2 && !includes_state_allocations) n = sat_add(n, decoded_state_extra);
+    if (file_version >= kVersionV2 && !includes_state_allocations) n = sat_add(n, decoded_state_extra);
     // one hash per <= 16 MiB block moved, and the per-layer directories (a tiny term, bounded by the file)
     n = sat_add(n, sat_mul(file_bytes / kBlock + 1, 6 * sizeof(uint64_t)));
     return n;
@@ -1700,6 +2019,10 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    if (opt.background_state && !opt.layout_v3) {
+        error = "session file: background-state writes require the v3 layout (layout_v3)";
+        return false;   // the K/V-first order is what makes the early sources release safe
+    }
     // the state-ref decision, once, before sizing: with state_ref on (a prefix save), a non-live checkpoint whose
     // five running-state arrays are ALL byte-identical to the live state's takes REF in a version-2 file; any
     // difference in any array keeps that checkpoint RAW, and absent both REF and RHT descriptors the file stays v1
@@ -1713,10 +2036,14 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     rht::Layout codec_layout{};
     const std::vector<StateCodecArray> codec = state_codecs(image, opt.state_codec_rht, ref, codec_layout);
     const bool any_codec2 = any_state_codec2(codec);
-    const uint32_t version = ref.empty() && !any_codec2 ? kVersion : kVersionV2;
+    // v3 is opt-in (the K/V-first layout); otherwise a REF or RHT descriptor makes the file v2, and with neither
+    // the bytes stay v1
+    const uint32_t version = opt.layout_v3 ? kVersionV3
+                                           : (ref.empty() && !any_codec2 ? kVersion : kVersionV2);
     Out sizing;
     if (version == kVersion) put_payload(sizing, image, sources);
-    else put_payload_v2(sizing, image, sources, ref, codec, codec_layout);
+    else if (version == kVersionV2) put_payload_v2(sizing, image, sources, ref, codec, codec_layout);
+    else put_payload_v3(sizing, image, sources, ref, codec, codec_layout);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
@@ -1743,40 +2070,65 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         error = "session file: cannot create a temporary file beside " + path + ": " + error;
         return false;
     }
-    FileSink f(raw);
-    if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
-    if (opt.progress) f.progress.emplace(opt.progress);
-    f.phase = opt.phase;
-    f.expected = total;
-    if (f.progress) (*f.progress)(0, total);   // the temporary file exists: the transfer starts
+    SourcesReleased released(opt.on_sources_released);
     const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
-    f.write_fault = injected(fault, "write");
-    f.flush_fault = injected(fault, "file_flush");
-    uint8_t h[kHeader];
-    header_bytes(h, id, payload, version);
-    bool ok = f.write(h, kHeader);
-    SessionHasher hash(0);
-    Out out;
-    out.f = &f;
-    out.hash = &hash;
-    if (ok) {
-        if (version == kVersion) put_payload(out, image, sources);
-        else put_payload_v2(out, image, sources, ref, codec, codec_layout);
-    }
-    ok = ok && out.ok && out.n == payload;
-    if (ok) {
-        const uint64_t ph = hash.digest();
-        ok = f.write(&ph, 8) && f.write(kEnd, 8);
-    }
-    ok = f.finish(opt.durable) && ok;
     std::string why;
-    if (!ok) {
-        why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
-                              : f.error();
-        st.error = out.read_failed ? SessionError::io : f.kind();
+    // the same production walk over either sink: with the background sink the K/V source reads overlap the OS
+    // writes, and the sources-released notification fires while the writer thread is still draining the buffers
+    const auto drive = [&](auto& sink) -> bool {
+        using Sink = std::remove_reference_t<decltype(sink)>;
+        if (opt.progress) sink.progress.emplace(opt.progress);
+        sink.phase = opt.phase;
+        sink.expected = total;
+        sink.timings = opt.timings;
+        if (sink.progress) (*sink.progress)(0, total);   // the temporary file exists: the transfer starts
+        sink.write_fault = injected(fault, "write");
+        sink.flush_fault = injected(fault, "file_flush");
+        uint8_t h[kHeader];
+        header_bytes(h, id, payload, version);
+        bool ok = sink.write(h, kHeader);
+        SessionHasher hash(0);
+        Out out;
+        if constexpr (std::is_same_v<Sink, AsyncFileSink>) out.af = &sink;
+        else out.f = &sink;
+        out.hash = &hash;
+        out.timings = opt.timings;
+        out.released = &released;
+        if (ok) {
+            if (version == kVersion) put_payload(out, image, sources);
+            else if (version == kVersionV2) put_payload_v2(out, image, sources, ref, codec, codec_layout);
+            else put_payload_v3(out, image, sources, ref, codec, codec_layout);
+        }
+        ok = ok && out.ok && out.n == payload;
+        if (ok) {
+            const uint64_t ph = hash.digest();
+            ok = sink.write(&ph, 8) && sink.write(kEnd, 8);
+        }
+        ok = sink.finish(opt.durable) && ok;
+        if (!ok) {
+            why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
+                                  : sink.error();
+            st.error = out.read_failed ? SessionError::io : sink.kind();
+            return false;
+        }
+        return true;
+    };
+    bool ok;
+    if (opt.background_state) {
+        AsyncFileSink sink(raw);
+        if (!sink.ok()) { st.error = SessionError::memory; error = "session file: " + sink.error(); return false; }
+        ok = drive(sink);
     } else {
+        FileSink sink(raw);
+        if (!sink.ok()) { st.error = SessionError::memory; error = "session file: " + sink.error(); return false; }
+        ok = drive(sink);
+    }
+    if (ok) {
         if (opt.phase) opt.phase("publish", total);
-        if (pub.publish(why, opt.durable, st, fault)) {
+        const auto started = opt.timings ? TimingClock::now() : TimingClock::time_point{};
+        const bool published = pub.publish(why, opt.durable, st, fault);
+        if (opt.timings) timing_add(&opt.timings->publish_ns, started);
+        if (published) {
             st.error = SessionError::none;
             bytes = (size_t) total;
             return true;
@@ -1823,8 +2175,9 @@ const ConversationCheckpoint* session_deepest_checkpoint(const std::vector<Conve
 }
 
 uint64_t session_save_peak_bytes(const ConversationCheckpoint* deepest, const SessionSaveLive& live) {
-    uint64_t n = sat_add(kBlock, uint64_t(1) << 20);                          // write buffer, small vectors
-    if (deepest) n = sat_add(n, sat_mul(2, deepest->bytes()));                // the list and the image's copy
+    const uint64_t buffers = live.background_state ? 2 * kBlock : kBlock;
+    uint64_t n = sat_add(buffers, uint64_t(1) << 20);                         // write buffers, small vectors
+    if (deepest) n = sat_add(n, sat_mul(live.background_state ? 1 : 2, deepest->bytes()));
     n = sat_add(n, live.state_bytes);                                         // the live running state
     n = sat_add(n, sat_mul(live.tokens, sizeof(int32_t)));                    // its token list
     n = sat_add(n, sat_mul(live.images, sizeof(ConversationImageKey)));       // its images
@@ -1870,7 +2223,7 @@ bool header_ok(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, u
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion && version != kVersionV2) {
+    if (version < kVersion || version > kVersionV3) {
         error = "session file: unsupported version " + std::to_string(version);
         return false;
     }
@@ -1891,7 +2244,7 @@ struct ReadFile {
     RawFile raw;
     FileSource source;
     uint64_t size = 0;
-    uint32_t version = 0;   // the verified header's format version (1 or 2)
+    uint32_t version = 0;   // the verified header's format version (1, 2 or 3)
     ReadFile() : source(raw) {}
     bool open(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
               uint64_t& payload, std::string& error, SessionStatus& st) {
@@ -1912,8 +2265,8 @@ struct ReadFile {
                         (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
                 return false;
             }
-            // within the absolute cap but past the v1-derived bound: a v2 file may legally be larger (its descriptor
-            // overhead is not in the v1 count), so the verified header decides
+            // within the absolute cap but past the v1-derived bound: a descriptor-format file (v2 or v3) may legally
+            // be larger (its descriptor overhead is not in the v1 count), so the verified header decides
             over_v1 = true;
         }
         if (!source.ok()) { st.error = SessionError::memory; error = "session file: " + source.error(); return false; }
@@ -1933,7 +2286,7 @@ struct ReadFile {
                         std::to_string(max_size);
                 return false;
             }
-            // v2's own physical bound: the untruncated v1-derived bound plus the per-checkpoint descriptor slack
+            // v2/v3's own physical bound: the untruncated v1-derived bound plus the per-checkpoint descriptor slack
             // (live included), still under the absolute cap
             const uint64_t v2_max = sat_add(max_size, sat_mul(kV2DescriptorSlack, sat_add(1, limits.max_checkpoints)));
             const uint64_t v2_bound = std::min(v2_max, limits.max_file_bytes);
@@ -1943,10 +2296,37 @@ struct ReadFile {
                 return false;
             }
         }
-        st.file_version = version;   // the header is verified: the caller may tell a v2 RAM refusal from a bad file
+        st.file_version = version;   // the header is verified: the caller may tell a descriptor-format RAM refusal
+                                     // from a bad file
         return true;
     }
 };
+
+// where a v3 session file's state section starts (the absolute offset of its first byte), derived from the read
+// pass's K/V part directory: the header, the geometry prefix, the layer count, then each layer's header and its
+// five (size word + payload bytes).  UINT64_MAX on overflow.
+uint64_t session_states_offset(const std::vector<std::array<uint64_t, 5>>& kv_part_bytes) {
+    uint64_t n = sat_add(kHeader, kGeoPrefix);
+    n = sat_add(n, 8);
+    for (const auto& parts : kv_part_bytes) {
+        n = sat_add(n, kKvHeaderBytes);
+        for (uint64_t b : parts) n = sat_add(n, sat_add(8, b));
+    }
+    return n;
+}
+
+// where a v3 delta record's state section starts (the absolute offset of its first byte), derived from the read
+// pass's record: the record header, the geometry prefix, the layer count, then each layer's header and its five
+// (offset, size) framings and payload bytes.  UINT64_MAX on overflow.
+uint64_t delta_states_offset(uint64_t at0, const SessionDeltaRecord& expected) {
+    uint64_t n = sat_add(kDeltaHead, kGeoPrefix);
+    n = sat_add(n, 8);
+    for (size_t l = 0; l < expected.kv_bytes.size(); ++l) {
+        n = sat_add(n, kKvHeaderBytes);
+        for (uint64_t b : expected.kv_bytes[l]) n = sat_add(n, sat_add(kKvPartBytes, b));
+    }
+    return n > UINT64_MAX - at0 ? UINT64_MAX : at0 + n;
+}
 
 bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
@@ -1966,7 +2346,9 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     SavedConversation parsed;
     In in{&rf.source, SessionHasher(0), payload, error, limits};
-    const bool ok = rf.version == kVersionV2 ? get_payload_v2(in, parsed) : get_payload(in, parsed);
+    const bool ok = rf.version == kVersion ? get_payload(in, parsed)
+                  : rf.version == kVersionV2 ? get_payload_v2(in, parsed)
+                                             : get_payload_v3(in, parsed);
     if (!ok) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
@@ -2003,8 +2385,9 @@ bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, Sa
     SavedConversation parsed;
     In in{&rf.source, SessionHasher(0), payload, error, limits};
     in.record_kv = kv_part_bytes;
-    const bool ok = rf.version == kVersionV2 ? get_payload_streamed_v2(in, parsed, {})
-                                                   : get_payload_streamed(in, parsed, {});
+    const bool ok = rf.version == kVersion ? get_payload_streamed(in, parsed, {})
+                  : rf.version == kVersionV2 ? get_payload_streamed_v2(in, parsed, {})
+                                             : get_payload_streamed_v3(in, parsed, {});
     if (!ok) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
@@ -2034,8 +2417,8 @@ bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, c
     ReadFile rf;
     uint64_t payload = 0;
     if (!rf.open(path, id, bounds ? *bounds : open, payload, error, st)) return false;
-    const bool v2 = rf.version == kVersionV2;
-    if (v2 && bounds && bounds->admit) {
+    const bool desc = rf.version >= kVersionV2;   // descriptor-coded states (v2 states-first, v3 K/V-first)
+    if (desc && bounds && bounds->admit) {
         // the apply pass re-parses the metadata while the read pass's copy is still resident: admit ONLY this
         // additional peak (parser metadata and one 16 MiB I/O block), before the first byte can reach the sink.  The
         // per-allocation checks below stay as overflow/container guards; the callback is not asked twice for the
@@ -2048,12 +2431,42 @@ bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, c
         }
     }
     SavedConversation parsed;   // re-parsed, then discarded
+    if (rf.version == kVersionV3) {
+        // the v3 state section follows the K/V: validate it BEFORE any block reaches the sink, positioned from the
+        // read pass's K/V directory.  A buffered pread pass over the same descriptor reader does that (the
+        // sequential FileSource may use O_DIRECT, whose alignment arbitrary section offsets cannot meet), so a v3
+        // state corruption is refused just as cleanly, ahead of the sink, as a v2 one is in its single pass.
+        const uint64_t payload_end = rf.size - kTrailer;
+        const uint64_t states_at = session_states_offset(kv_part_bytes);
+        if (states_at >= payload_end) {
+            error = "session file: the K/V directory does not reach the state section";
+            return false;
+        }
+        RawFile buffered;
+        uint64_t buffered_size = 0;
+        if (!buffered.open_session(path, buffered_size, /*allow_direct=*/false)) {
+            st.error = buffered.refused() ? SessionError::invalid : buffered.kind();
+            error = "session file: " + path + ": " + buffered.error();
+            return false;
+        }
+        SessionReadLimits pread_limits = bounds ? *bounds : open;
+        pread_limits.admit = {};   // the apply peak admitted above covers this pass's bounded allocations
+        DeltaIn geo_in{&buffered, kHeader, payload_end, SessionHasher(0), error, pread_limits};
+        geo_in.what = "session file";
+        if (!get_geo_prefix_t(geo_in, parsed)) { st.error = geo_in.kind; return false; }
+        DeltaIn states_in{&buffered, states_at, payload_end, SessionHasher(0), error, pread_limits};
+        states_in.what = "session file";
+        if (!get_states_v2_t(states_in, parsed)) { st.error = states_in.kind; return false; }
+    }
     SessionReadLimits apply_limits = bounds ? *bounds : open;
-    apply_limits.admit = {};    // the v2 extra peak above covered this pass's staging; a caller passing bounds MUST
-                                // set admit itself (both current callers do), or the apply pass runs unguarded
+    apply_limits.admit = {};    // the descriptor extra peak above covered this pass's staging; a caller passing
+                                // bounds MUST set admit itself (both current callers do), or the apply pass runs
+                                // unguarded
     In in{&rf.source, SessionHasher(0), payload, error, apply_limits};
     in.verify_kv = &kv_part_bytes;
-    const bool ok = v2 ? get_payload_streamed_v2(in, parsed, sink) : get_payload_streamed(in, parsed, sink);
+    const bool ok = rf.version == kVersion ? get_payload_streamed(in, parsed, sink)
+                  : rf.version == kVersionV2 ? get_payload_streamed_v2(in, parsed, sink)
+                                             : get_payload_streamed_v3(in, parsed, sink);
     if (!ok) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
@@ -2155,12 +2568,17 @@ bool delta_write_impl(const std::string& path, uint64_t at, const SavedConversat
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(meta)) { error = "delta record: layer-split state cannot be saved"; return false; }
     if (!meta.kv.empty()) { error = "delta record: the metadata must not carry K/V buffers"; return false; }
+    if (opt.background_state && !opt.layout_v3) {
+        error = "delta record: background-state writes require the v3 layout (layout_v3)";
+        return false;   // st.error is still 'invalid'
+    }
     for (const auto& s : kv)
         for (size_t p = 0; p < 5; ++p)
             if (s.first_bytes[p] > s.sizes[p]) { error = "delta record: a K/V offset is past its part"; return false; }
     rht::Layout codec_layout{};
     const std::vector<StateCodecArray> codec = state_codecs(meta, opt.state_codec_rht, {}, codec_layout);
-    const uint64_t record_version = any_state_codec2(codec) ? kDeltaVersion : kDeltaVersionV1;
+    const uint64_t record_version = opt.layout_v3 ? kDeltaVersionV3
+                                    : any_state_codec2(codec) ? kDeltaVersion : kDeltaVersionV1;
     Out sizing;
     put_delta_record(sizing, id, first_token, meta, kv, record_version, codec, codec_layout);
     if (sizing.overflow || sizing.n > UINT64_MAX - kTrailer) {
@@ -2187,41 +2605,142 @@ bool delta_write_impl(const std::string& path, uint64_t at, const SavedConversat
         error = "delta record: cannot open " + path + ": " + raw.error();
         return false;
     }
+    SourcesReleased released(opt.on_sources_released);
     // the committed end is the append point: anything past it (an interrupted append) is dropped before writing
     if (!raw.truncate(at) || !raw.seek(at)) {
         st.error = raw.kind();
         error = "delta record: cannot position " + path + " at " + std::to_string(at) + ": " + raw.error();
         return false;
     }
-    FileSink f(raw);
-    if (!f.ok()) { st.error = SessionError::memory; error = "delta record: " + f.error(); return false; }
-    if (opt.progress) f.progress.emplace(opt.progress);
-    f.phase = opt.phase;
-    f.expected = total;
-    if (f.progress) (*f.progress)(0, total);
     const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
-    f.write_fault = injected(fault, "write");
-    f.flush_fault = injected(fault, "file_flush");
-    SessionHasher hash(0);
-    Out out;
-    out.f = &f;
-    out.hash = &hash;
-    put_delta_record(out, id, first_token, meta, kv, record_version, codec, codec_layout);
-    bool ok = out.ok && out.n == sizing.n;
-    if (ok) {
-        const uint64_t ph = hash.digest();
-        ok = f.write(&ph, 8) && f.write(kEnd, 8);
+    const auto drive = [&](auto& sink) -> bool {
+        using Sink = std::remove_reference_t<decltype(sink)>;
+        if (opt.progress) sink.progress.emplace(opt.progress);
+        sink.phase = opt.phase;
+        sink.expected = total;
+        sink.timings = opt.timings;
+        if (sink.progress) (*sink.progress)(0, total);
+        sink.write_fault = injected(fault, "write");
+        sink.flush_fault = injected(fault, "file_flush");
+        SessionHasher hash(0);
+        Out out;
+        if constexpr (std::is_same_v<Sink, AsyncFileSink>) out.af = &sink;
+        else out.f = &sink;
+        out.hash = &hash;
+        out.timings = opt.timings;
+        out.released = &released;
+        put_delta_record(out, id, first_token, meta, kv, record_version, codec, codec_layout);
+        bool ok = out.ok && out.n == sizing.n;
+        if (ok) {
+            const uint64_t ph = hash.digest();
+            ok = sink.write(&ph, 8) && sink.write(kEnd, 8);
+        }
+        ok = sink.finish(opt.durable) && ok;
+        if (!ok) {
+            const std::string why = out.read_failed
+                                        ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
+                                        : sink.error();
+            st.error = out.read_failed ? SessionError::io : sink.kind();
+            error = "delta record: writing " + path + " failed" + (why.empty() ? std::string() : ": " + why);
+            return false;
+        }
+        st.error = SessionError::none;
+        bytes = total;
+        return true;
+    };
+    if (opt.background_state) {
+        AsyncFileSink sink(raw);
+        if (!sink.ok()) { st.error = SessionError::memory; error = "delta record: " + sink.error(); return false; }
+        return drive(sink);
     }
-    ok = f.finish(opt.durable) && ok;
-    if (!ok) {
-        const std::string why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
-                                                : f.error();
-        st.error = out.read_failed ? SessionError::io : f.kind();
-        error = "delta record: writing " + path + " failed" + (why.empty() ? std::string() : ": " + why);
+    FileSink sink(raw);
+    if (!sink.ok()) { st.error = SessionError::memory; error = "delta record: " + sink.error(); return false; }
+    return drive(sink);
+}
+
+// a delta record's K/V directory walk (the read pass): the layer count, each layer's header, each part's
+// (offset, size), then the part's bytes read for the hash only.  Fills `parsed`.kv's headers and the record's
+// offset/size directory.  Shared by every record version; the caller walks it after the state section (v1/v2
+// records) or before it (v3 records).
+bool delta_kv_dir_read(DeltaIn& in, SavedConversation& parsed, SessionDeltaRecord& result) {
+    uint64_t n = 0;
+    if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
+    if (!in.resize(parsed.kv, n) || !in.resize_zero(result.kv_offset, n) || !in.resize_zero(result.kv_bytes, n))
         return false;
+    Aligned block;
+    if (n) {
+        if (!in.prepare_allocation(kBlock, 1)) return false;
+        block = aligned_block();
+        if (!block) { in.kind = SessionError::memory; return in.fail("out of memory for the K/V read block"); }
     }
-    st.error = SessionError::none;
-    bytes = total;
+    for (size_t l = 0; l < (size_t) n; ++l) {
+        auto& k = parsed.kv[l];
+        in.kv_layer = l;
+        int64_t format = 0;
+        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+        if (format < INT32_MIN || format > INT32_MAX) { in.fail("invalid K/V format"); return false; }
+        k.format = (int) format;
+        for (size_t part = 0; part < 5; ++part) {
+            uint64_t part_at = 0, part_bytes = 0;
+            if (!in.u64(part_at) || !in.u64(part_bytes)) return false;
+            const uint64_t max = l < in.limits.max_kv_bytes.size() ? in.limits.max_kv_bytes[l][part] : UINT64_MAX;
+            if (part_at > max || part_bytes > max - part_at) {
+                in.fail("K/V part beyond this engine's limit");
+                in.kind = SessionError::invalid;
+                return false;
+            }
+            result.kv_offset[l][part] = part_at;
+            result.kv_bytes[l][part] = part_bytes;
+            for (uint64_t done = 0; done < part_bytes;) {
+                const size_t c = (size_t) std::min<uint64_t>(kBlock, part_bytes - done);
+                if (!in.raw(block.get(), c)) return false;
+                done += (uint64_t) c;
+            }
+        }
+    }
+    return true;
+}
+
+// the apply pass's K/V directory walk: re-reads the directory and refuses a record that differs from `expected`
+// (a K/V header, an offset or a size) BEFORE that part's first block reaches the sink, then hands every block to
+// the sink at (offset + done within the part).
+bool delta_kv_dir_apply(DeltaIn& in, const SessionDeltaRecord& expected, const SessionKvBlock& sink) {
+    uint64_t n = 0;
+    if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
+    if (n != expected.kv_offset.size()) return in.fail("K/V layer count differs from the read pass");
+    Aligned block;
+    if (n) {
+        if (!in.prepare_allocation(kBlock, 1)) return false;
+        block = aligned_block();
+        if (!block) { in.kind = SessionError::memory; return in.fail("out of memory for the K/V read block"); }
+    }
+    for (size_t l = 0; l < (size_t) n; ++l) {
+        in.kv_layer = l;
+        int64_t format = 0, cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
+        if (!in.i64(format) || !in.i64(cells) || !in.i64(heads) || !in.i64(head_dim) ||
+            !in.i64(page_size) || !in.i64(pooled_rows) || !in.i64(idx_dim)) return false;
+        const ConversationKv& want = expected.meta.kv[l];
+        if (format != want.format || cells != want.cells || heads != want.heads || head_dim != want.head_dim ||
+            page_size != want.page_size || pooled_rows != want.pooled_rows || idx_dim != want.idx_dim)
+            return in.fail("a K/V header differs from the read pass");
+        for (size_t part = 0; part < 5; ++part) {
+            uint64_t part_at = 0, part_bytes = 0;
+            if (!in.u64(part_at) || !in.u64(part_bytes)) return false;
+            if (part_at != expected.kv_offset[l][part] || part_bytes != expected.kv_bytes[l][part])
+                return in.fail("a K/V part size differs from the read pass");
+            for (uint64_t done = 0; done < part_bytes;) {
+                const size_t c = (size_t) std::min<uint64_t>(kBlock, part_bytes - done);
+                if (!in.raw(block.get(), c)) return false;
+                if (sink && !sink(l, part, part_at + done, block.get(), c)) {
+                    if (in.error.empty()) in.error = std::string(in.what) + ": the K/V sink failed";
+                    in.kind = SessionError::io;
+                    return false;
+                }
+                done += (uint64_t) c;
+            }
+        }
+    }
     return true;
 }
 
@@ -2245,7 +2764,7 @@ bool delta_read_impl(const std::string& path, uint64_t at0, uint64_t limit, cons
     uint64_t version = 0, model = 0, config = 0;
     int64_t first_token = 0;
     if (!in.raw(magic, 8) || std::memcmp(magic, kDeltaMagic, 8) != 0 || !in.u64(version) ||
-        (version != kDeltaVersionV1 && version != kDeltaVersion) ||
+        (version != kDeltaVersionV1 && version != kDeltaVersion && version != kDeltaVersionV3) ||
         !in.u64(model) || !in.u64(config) || !in.i64(first_token)) {
         st.error = in.kind;
         return false;
@@ -2258,46 +2777,16 @@ bool delta_read_impl(const std::string& path, uint64_t at0, uint64_t limit, cons
     // as it was
     SessionDeltaRecord result;
     SavedConversation& parsed = result.meta;
-    const bool parsed_meta = version == kDeltaVersion ? get_meta_prefix_v2(in, parsed)
-                                                     : get_meta_prefix_t(in, parsed);
-    if (!parsed_meta) { st.error = in.kind; return false; }
-    uint64_t n = 0;
-    if (!in.count(n, 96, limits.max_kv_layers)) { st.error = in.kind; return false; }
-    if (!in.resize(parsed.kv, n) || !in.resize_zero(result.kv_offset, n) || !in.resize_zero(result.kv_bytes, n)) {
-        st.error = in.kind;
-        return false;
-    }
-    Aligned block;
-    if (n) {
-        if (!in.prepare_allocation(kBlock, 1)) { st.error = in.kind; return false; }
-        block = aligned_block();
-        if (!block) { st.error = SessionError::memory; error = "delta record: out of memory for the K/V read block"; return false; }
-    }
-    for (size_t l = 0; l < (size_t) n; ++l) {
-        auto& k = parsed.kv[l];
-        in.kv_layer = l;
-        int64_t format = 0;
-        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
-            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) { st.error = in.kind; return false; }
-        if (format < INT32_MIN || format > INT32_MAX) { in.fail("invalid K/V format"); st.error = in.kind; return false; }
-        k.format = (int) format;
-        for (size_t part = 0; part < 5; ++part) {
-            uint64_t part_at = 0, part_bytes = 0;
-            if (!in.u64(part_at) || !in.u64(part_bytes)) { st.error = in.kind; return false; }
-            const uint64_t max = l < limits.max_kv_bytes.size() ? limits.max_kv_bytes[l][part] : UINT64_MAX;
-            if (part_at > max || part_bytes > max - part_at) {
-                in.fail("K/V part beyond this engine's limit");
-                st.error = SessionError::invalid;
-                return false;
-            }
-            result.kv_offset[l][part] = part_at;
-            result.kv_bytes[l][part] = part_bytes;
-            for (uint64_t done = 0; done < part_bytes;) {
-                const size_t c = (size_t) std::min<uint64_t>(kBlock, part_bytes - done);
-                if (!in.raw(block.get(), c)) { st.error = in.kind; return false; }
-                done += (uint64_t) c;
-            }
-        }
+    if (version == kDeltaVersionV3) {
+        // the K/V-first record: geometry prefix, the K/V directory, then the state descriptors
+        if (!get_geo_prefix_t(in, parsed)) { st.error = in.kind; return false; }
+        if (!delta_kv_dir_read(in, parsed, result)) { st.error = in.kind; return false; }
+        if (!get_states_v2_t(in, parsed)) { st.error = in.kind; return false; }
+    } else {
+        const bool parsed_meta = version == kDeltaVersion ? get_meta_prefix_v2(in, parsed)
+                                                          : get_meta_prefix_t(in, parsed);
+        if (!parsed_meta) { st.error = in.kind; return false; }
+        if (!delta_kv_dir_read(in, parsed, result)) { st.error = in.kind; return false; }
     }
     uint64_t ph = 0;
     char endm[8];
@@ -2358,7 +2847,7 @@ bool delta_apply_impl(const std::string& path, uint64_t at0, const SessionFileId
     uint64_t version = 0, model = 0, config = 0;
     int64_t first_token = 0;
     if (!in.raw(magic, 8) || std::memcmp(magic, kDeltaMagic, 8) != 0 || !in.u64(version) ||
-        (version != kDeltaVersionV1 && version != kDeltaVersion) ||
+        (version != kDeltaVersionV1 && version != kDeltaVersion && version != kDeltaVersionV3) ||
         !in.u64(model) || !in.u64(config) || !in.i64(first_token)) { st.error = in.kind; return false; }
     if (model != id.model || config != id.config) {
         error = "delta record: saved with another model or engine configuration";
@@ -2366,9 +2855,25 @@ bool delta_apply_impl(const std::string& path, uint64_t at0, const SessionFileId
     }
     if (first_token != expected.first_token) { in.fail("the record's first token differs from the read pass"); st.error = in.kind; return false; }
     SavedConversation parsed;
-    const bool parsed_meta = version == kDeltaVersion ? get_meta_prefix_v2(in, parsed)
-                                                     : get_meta_prefix_t(in, parsed);
-    if (!parsed_meta) { st.error = in.kind; return false; }
+    if (version == kDeltaVersionV3) {
+        // the K/V-first record: the state section follows the K/V, so validate it BEFORE any block reaches the
+        // sink.  Its position follows from the read pass's directory (the record must match it, checked per part
+        // below before that part is sunk); the descriptor reader over a pread window refuses a corrupt state
+        // section cleanly, the way the states-first records do in their single pass.
+        if (!get_geo_prefix_t(in, parsed)) { st.error = in.kind; return false; }
+        const uint64_t states_at = delta_states_offset(at0, expected);
+        if (states_at == UINT64_MAX || states_at >= size - kTrailer) {
+            in.fail("the record's state section is outside the file");
+            st.error = SessionError::invalid;
+            return false;
+        }
+        DeltaIn states_in{&f, states_at, size - kTrailer, SessionHasher(0), error, bounded};
+        if (!get_states_v2_t(states_in, parsed)) { st.error = states_in.kind; return false; }
+    } else {
+        const bool parsed_meta = version == kDeltaVersion ? get_meta_prefix_v2(in, parsed)
+                                                          : get_meta_prefix_t(in, parsed);
+        if (!parsed_meta) { st.error = in.kind; return false; }
+    }
     if (parsed.live.ids.size() != expected.meta.live.ids.size() || parsed.geometry != expected.meta.geometry ||
         parsed.layer_lo != expected.meta.layer_lo || parsed.layer_hi != expected.meta.layer_hi ||
         parsed.cvec != expected.meta.cvec || parsed.checkpoints.size() != expected.meta.checkpoints.size()) {
@@ -2376,46 +2881,11 @@ bool delta_apply_impl(const std::string& path, uint64_t at0, const SessionFileId
         st.error = in.kind;
         return false;
     }
-    uint64_t n = 0;
-    if (!in.count(n, 96, bounded.max_kv_layers)) { st.error = in.kind; return false; }
-    if (n != expected.kv_offset.size()) { in.fail("K/V layer count differs from the read pass"); st.error = in.kind; return false; }
-    Aligned block;
-    if (n) {
-        if (!in.prepare_allocation(kBlock, 1)) { st.error = in.kind; return false; }
-        block = aligned_block();
-        if (!block) { st.error = SessionError::memory; error = "delta record: out of memory for the K/V read block"; return false; }
-    }
-    for (size_t l = 0; l < (size_t) n; ++l) {
-        in.kv_layer = l;
-        int64_t format = 0, cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
-        if (!in.i64(format) || !in.i64(cells) || !in.i64(heads) || !in.i64(head_dim) ||
-            !in.i64(page_size) || !in.i64(pooled_rows) || !in.i64(idx_dim)) { st.error = in.kind; return false; }
-        const ConversationKv& want = expected.meta.kv[l];
-        if (format != want.format || cells != want.cells || heads != want.heads || head_dim != want.head_dim ||
-            page_size != want.page_size || pooled_rows != want.pooled_rows || idx_dim != want.idx_dim) {
-            in.fail("a K/V header differs from the read pass");
-            st.error = in.kind;
-            return false;
-        }
-        for (size_t part = 0; part < 5; ++part) {
-            uint64_t part_at = 0, part_bytes = 0;
-            if (!in.u64(part_at) || !in.u64(part_bytes)) { st.error = in.kind; return false; }
-            if (part_at != expected.kv_offset[l][part] || part_bytes != expected.kv_bytes[l][part]) {
-                in.fail("a K/V part size differs from the read pass");
-                st.error = in.kind;
-                return false;
-            }
-            for (uint64_t done = 0; done < part_bytes;) {
-                const size_t c = (size_t) std::min<uint64_t>(kBlock, part_bytes - done);
-                if (!in.raw(block.get(), c)) { st.error = in.kind; return false; }
-                if (sink && !sink(l, part, part_at + done, block.get(), c)) {
-                    if (error.empty()) error = "delta record: the K/V sink failed";
-                    st.error = SessionError::io;
-                    return false;
-                }
-                done += (uint64_t) c;
-            }
-        }
+    if (!delta_kv_dir_apply(in, expected, sink)) { st.error = in.kind; return false; }
+    if (version == kDeltaVersionV3) {
+        // consume and hash the state section again in record order (it was validated ahead of the sink); the
+        // sequential re-parse re-checks every descriptor against the bounded limits
+        if (!get_states_v2_t(in, parsed)) { st.error = in.kind; return false; }
     }
     uint64_t ph = 0;
     char endm[8];
@@ -2476,11 +2946,12 @@ bool session_delta_apply(const std::string& path, uint64_t at, const SessionFile
 }
 
 uint64_t session_delta_record_bytes(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
-                                    bool* overflow, bool state_codec_rht) {
+                                    bool* overflow, bool state_codec_rht, bool layout_v3) {
     if (overflow) *overflow = false;
     rht::Layout codec_layout{};
     const std::vector<StateCodecArray> codec = state_codecs(meta, state_codec_rht, {}, codec_layout);
-    const uint64_t record_version = any_state_codec2(codec) ? kDeltaVersion : kDeltaVersionV1;
+    const uint64_t record_version = layout_v3 ? kDeltaVersionV3
+                                    : any_state_codec2(codec) ? kDeltaVersion : kDeltaVersionV1;
     Out sizing;
     put_delta_record(sizing, SessionFileIdentity{}, 0, meta, kv, record_version, codec, codec_layout);
     if (sizing.overflow || sizing.n > UINT64_MAX - kTrailer) {

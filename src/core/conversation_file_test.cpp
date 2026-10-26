@@ -6,17 +6,21 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <mutex>
 #include <new>
 #include <limits>
+#include <thread>
 #include <utility>
 #include <vector>
 #ifndef _WIN32
@@ -401,11 +405,11 @@ int main() {
     // other model or other configuration
     check(rejects(good, {id.model ^ 1, id.config}, "model"), "different model fingerprint rejected");
     check(rejects(good, {id.model, id.config ^ 1}, "config"), "different configuration rejected");
-    // wrong version: header field patched and header hash recomputed so only the version differs. (Version 2 is the
-    // descriptor-coded state format, so the unsupported-version probe must use a version no reader accepts.)
+    // wrong version: header field patched and header hash recomputed so only the version differs. (Versions 2 and 3
+    // are the descriptor-coded formats, so the unsupported-version probe must use a version no reader accepts.)
     {
         auto d = image;
-        uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 4; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");
@@ -519,6 +523,39 @@ int main() {
         // K/V in the image and as sources at once is ambiguous: refused
         check(!session_file_write((dir / "both.bin").string(), original, sources, id, written, error),
               "image K/V plus sources refused");
+    }
+
+    // generate.cpp's delta-then-base fallback reuses ONE capture: a failed delta attempt leaves the sources'
+    // first_bytes offset-adjusted, and the full base write that follows must still produce byte-identical
+    // output, because the base writer reads every part from offset 0 and ignores first_bytes.
+    {
+        SavedConversation meta = original;
+        meta.kv.clear();
+        std::vector<SessionKvSource> sources;
+        for (const auto& k : original.kv) {
+            SessionKvSource s;
+            s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
+            s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
+            const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+            for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
+            s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
+                return parts[part]->read(dst, offset, n);
+            };
+            sources.push_back(std::move(s));
+        }
+        const fs::path plain = dir / "fallback-plain.bin";
+        check(session_file_write(plain.string(), meta, sources, id, written, error), "fallback: base write");
+        const std::vector<char> plain_bytes = slurp(plain);
+        // the offsets a delta record would have started at, via the real page-rounded keep rule
+        auto offset = sources;
+        for (size_t i = 0; i < offset.size(); ++i)
+            check(session_delta_first_bytes(offset[i], 64, i + 1 < offset.size(), 16, 128, error),
+                  "fallback: delta offsets apply to the capture");
+        const fs::path reused = dir / "fallback-reused.bin";
+        check(session_file_write(reused.string(), meta, offset, id, written, error),
+              "fallback: base write reuses the offset-adjusted capture");
+        check(slurp(reused) == plain_bytes, "fallback: offset-adjusted sources write the identical base file");
+        check(fs::file_size(reused) == plain_bytes.size(), "fallback: the reused save has the same size");
     }
 
     // --conversation-cache-disk-delta: a base file plus appended records that carry only the K/V from an offset on.
@@ -1350,6 +1387,10 @@ int main() {
         check(need >= 2 * (uint64_t) chain[1].bytes() + 5000 + 4000 + (16u << 20) &&
               need <= 2 * (uint64_t) chain[1].bytes() + 5000 + 4000 + (18u << 20),
               "save: the peak counts two checkpoint copies, the live state, tokens and the buffer");
+        SessionSaveLive background = live;
+        background.background_state = true;
+        check(session_save_peak_bytes(&chain[1], background) == need - chain[1].bytes() + (16u << 20),
+              "save: the background peak counts one moved checkpoint and two write buffers");
         SessionSaveLive huge = live;
         huge.state_bytes = UINT64_MAX;
         check(session_save_peak_bytes(&chain[1], huge) == UINT64_MAX, "save: the peak saturates");
@@ -1890,12 +1931,12 @@ int main() {
     // fires first
     {
         const fs::path p = dir / "hdr.bin";
-        {   // version 3, hash recomputed: unsupported version (v2 is a valid version now, so probe with 3)
+        {   // version 4, hash recomputed: unsupported version (v2 and v3 are valid versions now, so probe with 4)
             auto d = image;
-            const uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
+            const uint32_t v = 4; std::memcpy(d.data() + 8, &v, 4);
             const uint64_t hh = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &hh, 8);
             spit(p, d);
-            check(rejects(p, id, "unsupported version"), "v2hdr: a recomputed version 3 is an unsupported version");
+            check(rejects(p, id, "unsupported version"), "v2hdr: a recomputed version 4 is an unsupported version");
         }
         {   // the same patch without the recompute: the header checksum is what refuses it
             auto d = image;
@@ -2331,6 +2372,893 @@ int main() {
               read_back.meta.live.ids == grown.live.ids,
               "v2delta: the record is still a v1 record and reads back");
         fs::remove(log);
+    }
+
+    // ---- format v3 (--conversation-cache-disk-background-state's K/V-first layout): geometry/layer range/cvec,
+    // then the K/V, then the same v2 state descriptors.  Opt-in: the default bytes stay v1/v2 (golden above).
+    {
+        size_t n = 0;
+        // the fixed sample with a valid RHT geometry and finite GDN state, so the RHT codec applies to it
+        auto rht_kv_sample = [&]() {
+            SavedConversation s = sample();
+            s.geometry = {2560, 2, 4, 128, 16, 1, 2, 1, 6144, 24, 2, 256, 4, 128, 4, 320, 512, 640};
+            s.layer_lo = 0; s.layer_hi = 2;
+            rht::Layout layout{};
+            if (!rht::layout_from(s.geometry, s.layer_lo, s.layer_hi, layout)) std::abort();
+            auto finite_state = [&](uint8_t seed) {
+                auto state = named_bytes_of((size_t) layout.logical, seed);
+                for (size_t at = 0; at < state.size(); at += sizeof(float)) {
+                    const int value = (int) ((at / sizeof(float)) % 127) - 63;
+                    const float f = (float) value * 0.001f + (float) seed * 0.01f;
+                    std::memcpy(state.data() + at, &f, sizeof(f));
+                }
+                return state;
+            };
+            s.live.gdn = finite_state(1);
+            for (auto& c : s.checkpoints) c.gdn = finite_state(2);
+            return s;
+        };
+        auto sources_from = [](const SavedConversation& want) {
+            std::vector<SessionKvSource> sources;
+            for (const auto& k : want.kv) {
+                SessionKvSource s;
+                s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
+                s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
+                const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
+                s.read = [parts](size_t part, size_t offset, void* dst, size_t c2) {
+                    return parts[part]->read(dst, offset, c2);
+                };
+                sources.push_back(std::move(s));
+            }
+            return sources;
+        };
+
+        // v3 base write: the header says 3 and the K/V section stands between the geometry prefix and the states
+        {
+            const fs::path p = dir / "v3.bin";
+            SessionWriteOptions v3; v3.layout_v3 = true;
+            check(session_file_write(p.string(), original, id, written, error, v3), "v3: write");
+            const std::vector<char> d = slurp(p);
+            check(file_version_of(d) == 3, "v3: the header version is 3");
+            check(read_u64(d, 64 + 21 * 8) == original.kv.size(), "v3: the K/V count follows the geometry prefix");
+            // where the state section must start, from the K/V directory alone
+            size_t states_at = 64 + 21 * 8 + 8;
+            for (const auto& k : original.kv) {
+                states_at += 7 * 8;
+                const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                for (size_t part = 0; part < 5; ++part) states_at += 8 + parts[part]->size();
+            }
+            check(read_u64(d, states_at) == original.live.ids.size(),
+                  "v3: the live checkpoint (its ids count) opens the state section after the K/V");
+            SavedConversation back;
+            SessionStatus st;
+            check(session_file_read(p.string(), id, back, n, error, {}, &st) && same(original, back) &&
+                  st.file_version == 3, "v3: a full read round-trips and reports version 3");
+            // a RAM refusal of the verified file keeps it, like a v2 file's
+            SessionReadLimits refuse;
+            refuse.admit = [](uint64_t, std::string& why) { why = "no RAM"; return false; };
+            check(!session_file_read(p.string(), id, back, n, error, refuse, &st) &&
+                  st.error == SessionError::memory && st.file_version == 3,
+                  "v3: a RAM refusal is 'memory' with the verified version kept");
+        }
+
+        // v3 REF: a homomorphic checkpoint is still stored as references to the live state
+        {
+            SavedConversation s = sample();
+            s.checkpoints = {homo(s.live, 10, 5, 9)};
+            const fs::path p = dir / "v3ref.bin";
+            SessionWriteOptions v3; v3.layout_v3 = true; v3.state_ref = true;
+            check(session_file_write(p.string(), s, id, written, error, v3) && file_version_of(slurp(p)) == 3,
+                  "v3ref: a REF hit writes version 3");
+            SavedConversation back;
+            check(session_file_read(p.string(), id, back, n, error) && same(s, back),
+                  "v3ref: the referenced checkpoint round-trips byte-identically");
+            // the exact whole-file savings of one REF checkpoint, the same formula as v2
+            const fs::path v1p = dir / "v3ref-v1.bin";
+            check(session_file_write(v1p.string(), s, id, n, error) &&
+                  n - written == checkpoint_state_bytes(s.live) - 160,
+                  "v3ref: the whole-file savings are the v2 formula");
+        }
+
+        // v3 RHT: the lossy GDN codec in the K/V-first layout, full and streaming
+        {
+            const SavedConversation s = rht_kv_sample();
+            const fs::path p = dir / "v3rht.bin";
+            SessionWriteOptions v3; v3.layout_v3 = true; v3.state_codec_rht = true;
+            check(session_file_write(p.string(), s, id, written, error, v3) && file_version_of(slurp(p)) == 3,
+                  "v3rht: the RHT codec writes version 3");
+            SavedConversation back;
+            SessionStatus st;
+            check(session_file_read(p.string(), id, back, n, error, {}, &st) && st.file_version == 3,
+                  "v3rht: a full read passes and reports version 3");
+            // RHT is lossy: the GDN arrays decode to the logical size with finite values, every other byte is exact
+            check(back.live.gdn.size() == s.live.gdn.size() && back.checkpoints[0].gdn.size() == s.checkpoints[0].gdn.size() &&
+                  rht::all_finite(back.live.gdn.data(), back.live.gdn.size()) &&
+                  rht::all_finite(back.checkpoints[0].gdn.data(), back.checkpoints[0].gdn.size()),
+                  "v3rht: the decoded GDN arrays are logical-size and finite");
+            {
+                SavedConversation want = s, got = back;
+                want.live.gdn.clear(); got.live.gdn.clear();
+                for (auto& c : want.checkpoints) c.gdn.clear();
+                for (auto& c : got.checkpoints) c.gdn.clear();
+                check(same(want, got), "v3rht: everything but the lossy GDN arrays is byte-identical");
+            }
+            // the streamed read + apply, with the descriptor admission contract
+            SessionReadLimits lim;
+            lim.max_tokens = 1000; lim.max_checkpoints = 2; lim.max_kv_layers = 3;
+            lim.max_state_bytes = {s.live.gdn.size(), s.live.ple.size(), s.live.tails.size(),
+                                   s.live.dead.size(), s.live.block_pos.size()};
+            SavedConversation meta;
+            std::vector<std::array<uint64_t, 5>> sizes;
+            check(session_file_read_streamed(p.string(), id, meta, n, error, lim, &sizes, &st) &&
+                  st.file_version == 3, "v3rht: the streamed read passes and reports version 3");
+            SessionReadLimits bounds;
+            session_read_bounds_from_meta(meta, bounds);
+            std::vector<uint64_t> asks;
+            bounds.admit = [&](uint64_t need, std::string&) { asks.push_back(need); return true; };
+            std::vector<std::vector<uint8_t>> parts(meta.kv.size() * 5);
+            check(session_file_apply_streamed(p.string(), id,
+                  [&](size_t layer, size_t slot, uint64_t offset, const void* data, size_t len) {
+                      std::vector<uint8_t>& out = parts[layer * 5 + slot];
+                      if (offset != out.size()) return false;
+                      const uint8_t* q = static_cast<const uint8_t*>(data);
+                      out.insert(out.end(), q, q + len);
+                      return true;
+                  }, sizes, error, &st, &bounds), "v3rht: the streamed apply passes");
+            check(asks.size() == 1 && asks[0] == session_stream_apply_peak_bytes(bounds),
+                  "v3rht: the apply pass asks exactly its additional coexisting peak, once");
+            bool same_kv = true;
+            for (size_t i = 0; i < meta.kv.size(); ++i) {
+                const std::array<const ConversationBuffer*, 5> bufs = {&s.kv[i].k, &s.kv[i].v, &s.kv[i].k_scale,
+                                                                       &s.kv[i].v_scale, &s.kv[i].pooled};
+                for (size_t part = 0; part < 5; ++part) {
+                    std::vector<uint8_t> want(bufs[part]->size());
+                    bufs[part]->visit(0, want.size(), [&](const uint8_t* q2, size_t c2, size_t at2) {
+                        std::memcpy(want.data() + at2, q2, c2); return true;
+                    });
+                    same_kv = same_kv && parts[i * 5 + part] == want;
+                }
+            }
+            check(same_kv, "v3rht: the applied K/V equals the image byte for byte");
+            // a refused admission is a clean refusal: nothing reaches the sink
+            SessionReadLimits poor = bounds;
+            poor.admit = [](uint64_t, std::string&) { return false; };
+            size_t calls = 0;
+            check(!session_file_apply_streamed(p.string(), id,
+                  [&](size_t, size_t, uint64_t, const void*, size_t) { ++calls; return true; },
+                  sizes, error, &st, &poor) && calls == 0 && st.error == SessionError::memory,
+                  "v3rht: a refused apply stops before the first block");
+        }
+
+        // v3 non-finite fallback: an infinite GDN value keeps its checkpoint RAW, in a version-3 file
+        {
+            SavedConversation mixed = rht_kv_sample();
+            const float inf = std::numeric_limits<float>::infinity();
+            std::memcpy(mixed.checkpoints[0].gdn.data(), &inf, sizeof(inf));
+            const fs::path p = dir / "v3mixed.bin";
+            SessionWriteOptions v3; v3.layout_v3 = true; v3.state_codec_rht = true;
+            check(session_file_write(p.string(), mixed, id, written, error, v3) &&
+                  file_version_of(slurp(p)) == 3, "v3mix: mixed RHT/RAW descriptors write version 3");
+            SavedConversation back;
+            check(session_file_read(p.string(), id, back, n, error), "v3mix: the file reads back");
+            // the non-finite checkpoint fell back to RAW: its GDN is byte-identical; the live GDN is RHT (lossy:
+            // logical size, finite); every other array is exact
+            check(back.checkpoints[0].gdn == mixed.checkpoints[0].gdn,
+                  "v3mix: the non-finite checkpoint's GDN fell back to byte-identical RAW");
+            check(back.live.gdn.size() == mixed.live.gdn.size() &&
+                  rht::all_finite(back.live.gdn.data(), back.live.gdn.size()),
+                  "v3mix: the live GDN decoded to a finite logical-size array");
+            {
+                SavedConversation want = mixed, got = back;
+                want.live.gdn.clear(); got.live.gdn.clear();
+                for (auto& c : want.checkpoints) c.gdn.clear();
+                for (auto& c : got.checkpoints) c.gdn.clear();
+                check(same(want, got), "v3mix: everything but the GDN arrays is byte-identical");
+            }
+        }
+
+        // v3 corruption: a flipped K/V byte fails the hash; a torn file fails the size; a bad state descriptor is
+        // refused by the apply pass BEFORE any block reaches the sink (the states-first layouts' clean refusal,
+        // preserved by the v3 apply's ahead-of-the-sink state validation)
+        {
+            const fs::path p = dir / "v3.bin";
+            auto d = slurp(p);
+            d[d.size() / 2] ^= 0x20;   // a K/V payload byte, no hash recompute
+            const fs::path bad = dir / "v3flip.bin";
+            spit(bad, d);
+            check(rejects(bad, id, "checksum"), "v3corr: a flipped K/V byte fails the payload hash");
+            d.resize(d.size() / 2);
+            const fs::path short_p = dir / "v3short.bin";
+            spit(short_p, d);
+            check(rejects(short_p, id, nullptr), "v3corr: a truncated v3 file is refused");
+            // a corrupt state descriptor (codec 7), hash NOT recomputed: the read pass of the clean file succeeds
+            // first; corrupting the state section afterwards (a torn re-read between the passes) must be refused by
+            // the apply pass BEFORE any block reaches the sink - the same clean refusal the states-first layouts give
+            d = slurp(p);
+            size_t states_at = 64 + 21 * 8 + 8;
+            for (const auto& k : original.kv) {
+                states_at += 7 * 8;
+                const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                for (size_t part = 0; part < 5; ++part) states_at += 8 + parts[part]->size();
+            }
+            SavedConversation meta;
+            std::vector<std::array<uint64_t, 5>> sizes;
+            check(session_file_read_streamed(p.string(), id, meta, n, error, {}, &sizes),
+                  "v3corr: the read pass of the clean file validates");
+            const uint64_t bad_codec = 7;
+            std::memcpy(d.data() + states_at + 8 + 1000 * 4 + 8 + 16, &bad_codec, 8);   // live ids, one img, then gdn's codec word
+            const fs::path bad_state = dir / "v3state.bin";
+            spit(bad_state, d);
+            size_t calls = 0;
+            check(!session_file_apply_streamed(bad_state.string(), id,
+                  [&](size_t, size_t, uint64_t, const void*, size_t) { ++calls; return true; }, sizes, error) &&
+                  calls == 0 && error.find("codec") != std::string::npos,
+                  "v3corr: a bad state descriptor is refused before the first sink block");
+        }
+
+        // the sources-released notification: exactly once, after every K/V source read, before the state section
+        {
+            const fs::path p = dir / "v3rel.bin";
+            auto sources = sources_from(original);
+            size_t reads = 0, reads_at_release = SIZE_MAX;
+            bool released = false, read_after_release = false;
+            for (auto& s : sources)
+                s.read = [&, raw = s.read](size_t part, size_t offset, void* dst, size_t c2) {
+                    if (released) read_after_release = true;
+                    ++reads;
+                    return raw(part, offset, dst, c2);
+                };
+            uint64_t last_done = 0, total = 0, done_at_release = UINT64_MAX;
+            SessionWriteOptions v3;
+            v3.layout_v3 = true;
+            v3.progress = [&](uint64_t done, uint64_t t) { last_done = done; total = t; };
+            v3.on_sources_released = [&]() {
+                if (!released) { released = true; reads_at_release = reads; done_at_release = last_done; }
+                else check(false, "v3rel: the notification fires exactly once");
+            };
+            check(session_file_write(p.string(), [&]() { SavedConversation m = original; m.kv.clear(); return m; }(),
+                                     sources, id, written, error, v3),
+                  "v3rel: the write succeeds");
+            check(released && reads_at_release == reads && !read_after_release,
+                  "v3rel: the notification fires after the last K/V source read and none follows it");
+            check(done_at_release != UINT64_MAX && done_at_release < total && last_done == total,
+                  "v3rel: the state bytes are written after the notification (the K/V came first)");
+            fs::remove(p);
+            // a v1 write fires it only at the end: the state section precedes the K/V there
+            const fs::path v1p = dir / "v1rel.bin";
+            released = false; reads_at_release = SIZE_MAX; done_at_release = UINT64_MAX; last_done = 0; total = 0;
+            reads = 0;
+            SessionWriteOptions v1;
+            v1.progress = [&](uint64_t done, uint64_t t) { last_done = done; total = t; };
+            v1.on_sources_released = [&]() {
+                if (!released) { released = true; done_at_release = last_done; }
+            };
+            check(session_file_write(v1p.string(), original, id, written, error, v1), "v3rel: a v1 write succeeds");
+            check(released && done_at_release == total, "v3rel: v1 fires the notification only after everything");
+            fs::remove(v1p);
+            // a failed source read still fires it, exactly once
+            auto broken = sources_from(original);
+            broken[1].read = [](size_t, size_t, void*, size_t) { return false; };
+            const fs::path bp = dir / "v3rel-broken.bin";
+            released = false;
+            v3.on_sources_released = [&]() { released = true; };
+            check(!session_file_write(bp.string(), [&]() { SavedConversation m = original; m.kv.clear(); return m; }(),
+                                      broken, id, written, error, v3) && released,
+                  "v3rel: a failed source read still releases the waiter");
+            check(!fs::exists(bp) && no_temp(dir), "v3rel: the failed write leaves nothing");
+            // a write fault still fires it
+            released = false;
+            v3.on_sources_released = [&]() { released = true; };
+            v3.fault = [](const char* step) { return std::strcmp(step, "write") == 0 ? EIO : 0; };
+            const fs::path fp = dir / "v3rel-fault.bin";
+            check(!session_file_write(fp.string(), original, id, written, error, v3) && released,
+                  "v3rel: a write fault still releases the waiter");
+            v3.fault = {};
+            // a preflight refusal (before any disk access) does not fire it
+            released = false;
+            v3.on_sources_released = [&]() { released = true; };
+            v3.min_free_bytes = 1ull << 60;
+            const fs::path rp = dir / "v3rel-refused.bin";
+            check(!session_file_write(rp.string(), original, id, written, error, v3) && !released,
+                  "v3rel: a preflight refusal fires nothing");
+        }
+
+        // v3 delta records: version 3 in the log, sized and read exactly, applied over a base
+        {
+            SavedConversation grown = sample();
+            grown.live.ids.push_back(9001);
+            grown.checkpoints.back() = checkpoint(1002, 7);
+            for (size_t i = 0; i < grown.kv.size(); ++i) {
+                const std::array<ConversationBuffer*, 5> parts = {&grown.kv[i].k, &grown.kv[i].v, &grown.kv[i].k_scale,
+                                                                  &grown.kv[i].v_scale, &grown.kv[i].pooled};
+                for (size_t part = 0; part < 5; ++part) {
+                    if (parts[part]->size() <= 1024) continue;
+                    ConversationBuffer& b = *parts[part];
+                    b.visit(1024, b.size() - 1024, [&](uint8_t* q, size_t c2, size_t at2) {
+                        for (size_t j = 0; j < c2; ++j) q[j] = uint8_t((at2 + j) * 37u + i + part);
+                        return true;
+                    });
+                }
+            }
+            SavedConversation meta = grown;
+            meta.kv.clear();
+            auto sources = sources_from(grown);
+            for (auto& s : sources)
+                for (size_t part = 0; part < 5; ++part)
+                    s.first_bytes[part] = s.sizes[part] > 1024 ? 1024 : 0;
+            const fs::path log = dir / "v3.dlog";
+            SessionWriteOptions v3; v3.layout_v3 = true;
+            // the released notification fires after the record's K/V, before its state section
+            size_t reads = 0, reads_at_release = SIZE_MAX;
+            bool released = false, read_after_release = false;
+            for (auto& s : sources) {
+                auto raw = s.read;
+                s.read = [&, raw](size_t part, size_t offset, void* dst, size_t c2) {
+                    if (released) read_after_release = true;
+                    ++reads;
+                    return raw(part, offset, dst, c2);
+                };
+            }
+            v3.on_sources_released = [&]() { if (!released) { released = true; reads_at_release = reads; } };
+            bool overflow = false;
+            const uint64_t estimate = session_delta_record_bytes(meta, sources, &overflow, false, true);
+            uint64_t rec = 0;
+            check(!overflow && session_delta_write(log.string(), 0, meta, sources, (int64_t) grown.live.ids.size(),
+                                                  id, rec, error, v3) && rec == estimate,
+                  "v3delta: the record writes and the v3 sizing matches it");
+            check(released && reads_at_release == reads && !read_after_release,
+                  "v3delta: the notification fires after the record's K/V reads");
+            const std::vector<char> log_bytes = slurp(log);
+            check(read_u64(log_bytes, 8) == 3, "v3delta: the record version is 3");
+            SessionDeltaRecord r;
+            uint64_t next = 0;
+            check(session_delta_read(log.string(), 0, rec, id, {}, r, next, error) && next == rec &&
+                  r.meta.live.ids == grown.live.ids && r.kv_offset[0][0] == 1024 && r.kv_bytes[0][0] > 0,
+                  "v3delta: the record reads back whole with its K/V directory");
+            // apply it over plain host buffers: the record's tails land at their offsets
+            std::vector<std::array<std::vector<uint8_t>, 5>> rebuilt(grown.kv.size());
+            for (size_t l = 0; l < grown.kv.size(); ++l) {
+                const std::array<const ConversationBuffer*, 5> parts = {&grown.kv[l].k, &grown.kv[l].v,
+                                                                        &grown.kv[l].k_scale, &grown.kv[l].v_scale,
+                                                                        &grown.kv[l].pooled};
+                for (size_t part = 0; part < 5; ++part) {
+                    std::vector<uint8_t> full(parts[part]->size());
+                    parts[part]->visit(0, full.size(), [&](const uint8_t* q, size_t c2, size_t at2) {
+                        std::memcpy(full.data() + at2, q, c2); return true;
+                    });
+                    rebuilt[l][part] = std::move(full);
+                }
+            }
+            // start from the PREVIOUS bytes: apply over the base image's buffers, then only the tails change
+            SavedConversation base = sample();
+            auto sink = [&](size_t layer, size_t part, uint64_t offset, const void* data, size_t c2) {
+                if (layer >= rebuilt.size() || offset > rebuilt[layer][part].size() ||
+                    c2 > rebuilt[layer][part].size() - offset) return false;
+                std::memcpy(rebuilt[layer][part].data() + offset, data, c2);
+                return true;
+            };
+            for (size_t l = 0; l < base.kv.size(); ++l) {
+                const std::array<const ConversationBuffer*, 5> parts = {&base.kv[l].k, &base.kv[l].v,
+                                                                        &base.kv[l].k_scale, &base.kv[l].v_scale,
+                                                                        &base.kv[l].pooled};
+                for (size_t part = 0; part < 5; ++part) {
+                    std::vector<uint8_t> full(parts[part]->size());
+                    parts[part]->visit(0, full.size(), [&](const uint8_t* q, size_t c2, size_t at2) {
+                        std::memcpy(full.data() + at2, q, c2); return true;
+                    });
+                    rebuilt[l][part] = std::move(full);
+                }
+            }
+            check(session_delta_apply(log.string(), 0, id, r, sink, error), "v3delta: the record applies");
+            bool rebuilt_same = true;
+            for (size_t l = 0; l < grown.kv.size(); ++l) {
+                const std::array<const ConversationBuffer*, 5> parts = {&grown.kv[l].k, &grown.kv[l].v,
+                                                                        &grown.kv[l].k_scale, &grown.kv[l].v_scale,
+                                                                        &grown.kv[l].pooled};
+                for (size_t part = 0; part < 5; ++part) {
+                    std::vector<uint8_t> want(parts[part]->size());
+                    parts[part]->visit(0, want.size(), [&](const uint8_t* q, size_t c2, size_t at2) {
+                        std::memcpy(want.data() + at2, q, c2); return true;
+                    });
+                    rebuilt_same = rebuilt_same && rebuilt[l][part] == want;
+                }
+            }
+            check(rebuilt_same, "v3delta: the record's tails rebuild the grown K/V exactly");
+            // a corrupt state descriptor in a v3 record is refused before any block is applied
+            auto corrupted = log_bytes;
+            uint64_t states_at = 40 + 21 * 8 + 8;   // magic..first_token, the geo prefix, the K/V count
+            for (size_t l = 0; l < r.kv_bytes.size(); ++l) {
+                states_at += 7 * 8;
+                for (size_t part = 0; part < 5; ++part) states_at += 16 + r.kv_bytes[l][part];
+            }
+            const uint64_t bad_codec = 9;   // the live gdn's codec word: ids count + 1001 ids + imgs count + 1 img
+            std::memcpy(corrupted.data() + states_at + 8 + 1001 * 4 + 8 + 16, &bad_codec, 8);
+            const fs::path clog = dir / "v3-corrupt.dlog";
+            spit(clog, corrupted);
+            size_t calls = 0;
+            check(!session_delta_apply(clog.string(), 0, id, r,
+                  [&](size_t, size_t, uint64_t, const void*, size_t) { ++calls; return true; }, error) &&
+                  calls == 0 && error.find("codec") != std::string::npos,
+                  "v3delta: a bad record state descriptor is refused before any block is applied");
+            fs::remove(log);
+            fs::remove(clog);
+        }
+
+        // mixed chains: the base file's format and the record version are independent.  A restore walks the base
+        // then every record; v2 base + v3 delta, v3 base + v2 delta, v1 base + v3 delta and v3 base + v1 delta must
+        // all rebuild the newest state exactly.
+        {
+            SavedConversation grown = sample();
+            grown.live.ids.push_back(4242);
+            for (size_t i = 0; i < grown.kv.size(); ++i) {
+                const std::array<ConversationBuffer*, 5> parts = {&grown.kv[i].k, &grown.kv[i].v, &grown.kv[i].k_scale,
+                                                                  &grown.kv[i].v_scale, &grown.kv[i].pooled};
+                for (size_t part = 0; part < 5; ++part) {
+                    if (parts[part]->size() <= 2048) continue;
+                    ConversationBuffer& b = *parts[part];
+                    b.visit(2048, b.size() - 2048, [&](uint8_t* q, size_t c2, size_t at2) {
+                        for (size_t j = 0; j < c2; ++j) q[j] = uint8_t((at2 + j) * 53u + i + part);
+                        return true;
+                    });
+                }
+            }
+            SavedConversation meta = grown;
+            meta.kv.clear();
+            auto delta_sources = sources_from(grown);
+            for (auto& s : delta_sources)
+                for (size_t part = 0; part < 5; ++part)
+                    s.first_bytes[part] = s.sizes[part] > 2048 ? 2048 : 0;
+            // one v2 record needs the RHT codec (the only v2-record maker); the rest ride the plain samples
+            SavedConversation rht_meta = rht_kv_sample();
+            rht_meta.live.ids.push_back(5150);
+            SavedConversation rht_grown = rht_meta;
+            for (size_t i = 0; i < rht_grown.kv.size(); ++i) {
+                const std::array<ConversationBuffer*, 5> parts = {&rht_grown.kv[i].k, &rht_grown.kv[i].v,
+                                                                  &rht_grown.kv[i].k_scale, &rht_grown.kv[i].v_scale,
+                                                                  &rht_grown.kv[i].pooled};
+                for (size_t part = 0; part < 5; ++part) {
+                    if (parts[part]->size() <= 2048) continue;
+                    ConversationBuffer& b = *parts[part];
+                    b.visit(2048, b.size() - 2048, [&](uint8_t* q, size_t c2, size_t at2) {
+                        for (size_t j = 0; j < c2; ++j) q[j] = uint8_t((at2 + j) * 59u + i + part);
+                        return true;
+                    });
+                }
+            }
+            SavedConversation rht_delta_meta = rht_grown;
+            rht_delta_meta.kv.clear();
+            auto rht_sources = sources_from(rht_grown);
+            for (auto& s : rht_sources)
+                for (size_t part = 0; part < 5; ++part)
+                    s.first_bytes[part] = s.sizes[part] > 2048 ? 2048 : 0;
+
+            struct Combo {
+                const char* label;
+                bool base_v3, base_ref, delta_v3, delta_rht, use_rht_sample;
+            };
+            const Combo combos[] = {
+                {"v2base+v3delta", false, true, true, false, false},
+                {"v3base+v2delta", true, false, false, true, true},
+                {"v1base+v3delta", false, false, true, false, false},
+                {"v3base+v1delta", true, false, false, false, false},
+            };
+            for (const Combo& c : combos) {
+                const SavedConversation& newest = c.use_rht_sample ? rht_grown : grown;
+                const fs::path base = dir / (std::string("mix-") + c.label + ".sess");
+                const fs::path log = dir / (std::string("mix-") + c.label + ".dlog");
+                SessionWriteOptions bwo;
+                bwo.layout_v3 = c.base_v3;
+                bwo.state_ref = c.base_ref;
+                if (c.base_ref) {
+                    SavedConversation s = sample();
+                    s.checkpoints = {homo(s.live, 10, 5, 9)};
+                    check(session_file_write(base.string(), s, id, written, error, bwo) &&
+                          file_version_of(slurp(base)) == 2, "mix: the v2 base writes");
+                } else {
+                    const SavedConversation s = c.use_rht_sample ? rht_meta : sample();
+                    check(session_file_write(base.string(), s, id, written, error, bwo) &&
+                          file_version_of(slurp(base)) == (c.base_v3 ? 3 : 1),
+                          "mix: the base writes in its format");
+                }
+                const SavedConversation& dmeta = c.use_rht_sample ? rht_delta_meta : meta;
+                const auto& dsources = c.use_rht_sample ? rht_sources : delta_sources;
+                SessionWriteOptions dwo;
+                dwo.layout_v3 = c.delta_v3;
+                dwo.state_codec_rht = c.delta_rht;
+                uint64_t rec = 0;
+                check(session_delta_write(log.string(), 0, dmeta, dsources, (int64_t) newest.live.ids.size(), id,
+                                          rec, error, dwo) && rec > 0, "mix: the record writes");
+                check(read_u64(slurp(log), 8) == (c.delta_v3 ? 3 : c.delta_rht ? 2 : 1),
+                      "mix: the record is the expected version");
+                // restore: the base streamed, then the record applied, into plain buffers holding the base's bytes
+                std::vector<std::array<std::vector<uint8_t>, 5>> rebuilt(newest.kv.size());
+                SavedConversation base_meta;
+                std::vector<std::array<uint64_t, 5>> base_sizes;
+                check(session_file_read_streamed(base.string(), id, base_meta, n, error, {}, &base_sizes),
+                      "mix: the base reads streamed");
+                for (size_t l = 0; l < newest.kv.size(); ++l) {
+                    const std::array<const ConversationBuffer*, 5> parts = {&newest.kv[l].k, &newest.kv[l].v,
+                                                                            &newest.kv[l].k_scale, &newest.kv[l].v_scale,
+                                                                            &newest.kv[l].pooled};
+                    for (size_t part = 0; part < 5; ++part) rebuilt[l][part].resize(parts[part]->size());
+                }
+                auto sink = [&](size_t layer, size_t part, uint64_t offset, const void* data, size_t c2) {
+                    if (layer >= rebuilt.size() || offset > rebuilt[layer][part].size() ||
+                        c2 > rebuilt[layer][part].size() - offset) return false;
+                    std::memcpy(rebuilt[layer][part].data() + offset, data, c2);
+                    return true;
+                };
+                SessionReadLimits lim;
+                SessionStatus st;
+                check(session_file_apply_streamed(base.string(), id, sink, base_sizes, error, &st, nullptr),
+                      "mix: the base applies");
+                SessionDeltaRecord r;
+                uint64_t next = 0;
+                check(session_delta_read(log.string(), 0, rec, id, {}, r, next, error) && next == rec,
+                      "mix: the record reads");
+                check(session_delta_apply(log.string(), 0, id, r, sink, error), "mix: the record applies");
+                bool same_state = true;
+                for (size_t l = 0; l < newest.kv.size(); ++l) {
+                    const std::array<const ConversationBuffer*, 5> parts = {&newest.kv[l].k, &newest.kv[l].v,
+                                                                            &newest.kv[l].k_scale, &newest.kv[l].v_scale,
+                                                                            &newest.kv[l].pooled};
+                    for (size_t part = 0; part < 5; ++part) {
+                        std::vector<uint8_t> want(parts[part]->size());
+                        parts[part]->visit(0, want.size(), [&](const uint8_t* q, size_t c2, size_t at2) {
+                            std::memcpy(want.data() + at2, q, c2); return true;
+                        });
+                        same_state = same_state && rebuilt[l][part] == want;
+                    }
+                }
+                check(same_state, (std::string("mix: ") + c.label + " rebuilds the newest K/V exactly").c_str());
+                fs::remove(base);
+                fs::remove(log);
+            }
+        }
+
+        // ---- the background-state sink (SessionWriteOptions::background_state): byte parity with the synchronous
+        // v3 write across the size and codec matrix; the sources-released notification fires while the writer
+        // thread is still mid-file; write/flush/rename/dir_flush faults report exactly as the synchronous path
+        {
+            // the option requires the v3 layout: anything else is refused before any disk access
+            {
+                const fs::path p = dir / "bg-need-v3.bin";
+                SessionWriteOptions bad;
+                bad.background_state = true;   // layout_v3 left off
+                SessionStatus st;
+                check(!session_file_write(p.string(), original, id, written, error, bad, &st) &&
+                      st.error == SessionError::invalid && !fs::exists(p),
+                      "bg: background_state without layout_v3 is an invalid-option refusal, nothing written");
+                const fs::path log = dir / "bg-need-v3.dlog";
+                SavedConversation meta = original;
+                meta.kv.clear();
+                auto sources = sources_from(original);
+                uint64_t rec = 0;
+                check(!session_delta_write(log.string(), 0, meta, sources, (int64_t) original.live.ids.size(),
+                                          id, rec, error, bad, &st) &&
+                      st.error == SessionError::invalid && !fs::exists(log),
+                      "bg: a background delta without layout_v3 is refused the same way");
+            }
+
+            // byte parity with the synchronous v3 write, and a full read round-trip of the background file
+            const auto both_ways = [&](const SavedConversation& image, const std::vector<SessionKvSource>* sources,
+                                       bool rht, const std::string& label) {
+                const fs::path sync_p = dir / ("bg-" + label + "-sync.bin");
+                const fs::path bg_p = dir / ("bg-" + label + "-bg.bin");
+                SessionWriteOptions sync_v3, bg_v3;
+                sync_v3.layout_v3 = true;
+                sync_v3.state_codec_rht = rht;
+                bg_v3.layout_v3 = true;
+                bg_v3.state_codec_rht = rht;
+                bg_v3.background_state = true;
+                check(session_file_write(sync_p.string(), image, id, written, error, sync_v3),
+                      ("bg: the synchronous v3 write succeeds (" + label + ")").c_str());
+                size_t bg_bytes = 0;
+                check(session_file_write(bg_p.string(), image, id, bg_bytes, error, bg_v3) && bg_bytes == written,
+                      ("bg: the background write succeeds (" + label + ")").c_str());
+                check(slurp(bg_p) == slurp(sync_p),
+                      ("bg: the background file is byte-identical to the synchronous v3 file (" + label + ")").c_str());
+                SavedConversation back;
+                size_t n2 = 0;
+                SessionStatus st;
+                check(session_file_read(bg_p.string(), id, back, n2, error, {}, &st) && st.file_version == 3,
+                      ("bg: the background file reads back (" + label + ")").c_str());
+                if (rht) {
+                    // the codec is lossy: the GDN arrays decode to the logical size with finite values, every other
+                    // byte is exact
+                    check(back.live.gdn.size() == image.live.gdn.size() &&
+                          rht::all_finite(back.live.gdn.data(), back.live.gdn.size()),
+                          ("bg: the background RHT GDN decodes logical-size and finite (" + label + ")").c_str());
+                    SavedConversation want = image, got = back;
+                    want.live.gdn.clear(); got.live.gdn.clear();
+                    for (auto& c : want.checkpoints) c.gdn.clear();
+                    for (auto& c : got.checkpoints) c.gdn.clear();
+                    check(same(want, got),
+                          ("bg: everything but the lossy GDN arrays is exact (" + label + ")").c_str());
+                } else {
+                    check(same(back, image),
+                          ("bg: the background file reads back exactly (" + label + ")").c_str());
+                }
+                fs::remove(sync_p);
+                fs::remove(bg_p);
+            };
+            both_ways(original, nullptr, false, "raw");
+            both_ways(rht_kv_sample(), nullptr, true, "rht");
+            {
+                SavedConversation meta = original;
+                meta.kv.clear();
+                auto sources = sources_from(original);
+                both_ways(meta, &sources, false, "raw-sources");
+                SavedConversation rht_image = rht_kv_sample();
+                SavedConversation rht_meta = rht_image;
+                rht_meta.kv.clear();
+                auto rht_sources = sources_from(rht_image);
+                both_ways(rht_meta, &rht_sources, true, "rht-sources");
+                std::vector<SessionKvSource> none;
+                both_ways(meta, &none, false, "no-kv");
+            }
+
+            // the 16 MiB buffer boundaries: payload ending exactly on a block edge, one byte past it, spanning
+            // three blocks, and a header-only file; the tail is padded and truncated back to the exact size
+            const size_t block = 16u << 20;
+            for (const size_t extra : {size_t(0), size_t(1), block, size_t(1) + block}) {
+                const size_t k_at = 64 + 21 * 8 + 8 + 7 * 8 + 8;   // header, geo prefix, count, layer header, k size
+                SavedConversation s;
+                for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(100 + i);
+                s.layer_lo = 0; s.layer_hi = 48;
+                s.live = checkpoint(64, 1);
+                ConversationKv kv;
+                kv.format = 2; kv.cells = 1024; kv.heads = 2; kv.head_dim = 256;
+                kv.page_size = 64; kv.pooled_rows = 0; kv.idx_dim = 128;
+                const size_t k_size = block - k_at + extra;
+                if (extra == 0) check((k_at + k_size) % block == 0,
+                                      "bg: the edge case lands the K/V end exactly on a buffer boundary");
+                kv.k = pattern(k_size, 9);
+                s.kv.push_back(std::move(kv));
+                const std::string label = "edge-" + std::to_string(extra);
+                const fs::path sync_p = dir / ("bg-" + label + "-sync.bin");
+                const fs::path bg_p = dir / ("bg-" + label + "-bg.bin");
+                SessionWriteOptions sync_v3, bg_v3;
+                sync_v3.layout_v3 = true;
+                bg_v3.layout_v3 = true;
+                bg_v3.background_state = true;
+                check(session_file_write(sync_p.string(), s, id, written, error, sync_v3),
+                      "bg: the edge synchronous write succeeds");
+                check(session_file_write(bg_p.string(), s, id, written, error, bg_v3),
+                      "bg: the edge background write succeeds");
+                const std::vector<char> a = slurp(sync_p), b = slurp(bg_p);
+                check(a == b && b.size() == written,
+                      "bg: the edge files are byte-identical and cut back to the exact size");
+                SavedConversation back;
+                size_t n2 = 0;
+                check(session_file_read(bg_p.string(), id, back, n2, error) && same(back, s),
+                      "bg: the edge file reads back exactly");
+                fs::remove(sync_p);
+                fs::remove(bg_p);
+            }
+
+            // progress: (0, total) first, monotone, (total, total) last - reported from the writer thread
+            {
+                const fs::path p = dir / "bg-prog.bin";
+                SessionWriteOptions bg_v3;
+                bg_v3.layout_v3 = true;
+                bg_v3.background_state = true;
+                std::mutex m;
+                std::vector<std::pair<uint64_t, uint64_t>> reports;
+                bg_v3.progress = [&](uint64_t done, uint64_t total) {
+                    std::lock_guard<std::mutex> lk(m);
+                    reports.emplace_back(done, total);
+                };
+                check(session_file_write(p.string(), original, id, written, error, bg_v3), "bg: the progress write succeeds");
+                bool shape = !reports.empty() && reports.front().first == 0 && reports.front().second == written;
+                for (size_t i = 1; shape && i < reports.size(); ++i)
+                    shape = reports[i].second == written && reports[i].first >= reports[i - 1].first;
+                shape = shape && reports.back().first == written;
+                check(shape, "bg: progress starts at (0,total), is monotone and ends at (total,total)");
+                fs::remove(p);
+            }
+
+            // timings: every stage is filled, and the caller reads them only after the call returned
+            {
+                const fs::path p = dir / "bg-time.bin";
+                SavedConversation meta = original;
+                meta.kv.clear();
+                auto sources = sources_from(original);
+                SessionWriteTimings times{};
+                SessionWriteOptions bg_v3;
+                bg_v3.layout_v3 = true;
+                bg_v3.background_state = true;
+                bg_v3.timings = &times;
+                check(session_file_write(p.string(), meta, sources, id, written, error, bg_v3),
+                      "bg: the timed write succeeds");
+                check(times.kv_source_ns != 0 && times.kv_ns >= times.kv_source_ns && times.state_ns != 0 &&
+                      times.os_write_ns != 0 && times.finish_ns != 0 && times.publish_ns != 0,
+                      "bg: every write stage is timed");
+                fs::remove(p);
+            }
+
+            // the sources-released notification fires while the writer thread is still mid-file: the request
+            // thread could already continue.  The writer is held at its first progress report (both buffers may be
+            // queued); no sleeps, only condition variables.
+            {
+                SavedConversation meta = original;
+                meta.kv.clear();
+                auto sources = sources_from(original);
+                std::mutex pm, rm;
+                std::condition_variable pcv, rcv;
+                bool gate = false;
+                size_t reports = 0;
+                std::atomic<bool> fired{false}, write_done{false};
+                bool ok = false;
+                size_t bg_bytes = 0;
+                SessionWriteOptions bg_v3;
+                bg_v3.layout_v3 = true;
+                bg_v3.background_state = true;
+                bg_v3.progress = [&](uint64_t, uint64_t) {
+                    // the (0,total) announcement runs on the calling thread before any byte is read; gate the
+                    // writer thread's block reports only (the first of them follows its first completed block)
+                    if (++reports < 2) return;
+                    std::unique_lock<std::mutex> lk(pm);
+                    pcv.wait(lk, [&] { return gate; });
+                };
+                bg_v3.on_sources_released = [&] {
+                    std::lock_guard<std::mutex> lk(rm);
+                    fired.store(true);
+                    rcv.notify_all();
+                };
+                std::thread worker([&] {
+                    std::string e;
+                    ok = session_file_write((dir / "bg-rel.bin").string(), meta, sources, id, bg_bytes, e, bg_v3);
+                    write_done.store(true);
+                });
+                {
+                    std::unique_lock<std::mutex> lk(rm);
+                    rcv.wait(lk, [&] { return fired.load(); });
+                }
+                check(fired.load() && !write_done.load(),
+                      "bg: the notification fires while the writer thread is still draining the file");
+                {
+                    std::lock_guard<std::mutex> lk(pm);
+                    gate = true;
+                }
+                pcv.notify_all();
+                worker.join();
+                check(ok && write_done.load() && slurp(dir / "bg-rel.bin").size() == bg_bytes,
+                      "bg: the gated write completes, joins and publishes the full file");
+                fs::remove(dir / "bg-rel.bin");
+            }
+
+            // injected failures at each step, exactly the synchronous path's reporting (R3/R5 for the background sink)
+            {
+                const fs::path p = dir / "bg-fault.bin";
+                const std::vector<char> old(10, 'q');
+                struct Case { const char* step; int err; SessionError kind; bool published; };
+                for (const Case c : {Case{"write", ENOSPC, SessionError::storage, false},
+                                     Case{"write", EIO, SessionError::io, false},
+                                     Case{"file_flush", EIO, SessionError::io, false},
+                                     Case{"rename", EACCES, SessionError::io, false},
+                                     Case{"dir_flush", EIO, SessionError::io, true}}) {
+                    spit(p, old);
+                    SessionWriteOptions bg_v3;
+                    bg_v3.layout_v3 = true;
+                    bg_v3.background_state = true;
+                    const std::string want = c.step;
+                    const int code = c.err;
+                    bg_v3.fault = [want, code](const char* step) { return want == step ? code : 0; };
+                    SessionStatus st;
+                    const bool ok = session_file_write(p.string(), original, id, written, error, bg_v3, &st);
+                    check(!ok && st.error == c.kind, "bg-fault: the failure has its kind");
+                    check(st.published == c.published, "bg-fault: publication reported exactly");
+                    if (c.published) {
+                        check(file_version_of(slurp(p)) == 3 && error.find("replaced") != std::string::npos,
+                              "bg-fault: after a published failure the new file is there and the error says so");
+                    } else {
+                        check(slurp(p) == old, "bg-fault: a failure before the rename keeps the old file");
+                    }
+                    check(no_temp(dir), "bg-fault: no temporary left behind");
+                }
+            }
+
+            // a writer-thread failure wakes a producer blocked on full buffers (a 3-block K/V): no deadlock, the
+            // permanent error stops the source reads, the old file survives, no temporary is left
+            {
+                const fs::path p = dir / "bg-wake.bin";
+                const std::vector<char> old(7, 'z');
+                spit(p, old);
+                SavedConversation s;
+                for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(100 + i);
+                s.layer_lo = 0; s.layer_hi = 48;
+                s.live = checkpoint(64, 1);
+                ConversationKv kv;
+                kv.format = 2; kv.cells = 1024; kv.heads = 2; kv.head_dim = 256;
+                kv.page_size = 64; kv.pooled_rows = 0; kv.idx_dim = 128;
+                kv.k = pattern(3 * block + 13, 4);
+                s.kv.push_back(std::move(kv));
+                size_t reads = 0;
+                std::atomic<bool> released{false};
+                SessionWriteOptions bg_v3;
+                bg_v3.layout_v3 = true;
+                bg_v3.background_state = true;
+                bg_v3.fault = [](const char* step) { return std::strcmp(step, "write") == 0 ? ENOSPC : 0; };
+                bg_v3.on_sources_released = [&] { released.store(true); };
+                SavedConversation meta = s;
+                meta.kv.clear();
+                auto sources = sources_from(s);
+                for (auto& src : sources)
+                    src.read = [&reads, raw = src.read](size_t part, size_t offset, void* dst, size_t c2) {
+                        ++reads;
+                        return raw(part, offset, dst, c2);
+                    };
+                SessionStatus st;
+                check(!session_file_write(p.string(), meta, sources, id, written, error, bg_v3, &st) &&
+                      st.error == SessionError::storage,
+                      "bg-wake: the write fails with the injected failure's kind (the blocked producer woke)");
+                check(released.load(), "bg-wake: the waiter is released on the failure path too");
+                check(slurp(p) == old && no_temp(dir), "bg-wake: the old file survives, no temporary left");
+            }
+
+            // a failed K/V source read: the write fails as 'io', the notification still fires, nothing is left
+            {
+                SavedConversation meta = original;
+                meta.kv.clear();
+                auto sources = sources_from(original);
+                sources[1].read = [](size_t, size_t, void*, size_t) { return false; };
+                bool released = false;
+                SessionWriteOptions bg_v3;
+                bg_v3.layout_v3 = true;
+                bg_v3.background_state = true;
+                bg_v3.on_sources_released = [&] { released = true; };
+                const fs::path p = dir / "bg-srcfail.bin";
+                SessionStatus st;
+                check(!session_file_write(p.string(), meta, sources, id, written, error, bg_v3, &st) &&
+                      st.error == SessionError::io && released,
+                      "bg-src: a failed source read fails the write as 'io' and still releases the waiter");
+                check(!fs::exists(p) && no_temp(dir), "bg-src: the failed write leaves nothing");
+            }
+
+            // delta records: the background append is byte-identical to the synchronous v3 record and reads back;
+            // a write fault leaves the committed length untouched
+            {
+                SavedConversation grown = sample();
+                grown.live.ids.push_back(9001);
+                grown.checkpoints.back() = checkpoint(1002, 7);
+                SavedConversation meta = grown;
+                meta.kv.clear();
+                auto sources = sources_from(grown);
+                for (auto& s : sources)
+                    for (size_t part = 0; part < 5; ++part)
+                        s.first_bytes[part] = s.sizes[part] > 1024 ? 1024 : 0;
+                const fs::path a = dir / "bg-d-sync.dlog", b = dir / "bg-d-bg.dlog";
+                SessionWriteOptions sync_v3, bg_v3;
+                sync_v3.layout_v3 = true;
+                bg_v3.layout_v3 = true;
+                bg_v3.background_state = true;
+                uint64_t rec_a = 0, rec_b = 0;
+                check(session_delta_write(a.string(), 0, meta, sources, (int64_t) grown.live.ids.size(), id, rec_a,
+                                          error, sync_v3) &&
+                          session_delta_write(b.string(), 0, meta, sources, (int64_t) grown.live.ids.size(), id, rec_b,
+                                              error, bg_v3) && rec_b == rec_a,
+                      "bg-d: both records write");
+                check(slurp(b) == slurp(a) && read_u64(slurp(b), 8) == 3,
+                      "bg-d: the background record is byte-identical and version 3");
+                SessionDeltaRecord r;
+                uint64_t next = 0;
+                check(session_delta_read(b.string(), 0, rec_b, id, {}, r, next, error) && next == rec_b &&
+                      r.meta.live.ids == grown.live.ids,
+                      "bg-d: the background record reads back");
+                // a write fault mid-append: the record is refused, the committed length is not advanced
+                SessionWriteOptions bad = bg_v3;
+                bad.fault = [](const char* step) { return std::strcmp(step, "write") == 0 ? ENOSPC : 0; };
+                uint64_t rec_c = 0;
+                check(!session_delta_write(b.string(), rec_b, meta, sources, (int64_t) grown.live.ids.size(), id, rec_c,
+                                          error, bad) && rec_c == 0,
+                      "bg-d: a write fault refuses the append");
+                check(slurp(b) == slurp(a), "bg-d: the committed bytes are untouched by the failed append");
+                fs::remove(a);
+                fs::remove(b);
+            }
+        }
     }
 
     fs::remove_all(dir);

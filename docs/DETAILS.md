@@ -921,6 +921,38 @@ to a disk-only reader under a matching identity and parsing marks it invalid, th
 up files before changing versions. Follow the standing production rule: never roll back or delete cache files by hand
 without authorization.
 
+**Background state writes (`--conversation-cache-disk-background-state`, opt-in; needs
+`--conversation-cache-disk-only`).** This flag applies only to ordinary disk-only base and delta saves. It writes a
+format-v3 `.sess` file and version-3 delta records. The fixed header, geometry, layer range and cvec flag still come
+first. The K/V headers and payload follow, then the live and checkpoint RAW/REF/RHT descriptors, the payload hash and
+the end marker. The v1/v2 formats and their state-first order stay unchanged when this flag is off. The reader accepts
+all three versions, including mixed-version delta chains. Before a v3 apply pass sends any K/V to the session, it
+validates the later state section too. An old binary that does not know v3 refuses it; the engine-version identity
+keeps such a file separate from older caches.
+
+The save still waits while it captures the live state and reads the K/V sources. The v3 order lets it release those
+sources before encoding the state. One background task then owns the captured state and the file target. Its producer
+encodes RHT and hashes bytes while a second thread writes the OS buffers. Two preallocated, aligned 16 MiB buffers
+alternate, with backpressure when both are full. RHT still uses its bounded scratch; there is no extra whole-K/V copy
+or second complete compressed-state copy. The task holds one live state and one deepest checkpoint, moved from the
+admitted capture rather than copied again. This arithmetic is not a measured whole-process RSS limit: the task can
+overlap the next request.
+
+The running session can continue after the last K/V source read. It does not wait for the state encoding, fsync or
+file publication. There is at most one unfinished task. A later cache lookup, another save, erase or eviction, prefix
+or slot operation, and shutdown first joins it and publishes on the request thread. The background task never mutates
+the cache index or the current conversation's chain pointers. The log separates `blocked` time up to the source
+release, `save` time through file-task completion, and the later `boundary` join/publication time. Idle time between
+completion and that boundary is not save time. The detailed stages nest: source reads are inside K/V, RHT is inside
+state, and the tail write is inside both OS write and finish; do not add them together.
+
+A delta reservation carries its base path and size, committed length and accounted log length. Publication rejects an
+old task if that generation changed. An uncommitted tail is not a committed record. If a delta fails after its sources
+were released, Strata does not read the changed live K/V again to make a base file. It keeps the old committed chain
+and retries at a later save. A failure before the sources are released can still use the frozen capture for a base.
+A new root prefix uses the existing synchronous save instead; prefix files, slot SAVE/RESTORE, RAM-history parking
+and RAM-eviction spills keep their old formats and behavior.
+
 ### Session files (disk)
 
 The conversation the engine holds can be saved to a file and restored later, also after a

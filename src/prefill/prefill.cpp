@@ -4054,8 +4054,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool wmma_l = use_mmq && pf_wmma() && !fused_l && on_peer.empty() && lay.native &&
                                             (mmq_dt == 42 || mmq_dt == 20) && !lay.fmt[(size_t) l].tail_off &&
                                             strata::kernels::iq_row_bytes(mmq_gt, N) > 0;
-                        if (wmma_l && std::getenv("STRATA_PF_WMMA_TRACE") != nullptr)
-                            std::fprintf(stderr, "pf_wmma: layer %lld on the FP16 tiles (gu=%d down=%d)\n", (long long) l, mmq_gt, mmq_dt);
                         if (use_mmq && mmq_plan().wmma_only[(size_t) l] && !wmma_l) {
                             err = "prefill: an IQ1_M layer in the MMQ grouping needs the WMMA tiles, which this chunk cannot take";
                             return false;

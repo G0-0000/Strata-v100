@@ -1,8 +1,10 @@
 // CPU-only tests for the on-disk session format (include/strata/core/conversation_file.hpp).
 // Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no CUDA, no model.
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/rht_state_codec.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -14,6 +16,7 @@
 #include <fstream>
 #include <string>
 #include <new>
+#include <limits>
 #include <utility>
 #include <vector>
 #ifndef _WIN32
@@ -39,6 +42,25 @@ int checks = 0;
 void check(bool ok, const char* label) {
     ++checks;
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
+}
+
+void set_decreasing_available_admission(SessionReadLimits& limits, uint64_t initial_screen,
+                                        uint64_t& remaining, std::vector<uint64_t>& asks) {
+    limits.admit = [&remaining, &asks, initial_screen, screen_pending = true](uint64_t need, std::string& why) mutable {
+        asks.push_back(need);
+        if (screen_pending) {
+            screen_pending = false;
+            if (need == initial_screen) return true;
+            why = "unexpected initial read screen";
+            return false;
+        }
+        if (need > remaining) {
+            why = "simulated available RAM exhausted";
+            return false;
+        }
+        remaining -= need;
+        return true;
+    };
 }
 
 ConversationBuffer pattern(size_t n, uint8_t seed) {
@@ -90,6 +112,29 @@ SavedConversation sample() {
         kv.pooled = pattern(layer == 2 ? 0 : 9 * 128 * 4, uint8_t(layer + 40));
         s.kv.push_back(std::move(kv));
     }
+    return s;
+}
+
+SavedConversation rht_sample(size_t tokens = 32) {
+    SavedConversation s;
+    s.geometry = {2560, 2, 4, 128, 16, 1, 2, 1, 6144, 24, 2, 256, 4, 128, 4, 320, 512, 640};
+    s.layer_lo = 0;
+    s.layer_hi = 2;
+    s.live = checkpoint(tokens, 1);
+    s.checkpoints.push_back(checkpoint(tokens / 2, 2));
+    rht::Layout layout{};
+    if (!rht::layout_from(s.geometry, s.layer_lo, s.layer_hi, layout)) std::abort();
+    auto finite_state = [&](uint8_t seed) {
+        auto state = bytes_of((size_t) layout.logical, seed);
+        for (size_t at = 0; at < state.size(); at += sizeof(float)) {
+            const int value = (int) ((at / sizeof(float)) % 127) - 63;
+            const float f = (float) value * 0.001f + (float) seed * 0.01f;
+            std::memcpy(state.data() + at, &f, sizeof(f));
+        }
+        return state;
+    };
+    s.live.gdn = finite_state(1);
+    s.checkpoints[0].gdn = finite_state(2);
     return s;
 }
 
@@ -233,6 +278,29 @@ V2Fixture fx_v2(const SavedConversation& s, const std::vector<std::array<bool, 5
     return fx;
 }
 void fx_patch(std::vector<char>& f, size_t off, uint64_t v) { std::memcpy(f.data() + off, &v, 8); }
+uint64_t read_u64(const std::vector<char>& f, size_t off) {
+    uint64_t value = 0;
+    std::memcpy(&value, f.data() + off, sizeof(value));
+    return value;
+}
+void repair_payload_hash(std::vector<char>& f) {
+    const uint64_t payload = read_u64(f, 32);
+    const uint64_t hash = session_hash64(f.data() + 64, payload, 0);
+    std::memcpy(f.data() + 64 + payload, &hash, sizeof(hash));
+}
+size_t skip_v2_checkpoint(const std::vector<char>& f, size_t at, size_t& gdn, size_t& ple) {
+    const uint64_t ids = read_u64(f, at);
+    at += 8 + (size_t) ids * sizeof(int32_t);
+    const uint64_t images = read_u64(f, at);
+    at += 8 + (size_t) images * 16;
+    for (size_t state = 0; state < 5; ++state) {
+        if (state == 0) gdn = at;
+        if (state == 1) ple = at;
+        const uint64_t stored = read_u64(f, at + 16);
+        at += 24 + (size_t) stored;
+    }
+    return at + 8;
+}
 } // namespace
 
 int main() {
@@ -326,8 +394,8 @@ int main() {
     // other model or other configuration
     check(rejects(good, {id.model ^ 1, id.config}, "model"), "different model fingerprint rejected");
     check(rejects(good, {id.model, id.config ^ 1}, "config"), "different configuration rejected");
-    // wrong version: header field patched and header hash recomputed so only the version differs.  (Version 2 is now
-    // the state-ref format, so the unsupported-version probe must use a version no reader accepts.)
+    // wrong version: header field patched and header hash recomputed so only the version differs. (Version 2 is the
+    // descriptor-coded state format, so the unsupported-version probe must use a version no reader accepts.)
     {
         auto d = image;
         uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
@@ -911,7 +979,7 @@ int main() {
         l = {};
         uint64_t asked = 0;
         l.admit = [&](uint64_t n, std::string& why) { asked = n; why = "no room for it"; return false; };
-        check(rejects(good, id, "no room", l) && asked == session_read_peak_bytes(image.size()) &&
+        check(rejects(good, id, "no room", l) && asked == session_read_peak_bytes(image.size(), l) &&
               asked > image.size(), "admission sees the parse's peak (more than the file) and can refuse");
         l = {};
         bool admitted = false;
@@ -1047,7 +1115,7 @@ int main() {
         }
         check(sizes_ok, "streamed: the read pass reports every K/V part size");
         check(asked == session_read_stream_peak_bytes(image.size(), lim) &&
-              asked < session_read_peak_bytes(image.size()),
+              asked < session_read_peak_bytes(image.size(), lim),
               "streamed: the preflight prices the blocks and the metadata, not the snapshot");
         check(meta.kv.size() == original.kv.size(), "streamed: keeps the K/V layer headers");
         bool headers_ok = true, no_bytes = true;
@@ -1548,6 +1616,356 @@ int main() {
         }
     }
 
+    // RHT codec 2: ordinary state descriptors are opt-in, recurrent-only, lossy, and streamed to the file sink.
+    {
+        SavedConversation h = rht_sample();
+        rht::Layout layout{};
+        check(rht::layout_from(h.geometry, h.layer_lo, h.layer_hi, layout), "rht file: fixture layout");
+        const fs::path raw_path = dir / "rht-raw.bin";
+        const fs::path encoded_path = dir / "rht-encoded.bin";
+        size_t raw_bytes = 0, encoded_bytes = 0;
+        check(session_file_write(raw_path.string(), h, id, raw_bytes, error), "rht file: default RAW write");
+        SessionWriteOptions codec_options;
+        codec_options.state_codec_rht = true;
+        check(session_file_write(encoded_path.string(), h, id, encoded_bytes, error, codec_options),
+              "rht file: opt-in write");
+        const std::vector<char> raw_file = slurp(raw_path);
+        const std::vector<char> encoded_file = slurp(encoded_path);
+        check(file_version_of(raw_file) == 1 && file_version_of(encoded_file) == 2,
+              "rht file: codec 2 selects session version 2 only when enabled");
+        check(raw_bytes == raw_file.size() && encoded_bytes == encoded_file.size(),
+              "rht file: the count pass and written file sizes agree");
+        size_t cursor = 64 + 18 * 8 + 3 * 8;
+        size_t live_gdn = 0, live_ple = 0;
+        cursor = skip_v2_checkpoint(encoded_file, cursor, live_gdn, live_ple);
+        const uint64_t checkpoints = read_u64(encoded_file, cursor);
+        cursor += 8;
+        size_t saved_gdn = 0, saved_ple = 0;
+        check(checkpoints == 1, "rht file: one checkpoint is present");
+        skip_v2_checkpoint(encoded_file, cursor, saved_gdn, saved_ple);
+        check(read_u64(encoded_file, live_gdn) == 2 && read_u64(encoded_file, saved_gdn) == 2,
+              "rht file: live and checkpoint GDN use codec 2, never REF id 1");
+        check(read_u64(encoded_file, live_ple) == 0 && read_u64(encoded_file, saved_ple) == 0,
+              "rht file: non-GDN arrays stay RAW");
+        check(raw_file.size() - encoded_file.size() == 2 * (layout.logical - layout.stored) - 160,
+              "rht file: exact count reflects two compressed states and v2 descriptors");
+
+        SavedConversation back;
+        size_t read_bytes = 0;
+        check(session_file_read(encoded_path.string(), id, back, read_bytes, error) && read_bytes == encoded_bytes &&
+              back.live.gdn.size() == layout.logical && back.checkpoints[0].gdn.size() == layout.logical &&
+              rht::all_finite(back.live.gdn.data(), back.live.gdn.size()),
+              "rht file: one-shot decode allocates logical f32 size");
+        check(back.live.ids == h.live.ids && back.live.ple == h.live.ple && back.live.tails == h.live.tails &&
+              back.live.dead == h.live.dead && back.live.block_pos == h.live.block_pos &&
+              back.checkpoints[0].ids == h.checkpoints[0].ids && back.checkpoints[0].ple == h.checkpoints[0].ple &&
+              back.checkpoints[0].tails == h.checkpoints[0].tails && back.checkpoints[0].dead == h.checkpoints[0].dead &&
+              back.checkpoints[0].block_pos == h.checkpoints[0].block_pos,
+              "rht file: non-GDN state remains byte-identical");
+
+        SessionReadLimits limits;
+        limits.max_tokens = 32;
+        limits.max_checkpoints = 1;
+        limits.max_kv_layers = 0;
+        limits.max_state_bytes = {layout.logical, 77, 301, 64, 8};
+        limits.geometry = h.geometry;
+        limits.layer_range = std::make_pair(h.layer_lo, h.layer_hi);
+        const auto stream_metadata_covers_states = [](uint64_t file_bytes, const SessionReadLimits& bound) {
+            if (bound.max_tokens == UINT64_MAX || bound.max_checkpoints == UINT64_MAX ||
+                std::find(bound.max_state_bytes.begin(), bound.max_state_bytes.end(), UINT64_MAX) !=
+                    bound.max_state_bytes.end()) return false;
+            uint64_t one = 64;
+            const uint64_t token_bytes = sizeof(int32_t) + sizeof(ConversationImageKey);
+            if (file_bytes < one || bound.max_tokens > (file_bytes - one) / token_bytes) return false;
+            one += bound.max_tokens * token_bytes;
+            for (uint64_t bytes : bound.max_state_bytes) {
+                if (bytes > file_bytes - one) return false;
+                one += bytes;
+            }
+            return !one || bound.max_checkpoints <= (file_bytes - one) / one;
+        };
+        const uint64_t expected_expansion = 2 * (layout.logical - layout.stored);
+        bool saw_stream_preflight = false;
+        const uint64_t rht_stream_need = session_read_stream_peak_bytes(encoded_bytes, limits, 2, expected_expansion);
+        const uint64_t rht_stream_baseline = session_read_stream_peak_bytes(encoded_bytes, limits, 2, 0);
+        limits.admit = [&](uint64_t need, std::string&) {
+            if (need == rht_stream_baseline) saw_stream_preflight = true;
+            return true;
+        };
+        const uint64_t raw_stream_need = session_read_stream_peak_bytes(encoded_bytes, limits, 1, 0);
+        const uint64_t expected_stream_extra = stream_metadata_covers_states(encoded_bytes, limits) ? 0 : expected_expansion;
+        check(rht_stream_need == raw_stream_need + expected_stream_extra && rht_stream_need < UINT64_MAX &&
+              session_read_stream_peak_bytes(encoded_bytes, limits, 2, 0) == raw_stream_need,
+              "rht memory: finite state bounds cover decoded arrays unless the file-size cap truncates that estimate");
+        const uint64_t raw_one_shot_need = session_read_peak_bytes(encoded_bytes, limits, 1);
+        const uint64_t rht_one_shot_need = session_read_peak_bytes(encoded_bytes, limits, 2, expected_expansion);
+        SessionReadLimits raw_zero = limits;
+        raw_zero.max_state_bytes.fill(0);
+        raw_zero.admit = {};
+        check(rht_one_shot_need >= raw_one_shot_need + expected_expansion &&
+              session_read_peak_bytes(encoded_bytes, limits, 2, 0) == raw_one_shot_need &&
+              raw_one_shot_need == session_read_peak_bytes(encoded_bytes, raw_zero, 1, 0),
+              "rht memory: mixed RAW/RHT descriptors add only the RHT logical-minus-stored bytes");
+        SessionReadLimits open_limits;
+        check(session_read_peak_bytes(encoded_bytes, open_limits, 2) < UINT64_MAX &&
+              session_read_stream_peak_bytes(encoded_bytes, open_limits, 2) < UINT64_MAX,
+              "rht memory: open limits keep both read estimates finite");
+        SavedConversation streamed;
+        std::vector<std::array<uint64_t, 5>> kv_sizes;
+        SessionStatus status;
+        size_t streamed_bytes = 0;
+        check(session_file_read_streamed(encoded_path.string(), id, streamed, streamed_bytes, error, limits,
+                                          &kv_sizes, &status) && status.file_version == 2 && saw_stream_preflight,
+              "rht file: streaming metadata pass decodes codec 2");
+        SessionReadLimits open_rht;
+        std::vector<uint64_t> open_rht_asks;
+        uint64_t open_rht_remaining = session_read_peak_bytes(encoded_bytes, open_rht, 2, 0);
+        const uint64_t open_rht_baseline = open_rht_remaining;
+        set_decreasing_available_admission(open_rht, open_rht_baseline, open_rht_remaining, open_rht_asks);
+        SavedConversation open_back; size_t open_bytes = 0;
+        const bool open_rht_ok = session_file_read(encoded_path.string(), id, open_back, open_bytes, error, open_rht);
+        const uint64_t open_rht_duplicated_peak =
+            session_read_peak_bytes(open_bytes, open_rht, 2, expected_expansion);
+        check(open_rht_ok && !open_rht_asks.empty() && open_rht_asks.front() == open_rht_baseline &&
+              open_rht_remaining < open_rht_baseline && open_rht_duplicated_peak > open_rht_remaining,
+              "rht memory: shrinking available RAM admits logical arrays without a repeated full-peak request");
+        SessionReadLimits open_stream;
+        std::vector<uint64_t> open_stream_asks;
+        uint64_t open_stream_remaining = session_read_stream_peak_bytes(encoded_bytes, open_stream, 2, 0);
+        const uint64_t open_stream_baseline = open_stream_remaining;
+        set_decreasing_available_admission(open_stream, open_stream_baseline, open_stream_remaining, open_stream_asks);
+        SavedConversation open_meta; size_t open_stream_bytes = 0;
+        const bool open_stream_ok = session_file_read_streamed(encoded_path.string(), id, open_meta, open_stream_bytes,
+                                                                 error, open_stream);
+        const uint64_t open_stream_duplicated_peak =
+            session_read_stream_peak_bytes(open_stream_bytes, open_stream, 2, expected_expansion);
+        check(open_stream_ok && !open_stream_asks.empty() && open_stream_asks.front() == open_stream_baseline &&
+              open_stream_remaining < open_stream_baseline && open_stream_duplicated_peak > open_stream_remaining,
+              "rht memory: shrinking streamed-read RAM admits logical arrays without a repeated full-peak request");
+        SessionReadLimits bounds;
+        session_read_bounds_from_meta(streamed, bounds);
+        bounds.admit = [](uint64_t, std::string&) { return true; };
+        check(session_file_apply_streamed(encoded_path.string(), id,
+              [](size_t, size_t, uint64_t, const void*, size_t) { return true; }, kv_sizes, error, nullptr, &bounds),
+              "rht file: streaming apply pass decodes codec 2");
+
+        // Mixed descriptors: the live GDN is RHT, while a non-finite checkpoint GDN falls back to RAW.
+        SavedConversation mixed = rht_sample();
+        const float mixed_infinity = std::numeric_limits<float>::infinity();
+        std::memcpy(mixed.checkpoints[0].gdn.data(), &mixed_infinity, sizeof(mixed_infinity));
+        const fs::path mixed_path = dir / "rht-mixed-codecs.bin";
+        SessionWriteOptions mixed_options;
+        mixed_options.state_codec_rht = true;
+        size_t mixed_written = 0;
+        check(session_file_write(mixed_path.string(), mixed, id, mixed_written, error, mixed_options) &&
+              file_version_of(slurp(mixed_path)) == 2, "rht file: mixed RHT/RAW descriptors write v2");
+        const std::vector<char> mixed_file = slurp(mixed_path);
+        size_t mixed_cursor = 64 + 18 * 8 + 3 * 8;
+        size_t mixed_live_gdn = 0, mixed_live_ple = 0;
+        mixed_cursor = skip_v2_checkpoint(mixed_file, mixed_cursor, mixed_live_gdn, mixed_live_ple);
+        mixed_cursor += 8;
+        size_t mixed_saved_gdn = 0, mixed_saved_ple = 0;
+        skip_v2_checkpoint(mixed_file, mixed_cursor, mixed_saved_gdn, mixed_saved_ple);
+        check(read_u64(mixed_file, mixed_live_gdn) == 2 && read_u64(mixed_file, mixed_saved_gdn) == 0,
+              "rht file: one RHT descriptor and one RAW fallback coexist");
+        const uint64_t mixed_extra = layout.logical - layout.stored;
+        SessionReadLimits mixed_finite = limits;
+        std::vector<uint64_t> mixed_finite_asks;
+        mixed_finite.admit = [&](uint64_t need, std::string&) { mixed_finite_asks.push_back(need); return true; };
+        SavedConversation mixed_meta;
+        std::vector<std::array<uint64_t, 5>> mixed_kv_sizes;
+        size_t mixed_stream_bytes = 0;
+        SessionStatus mixed_status;
+        const bool mixed_stream_ok = session_file_read_streamed(mixed_path.string(), id, mixed_meta, mixed_stream_bytes,
+                                                                 error, mixed_finite, &mixed_kv_sizes, &mixed_status);
+        float mixed_stream_checkpoint_gdn = 0.0f;
+        if (mixed_stream_ok && !mixed_meta.checkpoints.empty() &&
+            mixed_meta.checkpoints[0].gdn.size() >= sizeof(mixed_stream_checkpoint_gdn))
+            std::memcpy(&mixed_stream_checkpoint_gdn, mixed_meta.checkpoints[0].gdn.data(), sizeof(float));
+        check(mixed_stream_ok && mixed_status.file_version == 2 && std::isinf(mixed_stream_checkpoint_gdn),
+              "rht file: mixed descriptors decode with finite bounds");
+        const uint64_t mixed_finite_need =
+            session_read_stream_peak_bytes(mixed_stream_bytes, mixed_finite, 2, mixed_extra);
+        const uint64_t mixed_finite_base = session_read_stream_peak_bytes(mixed_stream_bytes, mixed_finite, 2, 0);
+        const uint64_t mixed_finite_extra =
+            stream_metadata_covers_states(mixed_stream_bytes, mixed_finite) ? 0 : mixed_extra;
+        check(mixed_finite_need == mixed_finite_base + mixed_finite_extra &&
+              std::find(mixed_finite_asks.begin(), mixed_finite_asks.end(), mixed_finite_base) !=
+                  mixed_finite_asks.end(),
+              "rht memory: finite streaming screen is preserved and logical allocations are admitted individually");
+        SessionReadLimits mixed_open;
+        std::vector<uint64_t> mixed_open_asks;
+        uint64_t mixed_open_remaining = session_read_peak_bytes(fs::file_size(mixed_path), mixed_open, 2, 0);
+        const uint64_t mixed_open_baseline = mixed_open_remaining;
+        set_decreasing_available_admission(mixed_open, mixed_open_baseline, mixed_open_remaining, mixed_open_asks);
+        SavedConversation mixed_back;
+        size_t mixed_bytes = 0;
+        const bool mixed_read_ok = session_file_read(mixed_path.string(), id, mixed_back, mixed_bytes, error, mixed_open);
+        float mixed_checkpoint_gdn = 0.0f;
+        if (mixed_read_ok && !mixed_back.checkpoints.empty() &&
+            mixed_back.checkpoints[0].gdn.size() >= sizeof(mixed_checkpoint_gdn))
+            std::memcpy(&mixed_checkpoint_gdn, mixed_back.checkpoints[0].gdn.data(), sizeof(float));
+        const uint64_t mixed_duplicated_peak =
+            session_read_peak_bytes(mixed_bytes, mixed_open, 2, mixed_extra);
+        check(mixed_read_ok && std::isinf(mixed_checkpoint_gdn) && !mixed_open_asks.empty() &&
+              mixed_open_asks.front() == mixed_open_baseline && mixed_open_remaining < mixed_open_baseline &&
+              mixed_duplicated_peak > mixed_open_remaining,
+              "rht memory: mixed one-shot decode succeeds as available RAM shrinks, unlike a repeated full-peak ask");
+        SessionReadLimits mixed_open_stream;
+        std::vector<uint64_t> mixed_open_stream_asks;
+        uint64_t mixed_open_stream_remaining =
+            session_read_stream_peak_bytes(fs::file_size(mixed_path), mixed_open_stream, 2, 0);
+        const uint64_t mixed_open_stream_baseline = mixed_open_stream_remaining;
+        set_decreasing_available_admission(mixed_open_stream, mixed_open_stream_baseline,
+                                           mixed_open_stream_remaining, mixed_open_stream_asks);
+        SavedConversation mixed_open_meta;
+        size_t mixed_open_stream_bytes = 0;
+        const bool mixed_open_stream_ok = session_file_read_streamed(mixed_path.string(), id, mixed_open_meta,
+                                                                      mixed_open_stream_bytes, error, mixed_open_stream);
+        float mixed_open_stream_gdn = 0.0f;
+        if (mixed_open_stream_ok && !mixed_open_meta.checkpoints.empty() &&
+            mixed_open_meta.checkpoints[0].gdn.size() >= sizeof(mixed_open_stream_gdn))
+            std::memcpy(&mixed_open_stream_gdn, mixed_open_meta.checkpoints[0].gdn.data(), sizeof(float));
+        const uint64_t mixed_stream_duplicated_peak =
+            session_read_stream_peak_bytes(mixed_open_stream_bytes, mixed_open_stream, 2, mixed_extra);
+        check(mixed_open_stream_ok && std::isinf(mixed_open_stream_gdn) && !mixed_open_stream_asks.empty() &&
+              mixed_open_stream_asks.front() == mixed_open_stream_baseline &&
+              mixed_open_stream_remaining < mixed_open_stream_baseline &&
+              mixed_stream_duplicated_peak > mixed_open_stream_remaining,
+              "rht memory: mixed streamed decode succeeds as available RAM shrinks, unlike a repeated full-peak ask");
+
+        SavedConversation fallback = rht_sample();
+        const float infinity = std::numeric_limits<float>::infinity();
+        std::memcpy(fallback.live.gdn.data(), &infinity, sizeof(infinity));
+        std::memcpy(fallback.checkpoints[0].gdn.data(), &infinity, sizeof(infinity));
+        const fs::path fallback_raw = dir / "rht-fallback-raw.bin";
+        const fs::path fallback_opt = dir / "rht-fallback-opt.bin";
+        size_t fallback_bytes = 0, fallback_opt_bytes = 0;
+        check(session_file_write(fallback_raw.string(), fallback, id, fallback_bytes, error),
+              "rht file: non-finite baseline writes");
+        check(session_file_write(fallback_opt.string(), fallback, id, fallback_opt_bytes, error, codec_options) &&
+              file_version_of(slurp(fallback_opt)) == 1 && slurp(fallback_raw) == slurp(fallback_opt),
+              "rht file: non-finite GDN falls back to byte-identical RAW before counting");
+
+        SavedConversation overflow_fallback = rht_sample();
+        const float largest_finite = std::numeric_limits<float>::max();
+        const auto fill_largest_finite = [&](std::vector<uint8_t>& state) {
+            for (size_t at = 0; at < state.size(); at += sizeof(largest_finite))
+                std::memcpy(state.data() + at, &largest_finite, sizeof(largest_finite));
+        };
+        fill_largest_finite(overflow_fallback.live.gdn);
+        fill_largest_finite(overflow_fallback.checkpoints[0].gdn);
+        check(rht::all_finite(overflow_fallback.live.gdn.data(), layout.logical) &&
+              !rht::preflight_encode(overflow_fallback.live.gdn.data(), layout),
+              "rht file: finite extreme input that overflows the Hadamard transform is rejected by preflight");
+        const fs::path overflow_raw = dir / "rht-overflow-raw.bin";
+        const fs::path overflow_opt = dir / "rht-overflow-opt.bin";
+        size_t overflow_raw_bytes = 0, overflow_opt_bytes = 0;
+        check(session_file_write(overflow_raw.string(), overflow_fallback, id, overflow_raw_bytes, error),
+              "rht file: finite extreme RAW baseline writes");
+        check(session_file_write(overflow_opt.string(), overflow_fallback, id, overflow_opt_bytes, error,
+                                 codec_options) &&
+              file_version_of(slurp(overflow_opt)) == 1 && overflow_raw_bytes == overflow_opt_bytes &&
+              slurp(overflow_raw) == slurp(overflow_opt),
+              "rht file: finite transform overflow selects RAW before sizing and writes byte-identical output");
+        SavedConversation overflow_back;
+        size_t overflow_read_bytes = 0;
+        check(session_file_read(overflow_opt.string(), id, overflow_back, overflow_read_bytes, error) &&
+              overflow_read_bytes == overflow_opt_bytes && same(overflow_back, overflow_fallback),
+              "rht file: finite extreme RAW fallback saves and round-trips exactly");
+
+        SavedConversation rht_delta = rht_sample();
+        rht_delta.kv.clear();
+        const fs::path rht_delta_path = dir / "rht-delta.dlog";
+        uint64_t rht_delta_bytes = 0;
+        check(session_delta_write(rht_delta_path.string(), 0, rht_delta, {},
+                                  (int64_t) rht_delta.live.ids.size(), id, rht_delta_bytes, error,
+                                  codec_options) && read_u64(slurp(rht_delta_path), 8) == 2,
+              "rht delta: opt-in write emits a v2 record with RHT state");
+        SessionReadLimits rht_delta_limits;
+        rht_delta_limits.max_tokens = 32;
+        rht_delta_limits.max_checkpoints = 1;
+        rht_delta_limits.max_kv_layers = 0;
+        rht_delta_limits.max_state_bytes = {layout.logical, 77, 301, 64, 8};
+        rht_delta_limits.geometry = rht_delta.geometry;
+        rht_delta_limits.layer_range = std::make_pair(rht_delta.layer_lo, rht_delta.layer_hi);
+        std::vector<uint64_t> rht_delta_asks;
+        const auto read_rht_delta = [&](uint64_t allowance, SessionDeltaRecord& record, uint64_t& next,
+                                        std::vector<uint64_t>& asks) {
+            SessionReadLimits bounded = rht_delta_limits;
+            bounded.admit = [&](uint64_t need, std::string& why) {
+                asks.push_back(need);
+                if (need > allowance) {
+                    why = "controlled RHT delta allocation refusal";
+                    return false;
+                }
+                return true;
+            };
+            return session_delta_read(rht_delta_path.string(), 0, rht_delta_bytes, id, bounded,
+                                      record, next, error);
+        };
+        SessionDeltaRecord rht_delta_record;
+        uint64_t rht_delta_next = 0;
+        check(read_rht_delta(UINT64_MAX, rht_delta_record, rht_delta_next, rht_delta_asks) &&
+              rht_delta_next == rht_delta_bytes && rht_delta_record.meta.live.gdn.size() == layout.logical &&
+              rht::all_finite(rht_delta_record.meta.live.gdn.data(), layout.logical) && !rht_delta_asks.empty(),
+              "rht delta: v2 state decodes with finite bounds");
+        const uint64_t largest_delta_allocation =
+            *std::max_element(rht_delta_asks.begin(), rht_delta_asks.end());
+        SessionDeltaRecord exact_delta_record;
+        uint64_t exact_delta_next = 0;
+        std::vector<uint64_t> exact_delta_asks;
+        check(read_rht_delta(largest_delta_allocation, exact_delta_record, exact_delta_next, exact_delta_asks) &&
+              exact_delta_next == rht_delta_bytes,
+              "rht delta admission: the largest parser allocation is accepted at its exact boundary");
+        SessionDeltaRecord denied_delta_record;
+        uint64_t denied_delta_next = 0;
+        std::vector<uint64_t> denied_delta_asks;
+        check(!read_rht_delta(largest_delta_allocation - 1, denied_delta_record, denied_delta_next,
+                              denied_delta_asks) &&
+              error.find("controlled RHT delta allocation refusal") != std::string::npos &&
+              *std::max_element(denied_delta_asks.begin(), denied_delta_asks.end()) == largest_delta_allocation,
+              "rht delta admission: one byte below the largest allocation is refused");
+        const uint64_t delta_metadata = session_read_meta_peak_bytes(rht_delta_limits);
+        const uint64_t delta_record = delta_metadata + sizeof(SessionDeltaRecord) - sizeof(SavedConversation);
+        const uint64_t known_delta_peak_floor =
+            std::max(delta_record + sizeof(SessionDeltaRecord), delta_record + delta_metadata) +
+            (16ull << 20) + 64 + rht::decode_scratch_bytes();
+        check(rht::decode_scratch_bytes() == 768 &&
+              session_delta_walk_peak_bytes(rht_delta_limits) >= known_delta_peak_floor,
+              "rht delta admission: the walk estimate includes the 64-byte term and codec decode scratch");
+
+        auto malformed = encoded_file;
+        fx_patch(malformed, live_gdn, 3);
+        repair_payload_hash(malformed);
+        const fs::path unknown = dir / "rht-unknown-codec.bin";
+        spit(unknown, malformed);
+        check(rejects(unknown, id, "unknown state array codec"), "rht file: unknown codec is refused");
+        malformed = encoded_file;
+        fx_patch(malformed, live_gdn + 8, layout.logical + 4);
+        repair_payload_hash(malformed);
+        const fs::path wrong_logical = dir / "rht-wrong-logical.bin";
+        spit(wrong_logical, malformed);
+        check(rejects(wrong_logical, id, "logical size"), "rht file: wrong logical size is refused");
+        malformed = encoded_file;
+        fx_patch(malformed, live_gdn + 16, layout.stored + 1);
+        repair_payload_hash(malformed);
+        const fs::path wrong_stored = dir / "rht-wrong-stored.bin";
+        spit(wrong_stored, malformed);
+        check(rejects(wrong_stored, id, "stored size"), "rht file: wrong stored size is refused");
+        malformed = encoded_file;
+        fx_patch(malformed, live_ple, 2);
+        repair_payload_hash(malformed);
+        const fs::path wrong_array = dir / "rht-wrong-array.bin";
+        spit(wrong_array, malformed);
+        check(rejects(wrong_array, id, "only valid for gdn"), "rht file: codec 2 on non-GDN state is refused");
+        malformed = encoded_file;
+        malformed.resize(malformed.size() - 20);
+        spit(wrong_stored, malformed);
+        check(!session_file_read_streamed(wrong_stored.string(), id, streamed, streamed_bytes, error),
+              "rht file: truncated codec payload is refused in the streaming pass");
+    }
+
     // header-hash / version / reserved (PLAN 6.3, corrected): a patched version or reserved field with a RECOMPUTED
     // header hash reaches the unsupported-version / invalid-header checks; without the recompute the header checksum
     // fires first
@@ -1734,26 +2152,63 @@ int main() {
         check(rejects(f, id, "payload checksum"), "v2cut: a flipped payload byte fails the payload hash");
     }
 
-    // v2 memory admission (PLAN 6.4): the read keeps the v1 upfront screen, then checks EVERY real allocation point
-    // (ids/imgs, the live RAW arrays, each checkpoint's REF/RAW arrays, the checkpoint and K/V directories, the K/V
-    // buffers).  Refusing at each point in turn must give a memory failure with the file's version known (2), never
+    // v2 memory admission (PLAN 6.4): the read screens its baseline and checks every actual allocation (ids/imgs,
+    // live/checkpoint logical state arrays, the checkpoint and K/V directories, K/V buffers).
+    // Refusing at each point in turn must give a memory failure with the file's version known (2), never
     // touching the caller's output; the per-point asks price single allocations, not a running total.
     {
         SavedConversation h = sample();
-        h.checkpoints = {homo(h.live, 10, 999, 0xbeefull)};
+        h.checkpoints = {homo(h.live, 10, 998, 0xbeefull), homo(h.live, 20, 999, 0xcafeull)};
         SessionWriteOptions sro; sro.state_ref = true;
         const fs::path p = dir / "ref-adm.bin";
         check(session_file_write(p.string(), h, id, written, error, sro), "v2adm: write");
+        const uint64_t multi_ref_extra = 2 * checkpoint_state_bytes(h.live);
+        SessionReadLimits finite_ref;
+        finite_ref.max_tokens = 1000;
+        finite_ref.max_checkpoints = 2;
+        finite_ref.max_kv_layers = 3;
+        finite_ref.max_state_bytes = {h.live.gdn.size(), h.live.ple.size(), h.live.tails.size(),
+                                      h.live.dead.size(), h.live.block_pos.size()};
+        std::vector<uint64_t> finite_ref_asks;
+        finite_ref.admit = [&](uint64_t need, std::string&) { finite_ref_asks.push_back(need); return true; };
+        SavedConversation finite_back; size_t finite_bytes = 0;
+        check(session_file_read(p.string(), id, finite_back, finite_bytes, error, finite_ref) && same(finite_back, h),
+              "v2adm: finite limits accept multiple REF descriptors");
+        const uint64_t finite_ref_base = session_read_peak_bytes(finite_bytes, finite_ref, 2, 0);
+        check(std::find(finite_ref_asks.begin(), finite_ref_asks.end(), finite_ref_base) != finite_ref_asks.end(),
+              "v2adm: finite initial peak screen remains in place");
+        std::vector<uint64_t> finite_stream_asks;
+        finite_ref.admit = [&](uint64_t need, std::string&) { finite_stream_asks.push_back(need); return true; };
+        SavedConversation finite_meta; size_t finite_stream_bytes = 0;
+        check(session_file_read_streamed(p.string(), id, finite_meta, finite_stream_bytes, error, finite_ref),
+              "v2adm: finite streaming read accepts multiple REF descriptors");
+        const uint64_t finite_stream_ref_need = session_read_stream_peak_bytes(
+            finite_stream_bytes, finite_ref, 2, multi_ref_extra);
+        const uint64_t finite_stream_base = session_read_stream_peak_bytes(finite_stream_bytes, finite_ref, 2, 0);
+        check(finite_stream_ref_need == finite_stream_base &&
+              std::find(finite_stream_asks.begin(), finite_stream_asks.end(), finite_stream_ref_need) !=
+                  finite_stream_asks.end(),
+              "v2adm: finite metadata bounds already price REF logical allocations, without double-counting");
         std::vector<uint64_t> asks;
         SessionReadLimits all;
-        all.admit = [&](uint64_t need, std::string&) { asks.push_back(need); return true; };
+        const uint64_t open_base = session_read_peak_bytes(fs::file_size(p), all, 2, 0);
+        uint64_t open_remaining = open_base;
+        set_decreasing_available_admission(all, open_base, open_remaining, asks);
         SavedConversation back; size_t n = 0;
-        check(session_file_read(p.string(), id, back, n, error, all) && same(back, h), "v2adm: an admitting read succeeds");
-        check(asks.size() > 1 && asks[0] == session_read_peak_bytes(fs::file_size(p)),
-              "v2adm: the upfront screen is the v1 ask, then per-allocation checks follow");
-        bool per_allocation = true;
-        for (size_t i = 1; i < asks.size(); ++i) per_allocation = per_allocation && asks[i] <= asks[0];
-        check(per_allocation, "v2adm: per-allocation asks price single allocations, not a cumulative total");
+        check(session_file_read(p.string(), id, back, n, error, all) && same(back, h),
+              "v2adm: multiple REF arrays restore as available RAM decreases");
+        const uint64_t open_refs = session_read_peak_bytes(fs::file_size(p), all, 2, multi_ref_extra);
+        const uint64_t open_stream_base = session_read_stream_peak_bytes(fs::file_size(p), all, 2, 0);
+        const uint64_t open_stream_refs = session_read_stream_peak_bytes(fs::file_size(p), all, 2, multi_ref_extra);
+        check(open_refs > open_base && open_stream_refs == open_stream_base + multi_ref_extra &&
+              open_refs < UINT64_MAX && open_stream_refs < UINT64_MAX,
+              "v2adm: default-open estimates price multiple REF copies without overflow or file-size clamping");
+        check(asks.size() > 1 && asks.front() == open_base && open_remaining < open_base &&
+              open_refs > open_remaining,
+              "v2adm: real logical allocations fit, but a repeated full-peak admission would fail");
+        bool asks_bounded = true;
+        for (size_t i = 1; i < asks.size(); ++i) asks_bounded = asks_bounded && asks[i] <= open_base;
+        check(asks_bounded, "v2adm: subsequent admissions price individual allocations, not the full read peak");
         for (size_t allow = 0; allow + 1 < asks.size(); ++allow) {
             SessionReadLimits l;
             size_t calls = 0;
@@ -1843,7 +2298,7 @@ int main() {
         std::vector<std::array<uint64_t, 5>> sizes;
         size_t n = 0;
         check(session_file_read_streamed(p.string(), id, meta, n, error, lim, &sizes), "v2str: the read pass succeeds");
-        check(asks.size() > 1 && asks[0] == session_read_stream_peak_bytes(fs::file_size(p), lim),
+        check(asks.size() > 1 && asks[0] == session_read_stream_peak_bytes(fs::file_size(p), lim, 2),
               "v2str: the read pass screens upfront, then checks each allocation (the I/O block included)");
         for (size_t allow = 0; allow + 1 < asks.size(); ++allow) {
             SessionReadLimits l;
@@ -1922,8 +2377,8 @@ int main() {
               "v2str: the legacy apply form (no bounds) still serves a v2 file");
     }
 
-    // the delta writer never takes the flag: a record for a homomorphic state is still a v1 record, sized and read
-    // exactly as before (PLAN 6.5: delta encoding and size goldens unchanged)
+    // the delta writer ignores the state-ref flag: a homomorphic state stays a v1 record when RHT is not requested,
+    // sized and read exactly as before
     {
         SavedConversation grown = sample();
         grown.live.ids.push_back(4242);

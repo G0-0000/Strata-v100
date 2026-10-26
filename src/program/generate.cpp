@@ -28,6 +28,7 @@
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/rht_state_codec.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/ple_residency.hpp"
@@ -838,6 +839,8 @@ struct Options {
     /// its live state is written once (format v2): the checkpoint's five state arrays become on-disk references to
     /// the live copy. Prefix saves only; not part of the config identity.
     bool conversation_cache_disk_state_ref = false;
+    /// --conversation-cache-disk-state-codec-rht: lossy recurrent GDN encoding for ordinary disk-only saves only.
+    bool conversation_cache_disk_state_codec_rht = false;
     int64_t conversation_cache_disk_mib = 8192;   // the spill directory's limit (0 = off)
     double conversation_cache_similarity = 0.0;   // least LCP/new-prompt fraction a disk hit may offer (range [0,1))
     int64_t conversation_cache_n_min = 0;         // least common-prefix tokens a disk hit may offer
@@ -1022,6 +1025,9 @@ void usage() {
                   "                       once - the checkpoint's five state arrays become on-disk references to the\n"
                   "                       live copy (session file format v2) - saving one full state copy per prefix\n"
                   "                       file (default off; prefix saves only; not part of the config identity)\n"
+                  "  --conversation-cache-disk-state-codec-rht  --conversation-cache-disk-only: lossy opt-in RHT+INT16\n"
+                  "                       for recurrent GDN state in ordinary base/delta files; convolution stays RAW.\n"
+                  "                       Prefixes are excluded; default off and not part of the config identity.\n"
                  "  --conversation-cache-disk-mib N  --serve: the spill directory's limit (default 8192; 0 = off)\n"
                  "  --conversation-cache-similarity F  --serve: least common-prefix fraction a disk hit may offer\n"
                  "                       (default 0 = any; range [0,1))\n"
@@ -3277,6 +3283,7 @@ int main(int argc, char** argv) {
             o.conversation_cache_disk_delta_percent = number;
         }
         else if (a == "--conversation-cache-disk-state-ref") o.conversation_cache_disk_state_ref = true;
+        else if (a == "--conversation-cache-disk-state-codec-rht") o.conversation_cache_disk_state_codec_rht = true;
         else if (a == "--conversation-cache-similarity") {
             const std::string value = next("--conversation-cache-similarity");
             char* end = nullptr;
@@ -3610,6 +3617,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata serve: warning: --conversation-cache-disk-state-ref needs --conversation-cache-disk-only; "
                              "it is off\n");
         o.conversation_cache_disk_state_ref = false;
+    }
+    if (o.serve && o.conversation_cache_disk_state_codec_rht && !o.conversation_cache_disk_only) {
+        std::fprintf(stderr, "strata serve: warning: --conversation-cache-disk-state-codec-rht needs "
+                             "--conversation-cache-disk-only; it is off\n");
+        o.conversation_cache_disk_state_codec_rht = false;
     }
     if (o.serve && !o.conversation_cache_spill_dir.empty() && !o.conversation_cache_disk_only &&
         (o.conversation_cache_mib == 0 || o.prompt_cache == 0 || o.conversation_cache_slots == 0 ||
@@ -10611,7 +10623,7 @@ int main(int argc, char** argv) {
                 meta.live.pinned = false;
                 size_t bytes = 0;
                 if (!conversation_spill.spill_streamed(meta, sources, bytes, e, true, true,
-                                                       o.conversation_cache_disk_state_ref)) {
+                                                       o.conversation_cache_disk_state_ref, false)) {
                     std::fprintf(stderr, "strata serve: conversation cache: prefix save failed (%s)\n", e.c_str());
                     return;
                 }
@@ -10646,6 +10658,17 @@ int main(int argc, char** argv) {
                     sl.tokens = live.size();
                     sl.images = live_imgs.size();
                     sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                    // Ordinary disk-only base/delta saves may encode RHT; slot SAVE and prefix saves do not.
+                    if (o.conversation_cache_disk_state_codec_rht) {
+                        const std::array<int64_t, 18> geometry = {
+                            g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads,
+                            g.ssm_v_heads, g.ssm_d_conv, g.ssm_conv_channels, g.ssm_value_dim,
+                            g.n_head, g.n_head_kv, g.head_dim, g.idx_q_heads, g.idx_key_dim,
+                            g.hc, g.hc_lr, g.n_expert, g.n_ff};
+                        strata::core::rht::Layout layout{};
+                        if (strata::core::rht::layout_from(geometry, 0, g.n_layers, layout))
+                            sl.codec_scratch = strata::core::rht::scratch_bytes(layout);
+                    }
                 }
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                 auto admit = [&](uint64_t need, std::string& w) {
@@ -10688,7 +10711,8 @@ int main(int argc, char** argv) {
                         if (strata::core::conversation_snapshot_sources_delta(meta, sources, view, ss, g,
                                                                               mtp.kv_state(), unchanged, e)) {
                             bool overflow = false;
-                            const uint64_t estimate = strata::core::session_delta_record_bytes(meta, sources, &overflow);
+                            const uint64_t estimate = strata::core::session_delta_record_bytes(
+                                meta, sources, &overflow, o.conversation_cache_disk_state_codec_rht);
                             // Keep the original rounding at 40; this path does not count the full session.
                             uint64_t compact_at = 0;
                             if (o.conversation_cache_disk_delta_percent == 40) {
@@ -10726,7 +10750,7 @@ int main(int argc, char** argv) {
                             } else {
                                 size_t written = 0;
                                 if (conversation_spill.spill_delta(index, meta, sources, (int64_t) live.size(), written,
-                                                                   e, durable)) {
+                                                                   e, durable, o.conversation_cache_disk_state_codec_rht)) {
                                     bytes = written;
                                     kept = chain_path;
                                     delta_written = true;
@@ -10751,7 +10775,8 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: conversation cache: disk save skipped (%s)\n", e.c_str());
                         return;
                     }
-                    if (!conversation_spill.spill_streamed(meta, sources, bytes, e, durable)) {
+                    if (!conversation_spill.spill_streamed(meta, sources, bytes, e, durable, false, false,
+                                                            o.conversation_cache_disk_state_codec_rht)) {
                         std::fprintf(stderr, "strata serve: conversation cache: disk save failed (%s); it will be read "
                                              "again when it returns\n", e.c_str());
                         return;

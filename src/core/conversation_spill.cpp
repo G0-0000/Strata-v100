@@ -620,7 +620,7 @@ bool ConversationSpillCache::spill(const SavedConversation& image, std::string& 
 
 bool ConversationSpillCache::spill_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
                                             size_t& bytes, std::string& error, bool durable, bool prefix,
-                                            bool state_ref) {
+                                            bool state_ref, bool state_codec_rht) {
     bytes = 0;
     if (!enabled_) return false;
     if (meta.live.ids.empty() || !meta.stage_images.empty() || !meta.kv.empty()) {
@@ -632,6 +632,7 @@ bool ConversationSpillCache::spill_streamed(const SavedConversation& meta, const
     SessionWriteOptions wo;
     wo.durable = durable;
     wo.state_ref = state_ref;   // only a prefix save passes this on; ordinary saves and the delta writer never do
+    wo.state_codec_rht = !prefix && state_codec_rht;
     SessionStatus st;
     if (!session_file_write(session, meta, kv, identity_, bytes, error, wo, &st)) {
         std::filesystem::remove(session, ec);
@@ -933,7 +934,7 @@ bool ConversationSpillCache::write_chain(const std::filesystem::path& chain, uin
 
 bool ConversationSpillCache::spill_delta(size_t index, const SavedConversation& meta,
                                          const std::vector<SessionKvSource>& kv, int64_t first_token,
-                                         size_t& bytes, std::string& error, bool durable) {
+                                         size_t& bytes, std::string& error, bool durable, bool state_codec_rht) {
     bytes = 0;
     if (!enabled_ || index >= entries_.size()) { error = "spill cache is disabled"; return false; }
     if (!delta_) { error = "delta chains are off"; return false; }
@@ -966,6 +967,7 @@ bool ConversationSpillCache::spill_delta(size_t index, const SavedConversation& 
     try {
         SessionWriteOptions opt;
         opt.durable = durable;
+        opt.state_codec_rht = state_codec_rht;
         SessionStatus st;
         uint64_t written = 0;
         if (!session_delta_write(entry.delta_path(), entry.delta_bytes, meta, kv, first_token, identity_,

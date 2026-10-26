@@ -87,7 +87,8 @@ public:
     // that any new conversation opening the same way resumes from.  Prefix entries persist: drop_superseded never
     // removes them and the disk budget evicts every ordinary conversation before one of them.
     bool spill_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv, size_t& bytes,
-                        std::string& error, bool durable = false, bool prefix = false, bool state_ref = false);
+                        std::string& error, bool durable = false, bool prefix = false, bool state_ref = false,
+                        bool state_codec_rht = false);
     // --conversation-cache-disk-delta: appends one delta record for an indexed entry instead of rewriting its file.
     // `meta` + `kv` describe the conversation's current state; kv[i].sizes are full part sizes and first_bytes the
     // offset each part's data starts at.  The record is written to the entry's `<stem>.dlog`, its committed length is
@@ -95,7 +96,8 @@ public:
     // at its last committed record.  `bytes` is the record's length.  On success the entry's sidecar describes the
     // new state. A prefix, disabled directory or incomplete/unusable entry refuses.
     bool spill_delta(size_t index, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
-                     int64_t first_token, size_t& bytes, std::string& error, bool durable = false);
+                     int64_t first_token, size_t& bytes, std::string& error, bool durable = false,
+                     bool state_codec_rht = false);
     // The index of the entry whose session file is `path`, or size() when none.
     size_t find(const std::string& path) const;
     // What a delta save needs to know about an entry (see generate.cpp): its token count, its deepest checkpoint,

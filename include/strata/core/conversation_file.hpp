@@ -178,9 +178,8 @@ struct SessionKvSource {
     std::function<bool(size_t part, size_t offset, void* dst, size_t n)> read;
     std::function<std::string()> error;
 };
-// Counts the exact size of a complete `.sess` file, including its header and trailer, using the serialization counting
-// path. Sources are counted at their full size; this does not read sources, copy GPU data, or perform file I/O.
-// On failure, `error` explains whether the conversation is invalid or its size cannot be represented.
+// Count the exact size of a complete `.sess` file without reading sources, copying GPU data or performing file I/O.
+// Failure reports invalid conversation data or a size that cannot be represented.
 bool session_file_full_bytes(const SavedConversation& image, const std::vector<SessionKvSource>& sources,
                              uint64_t& bytes, std::string& error);
 

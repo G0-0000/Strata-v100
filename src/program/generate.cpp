@@ -833,6 +833,7 @@ struct Options {
     /// --conversation-cache-disk-delta: with --conversation-cache-disk-only, a switch away appends only the K/V that
     /// changed since the state the disk already holds (the base file's K/V stays), instead of rewriting the file
     bool conversation_cache_disk_delta = false;
+    int64_t conversation_cache_disk_delta_percent = 40; // delta 链压实阈值；最低 64 MiB
     int64_t conversation_cache_disk_mib = 8192;   // the spill directory's limit (0 = off)
     double conversation_cache_similarity = 0.0;   // least LCP/new-prompt fraction a disk hit may offer (range [0,1))
     int64_t conversation_cache_n_min = 0;         // least common-prefix tokens a disk hit may offer
@@ -1009,6 +1010,9 @@ void usage() {
                   "                       K/V that changed since the state on disk (a chain of delta records after the\n"
                   "                       conversation's file) instead of rewriting the whole file; the chain is\n"
                   "                       compacted into a fresh file when its records outgrow the base\n"
+                  "  --conversation-cache-disk-delta-percent N  delta chain limit as a percent of the base file\n"
+                  "                       (default 40; range 1..100; 64 MiB minimum). Does not enable\n"
+                  "                       --conversation-cache-disk-delta, which must be set separately\n"
                  "  --conversation-cache-disk-mib N  --serve: the spill directory's limit (default 8192; 0 = off)\n"
                  "  --conversation-cache-similarity F  --serve: least common-prefix fraction a disk hit may offer\n"
                  "                       (default 0 = any; range [0,1))\n"
@@ -3253,6 +3257,16 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-spill-dir") o.conversation_cache_spill_dir = next("--conversation-cache-spill-dir");
         else if (a == "--conversation-cache-disk-only") o.conversation_cache_disk_only = true;
         else if (a == "--conversation-cache-disk-delta") o.conversation_cache_disk_delta = true;
+        else if (a == "--conversation-cache-disk-delta-percent") {
+            const std::string value = next("--conversation-cache-disk-delta-percent");
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 1 || number > 100) {
+                std::fprintf(stderr, "--conversation-cache-disk-delta-percent needs an integer in [1, 100]\n");
+                return 2;
+            }
+            o.conversation_cache_disk_delta_percent = number;
+        }
         else if (a == "--conversation-cache-similarity") {
             const std::string value = next("--conversation-cache-similarity");
             char* end = nullptr;
@@ -10659,12 +10673,30 @@ int main(int argc, char** argv) {
                                                                               mtp.kv_state(), unchanged, e)) {
                             bool overflow = false;
                             const uint64_t estimate = strata::core::session_delta_record_bytes(meta, sources, &overflow);
-                            const uint64_t compact_at = std::max<uint64_t>(64ull << 20, base_bytes / 5 * 2);
+                            // Keep the original rounding at 40; this path does not count the full session.
+                            uint64_t compact_at = 0;
+                            if (o.conversation_cache_disk_delta_percent == 40) {
+                                compact_at = std::max<uint64_t>(64ull << 20, base_bytes / 5 * 2);
+                            } else {
+                                const uint64_t percent = (uint64_t) o.conversation_cache_disk_delta_percent;
+                                const uint64_t scaled = (base_bytes / 100) * percent + (base_bytes % 100) * percent / 100;
+                                compact_at = std::max<uint64_t>(64ull << 20, scaled);
+                            }
+                            uint64_t full_bytes = 0;
+                            std::string full_size_error;
                             const bool cumulative_overflow = estimate > UINT64_MAX - chain_delta;
                             const uint64_t cumulative_bytes = cumulative_overflow ? UINT64_MAX : chain_delta + estimate;
                             if (overflow) {
                                 std::fprintf(stderr, "strata serve: conversation cache: delta save skipped (the state "
                                              "is too large for this build); writing the whole file\n");
+                            } else if (o.conversation_cache_disk_delta_percent != 40 &&
+                                       !strata::core::session_file_full_bytes(meta, sources, full_bytes, full_size_error)) {
+                                std::fprintf(stderr, "strata serve: conversation cache: full session size estimate failed (%s); "
+                                             "writing the whole file\n", full_size_error.c_str());
+                            } else if (o.conversation_cache_disk_delta_percent != 40 && estimate >= full_bytes) {
+                                std::fprintf(stderr, "strata serve: conversation cache: delta record would be at least as "
+                                             "large as the %llu MiB full session; writing the whole file\n",
+                                             (unsigned long long) (full_bytes >> 20));
                             } else if ((cumulative_overflow || cumulative_bytes > compact_at) && chain_delta > 0) {
                                 std::fprintf(stderr, "strata serve: conversation cache: delta chain holds %llu of "
                                              "%llu MiB; compacting into a new file\n",

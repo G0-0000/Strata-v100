@@ -6,14 +6,54 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace strata::core {
+
+struct ConversationCacheTokenLimits {
+    int64_t write_min_tokens = 0;
+    int64_t read_min_tokens = 0;
+};
+
+// Parse the legacy single WRITE value or WRITE,READ. A single value leaves READ at zero.
+inline bool parse_conversation_cache_min_tokens(std::string_view text, ConversationCacheTokenLimits& limits) {
+    auto parse_number = [](std::string_view value, int64_t& parsed_value) {
+        if (value.empty()) return false;
+        for (char digit : value)
+            if (digit < '0' || digit > '9') return false;
+        int64_t number = 0;
+        const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+        if (result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
+            number > std::numeric_limits<int32_t>::max()) return false;
+        parsed_value = number;
+        return true;
+    };
+
+    ConversationCacheTokenLimits parsed;
+    const size_t comma = text.find(',');
+    if (comma == std::string_view::npos) {
+        if (!parse_number(text, parsed.write_min_tokens)) return false;
+    } else {
+        if (text.find(',', comma + 1) != std::string_view::npos ||
+            !parse_number(text.substr(0, comma), parsed.write_min_tokens) ||
+            !parse_number(text.substr(comma + 1), parsed.read_min_tokens)) return false;
+    }
+    limits = parsed;
+    return true;
+}
+
+// READ gates only automatic parked-candidate lookup and uses the complete prompt length.
+inline bool conversation_cache_should_read_parked(int64_t prompt_tokens, int64_t read_min_tokens) {
+    return read_min_tokens <= 0 || prompt_tokens >= read_min_tokens;
+}
 
 struct ConversationImageKey {
     int64_t start = 0;

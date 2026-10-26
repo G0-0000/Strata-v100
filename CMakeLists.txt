@@ -364,6 +364,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(prefill_plan_test PRIVATE include)
   add_test(NAME prefill_plan_test COMMAND prefill_plan_test)
 
+  # the conversation-cache fields of the startup INFO line: READ=0 prints the pre-READ-gate bytes, every field
+  # lands at its own name, the segment stays space-clean (header-only, no GPU)
+  add_executable(startup_info_test tests/program/startup_info_test.cpp)
+  target_include_directories(startup_info_test PRIVATE include)
+  add_test(NAME startup_info_test COMMAND startup_info_test)
+
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)

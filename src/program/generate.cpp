@@ -96,6 +96,7 @@
 #include "strata/program/prefill_plan.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
+#include "strata/program/startup_info.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -807,8 +808,10 @@ struct Options {
     int64_t conversation_cache_mib = -1; // host RAM for independent conversations; -1: not given, --serve sizes it from the free RAM (#3493), 0: off
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
-    /// --serve: park only conversations of at least N tokens, so short side requests do not take the slots a long one needs.
+    /// --serve: the WRITE threshold for saving an outgoing conversation; a single value retains the legacy meaning.
     int64_t conversation_cache_min_tokens = 0;
+    /// --serve: minimum complete prompt length for automatic parked-session lookup; 0 allows every prompt.
+    int64_t conversation_cache_min_read_tokens = 0;
     /// --serve: park only after the conversation has advanced this many tokens past the copy it would supersede.
     /// A conversation that moved a few hundred tokens writes a full snapshot again, and the turn after that drops it
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
@@ -987,8 +990,11 @@ void usage() {
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
                  "                       the container cannot see its real limit (also STRATA_MEMORY_LIMIT_MIB; the flag\n"
                  "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
-                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
-                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
+                  "  --conversation-cache-min-tokens WRITE[,READ]  --serve: WRITE is the minimum outgoing conversation\n"
+                  "                       length to save; READ is the minimum complete prompt length, including cached\n"
+                  "                       history, for automatic RAM/disk candidate lookup (default 0,0 = no minimum).\n"
+                  "                       A single WRITE value leaves READ at 0; active-session and checkpoint reuse\n"
+                  "                       and eligible outgoing saves are not limited by READ.\n"
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
@@ -3205,16 +3211,30 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+        else if (a == "--conversation-cache-min-tokens") {
+            if (i + 1 >= argc || (argv[i + 1][0] == '-' && argv[i + 1][1] == '-')) {
+                std::fprintf(stderr, "%s needs a value\n", a.c_str());
+                return 2;
+            }
+            strata::core::ConversationCacheTokenLimits limits;
+            if (!strata::core::parse_conversation_cache_min_tokens(argv[i + 1], limits)) {
+                std::fprintf(stderr, "%s needs a decimal N or WRITE,READ with each value in [0, 2147483647]\n",
+                             a.c_str());
+                return 2;
+            }
+            ++i;
+            o.conversation_cache_min_tokens = limits.write_min_tokens;
+            o.conversation_cache_min_read_tokens = limits.read_min_tokens;
+        }
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
-                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
+                 a == "--conversation-cache-min-free-mib" ||
                  a == "--conversation-cache-park-gain" ||
                  a == "--session-min-free-mib" || a == "--memory-limit-mib" ||
                  a == "--conversation-cache-disk-mib" || a == "--conversation-cache-n-min") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
-            const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
-                                   a == "--conversation-cache-park-gain")
+            const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-park-gain")
                                       ? INT32_MAX
                                       : a == "--conversation-cache-n-min" ? INT64_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
@@ -3223,7 +3243,6 @@ int main(int argc, char** argv) {
             }
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
-            else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--conversation-cache-slots") o.conversation_cache_slots = (int) number;
@@ -12471,68 +12490,48 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            // the disk-tier fields are logged only when the tier is actually enabled: with every new flag off the
-            // startup line stays byte-identical to a build without the disk cache (P2: default path unchanged).
-            if (conversation_spill.enabled())
-                std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
-                            "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
-                            "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                            "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                            "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
-                            "conversation_cache_disk_mib=%lld conversation_cache_disk_only=%d "
-                            "conversation_cache_similarity=%.3f conversation_cache_n_min=%lld "
-                            "tail_role_token=%lld vram_elastic=%d "
-                            "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
-                            (long long) o.max_context, o.kv.c_str(),
-                            (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
-                                             ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
-                            (long long) slots_all, (long long) mib_all,
-                            (long long) slots_primary, (long long) mib_primary,
-                            o.spec, o.mtp_max_t,
-                            o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
-                            (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
-                            pool.workers(), o.pcie_frac,
-                            o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                            (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
-                            (long long) o.conversation_cache_disk_mib, disk_only ? 1 : 0, o.conversation_cache_similarity,
-                            (long long) o.conversation_cache_n_min,
-                            (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
-                            // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
-                            // prompt flows through, the chunk size from which a chunk streams every expert, --prefill-pipe
-                            (long long) o.prefill_chunk, sp.stage_count(),
-                            (long long) strata::prefill::Prefill::stream_all_min_tokens(),
-                            strata::prefill::Prefill::pipe_setting(),
-                            o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                           " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                           " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
-            else
-                std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
-                            "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
-                            "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                            "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                            "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
-                            "tail_role_token=%lld vram_elastic=%d "
-                            "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
-                            (long long) o.max_context, o.kv.c_str(),
-                            (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
-                                             ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
-                            (long long) slots_all, (long long) mib_all,
-                            (long long) slots_primary, (long long) mib_primary,
-                            o.spec, o.mtp_max_t,
-                            o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
-                            (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
-                            pool.workers(), o.pcie_frac,
-                            o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                            (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
-                            (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
-                            // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
-                            // prompt flows through, the chunk size from which a chunk streams every expert, --prefill-pipe
-                            (long long) o.prefill_chunk, sp.stage_count(),
-                            (long long) strata::prefill::Prefill::stream_all_min_tokens(),
-                            strata::prefill::Prefill::pipe_setting(),
-                            o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                           " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                           " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+            // The conversation-cache fields of the INFO line are rendered by one helper and emitted through a
+            // single %s: a READ of 0 prints the bytes the pre-READ-gate builds printed, the disk-tier fields
+            // appear only when the spill directory is serving, and this printf keeps ONE argument list (an extra
+            // argument shared by two formats of different field counts shifts every field after it - varargs
+            // have no names).  startup_info_test renders both forms and pins the bytes.
+            const std::string cache_fields = strata::program::conversation_cache_info_fields(
+                {.mib = o.conversation_cache_mib,
+                 .slots = o.conversation_cache_slots,
+                 .min_free_mib = o.conversation_cache_min_free_mib,
+                 .min_tokens = o.conversation_cache_min_tokens,
+                 .min_read_tokens = o.conversation_cache_min_read_tokens,
+                 .disk_tier_on = conversation_spill.enabled(),
+                 .disk_mib = (int64_t) o.conversation_cache_disk_mib,
+                 .disk_only = disk_only,
+                 .disk_delta = o.conversation_cache_disk_delta,
+                 .similarity = o.conversation_cache_similarity,
+                 .n_min = o.conversation_cache_n_min,
+                 .tail_role_token = (int64_t) o.tail_role_token,
+                 .vram_elastic = xcache.segmented()});
+            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+                        "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                        "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
+                        "spec_min_p=%.2f %s "
+                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                        (long long) o.max_context, o.kv.c_str(),
+                        (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+                                         ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
+                        (long long) slots_all, (long long) mib_all,
+                        (long long) slots_primary, (long long) mib_primary,
+                        o.spec, o.mtp_max_t,
+                        o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
+                        (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
+                        pool.workers(), o.pcie_frac,
+                        o.spec_min_p, cache_fields.c_str(),
+                        // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
+                        // prompt flows through, the chunk size from which a chunk streams every expert, --prefill-pipe
+                        (long long) o.prefill_chunk, sp.stage_count(),
+                        (long long) strata::prefill::Prefill::stream_all_min_tokens(),
+                        strata::prefill::Prefill::pipe_setting(),
+                        o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
+                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -14502,8 +14501,13 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
-            strata::core::ConversationCache::Match parked = conversations.best(
-                ids, req_imgs, want_cvec, o.conversation_cache_similarity, o.conversation_cache_n_min);
+            // READ uses the complete prompt length. Active-session, checkpoint and batch-slot reuse is unchanged.
+            const bool read_parked = strata::core::conversation_cache_should_read_parked(
+                n, o.conversation_cache_min_read_tokens);
+            strata::core::ConversationCache::Match parked;
+            if (read_parked)
+                parked = conversations.best(ids, req_imgs, want_cvec,
+                                            o.conversation_cache_similarity, o.conversation_cache_n_min);
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
@@ -14518,8 +14522,9 @@ int main(int argc, char** argv) {
             // offers a longer resume than RAM, the batch slots and the live state does, read it back whole.
             decltype(conversation_spill.best(ids, req_imgs, want_cvec,
                 o.conversation_cache_similarity, o.conversation_cache_n_min)) disk_match{};
-            disk_match = conversation_spill.best(ids, req_imgs, want_cvec,
-                                                  o.conversation_cache_similarity, o.conversation_cache_n_min);
+            if (read_parked)
+                disk_match = conversation_spill.best(ids, req_imgs, want_cvec,
+                                                      o.conversation_cache_similarity, o.conversation_cache_n_min);
             // --conversation-cache-disk-only: the disk match is read back with the streaming RESTORE path - its read
             // pass now (it parses and checks the whole file, the K/V stays on disk; nothing on the device changes, so a
             // refusal leaves this request as it was), its apply pass after the outgoing conversation is saved below
@@ -14766,8 +14771,10 @@ int main(int argc, char** argv) {
             // an admission refusal) can have evicted the entry `parked` named: recompute the RAM match before the
             // take, so a stale index never takes the wrong conversation or throws.
             if (!incoming) {
-                parked = conversations.best(ids, req_imgs, want_cvec,
-                                             o.conversation_cache_similarity, o.conversation_cache_n_min);
+                parked = {};
+                if (read_parked)
+                    parked = conversations.best(ids, req_imgs, want_cvec,
+                                                o.conversation_cache_similarity, o.conversation_cache_n_min);
                 borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
                          conversations.borrows(parked);
             } else {

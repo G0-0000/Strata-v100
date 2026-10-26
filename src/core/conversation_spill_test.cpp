@@ -5,6 +5,7 @@
 #include "strata/core/rht_state_codec.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -385,7 +386,7 @@ int main() {
     // spill_delta appends the changed K/V and republishes the sidecar; the chain survives a reopen; erase, the
     // budget and drop_superseded remove the chain files together; a chain that cannot be proven (short log, edited
     // manifest) makes open() drop the whole entry rather than restore a state that does not match its sidecar.
-    auto sources_of = [](const SavedConversation& img, size_t first) {
+    auto sources_of = [](const SavedConversation& img, size_t first = 0) {
         std::vector<SessionKvSource> sources;
         for (const auto& k : img.kv) {
             SessionKvSource src;
@@ -1784,6 +1785,214 @@ int main() {
               "rht spill: all-RAW delta fallback remains v1 even with codec opt-in");
         fs::remove_all(pdir); fs::remove_all(plain_dir); fs::remove_all(ram_dir);
         fs::remove_all(ordinary_dir); fs::remove_all(mixed_dir); fs::remove_all(fallback_dir);
+    }
+
+    // format v3 pass-through: spill_streamed/spill_delta forward the K/V-first layout; a v3 base restores whole, a
+    // v3 chain restores base + records, and a v1 base accepts a v3 record (the versions are independent).
+    {
+        const fs::path v3dir = fs::temp_directory_path() / "strata_spill_v3_test";
+        fs::remove_all(v3dir);
+        auto word64 = [](const std::vector<char>& data, size_t at) {
+            uint64_t v = 0;
+            std::memcpy(&v, data.data() + at, 8);
+            return v;
+        };
+        auto file_version = [&word64](const std::vector<char>& data) { return uint32_t(word64(data, 8) & 0xffffffffu); };
+        SavedConversation base = sample(1200);
+        SavedConversation grown = base;
+        for (int i = 0; i < 200; ++i) grown.live.ids.push_back(int32_t(2500 + i));
+        grown.checkpoints.back() = checkpoint(1400, 8);
+        for (size_t i = 0; i < grown.kv.size(); ++i) {
+            const std::array<ConversationBuffer*, 5> parts = {&grown.kv[i].k, &grown.kv[i].v, &grown.kv[i].k_scale,
+                                                              &grown.kv[i].v_scale, &grown.kv[i].pooled};
+            for (size_t part = 0; part < 5; ++part) {
+                if (parts[part]->size() <= 1024) continue;
+                ConversationBuffer& b = *parts[part];
+                b.visit(1024, b.size() - 1024, [&](uint8_t* p, size_t c, size_t at) {
+                    for (size_t j = 0; j < c; ++j) p[j] = uint8_t((at + j) * 41u + i + part);
+                    return true;
+                });
+            }
+        }
+        // a v3 base: the file's header says 3 and a plain load round-trips
+        ConversationSpillCache v3;
+        size_t w = 0;
+        check(v3.open(v3dir, id, 1ull << 30, error, true), "v3 spill: open");
+        check(v3.spill_streamed(meta_of(base), sources_of(base, 0), w, error, false, false, false, false,
+                                nullptr, true),
+              "v3 spill: the streamed save forwards the layout");
+        const std::vector<char> v3_file = read_file(v3.newest_path());
+        check(file_version(v3_file) == 3, "v3 spill: the base file is version 3");
+        SavedConversation back;
+        check(v3.load(v3.newest_path(), back, {}, error) && back.live.ids == base.live.ids &&
+              back.kv.size() == base.kv.size(), "v3 spill: the base loads whole");
+        // a v3 record on it: the chain survives a reopen and restores base + record exactly
+        ConversationSpillCache c1;
+        check(c1.open(v3dir, id, 1ull << 30, error, true), "v3 chain: open");
+        size_t w1 = 0;
+        check(c1.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), w1, error,
+                             false, false, nullptr, true),
+              "v3 chain: the append forwards the layout");
+        const fs::path dlog = fs::path(c1.newest_path()).replace_extension(".dlog");
+        check(word64(read_file(dlog), 8) == 3, "v3 chain: the record is version 3");
+        ConversationSpillCache c2;
+        check(c2.open(v3dir, id, 1ull << 30, error, true) && c2.size() == 1, "v3 chain: reopen keeps the entry");
+        const auto m = c2.best(grown.live.ids, {}, grown.cvec, 0.0, 0);
+        check(bool(m) && m.delta_committed == w1, "v3 chain: the committed chain matches");
+        SavedConversation base_meta;
+        std::vector<std::array<uint64_t, 5>> base_sizes;
+        check(session_file_read_streamed(m.path, id, base_meta, w, error, {}, &base_sizes),
+              "v3 chain: the base reads streamed");
+        std::vector<std::array<std::vector<uint8_t>, 5>> rebuilt(grown.kv.size());
+        for (size_t l = 0; l < grown.kv.size(); ++l) {
+            const std::array<const ConversationBuffer*, 5> parts = {&grown.kv[l].k, &grown.kv[l].v,
+                                                                    &grown.kv[l].k_scale, &grown.kv[l].v_scale,
+                                                                    &grown.kv[l].pooled};
+            for (size_t part = 0; part < 5; ++part) rebuilt[l][part].resize(parts[part]->size());
+        }
+        auto sink = [&](size_t layer, size_t part, uint64_t offset, const void* data, size_t n) {
+            if (layer >= rebuilt.size() || offset > rebuilt[layer][part].size() ||
+                n > rebuilt[layer][part].size() - offset) return false;
+            std::memcpy(rebuilt[layer][part].data() + offset, data, n);
+            return true;
+        };
+        check(session_file_apply_streamed(m.path, id, sink, base_sizes, error), "v3 chain: the base applies");
+        uint64_t at = 0;
+        while (at < m.delta_committed) {
+            SessionDeltaRecord rec;
+            uint64_t next = 0;
+            check(session_delta_read(dlog.string(), at, m.delta_committed, id, {}, rec, next, error),
+                  "v3 chain: a committed record reads");
+            check(session_delta_apply(dlog.string(), at, id, rec, sink, error),
+                  "v3 chain: a committed record applies");
+            at = next;
+        }
+        bool same = true;
+        for (size_t l = 0; same && l < grown.kv.size(); ++l) {
+            const std::array<const ConversationBuffer*, 5> parts = {&grown.kv[l].k, &grown.kv[l].v,
+                                                                    &grown.kv[l].k_scale, &grown.kv[l].v_scale,
+                                                                    &grown.kv[l].pooled};
+            for (size_t part = 0; same && part < 5; ++part) {
+                std::vector<uint8_t> want(parts[part]->size());
+                parts[part]->visit(0, want.size(), [&](const uint8_t* p, size_t c, size_t at2) {
+                    std::memcpy(want.data() + at2, p, c); return true;
+                });
+                same = rebuilt[l][part] == want;
+            }
+        }
+        check(same, "v3 chain: base + v3 record rebuild the newest K/V exactly");
+        fs::remove_all(v3dir);
+
+        // a v1 base with a v3 record: the mixed chain restores too (the file and record versions are independent)
+        const fs::path mxdir = fs::temp_directory_path() / "strata_spill_v3_mixed_test";
+        fs::remove_all(mxdir);
+        ConversationSpillCache mx1;
+        check(mx1.open(mxdir, id, 1ull << 30, error, true), "v3 mix: open");
+        check(mx1.spill_streamed(meta_of(base), sources_of(base, 0), w, error), "v3 mix: a v1 base");
+        check(file_version(read_file(mx1.newest_path())) == 1, "v3 mix: the base stays version 1");
+        size_t wm = 0;
+        check(mx1.spill_delta(0, meta_of(grown), sources_of(grown, 1024), (int64_t) grown.live.ids.size(), wm, error,
+                              false, false, nullptr, true),
+              "v3 mix: a v3 record on a v1 base");
+        ConversationSpillCache mx2;
+        check(mx2.open(mxdir, id, 1ull << 30, error, true) && mx2.size() == 1, "v3 mix: reopen keeps the entry");
+        const auto mm = mx2.best(grown.live.ids, {}, grown.cvec, 0.0, 0);
+        check(bool(mm) && mm.delta_committed == wm, "v3 mix: the committed chain matches");
+        check(word64(read_file(fs::path(mm.path).replace_extension(".dlog")), 8) == 3,
+              "v3 mix: the record is version 3");
+        fs::remove_all(mxdir);
+    }
+
+    // Two-phase background saves: only the reservation and publication touch the cache. The file task owns the
+    // captured identity and paths; an uncommitted record or an old reservation never replaces the committed chain.
+    {
+        const fs::path bdir = fs::temp_directory_path() / "strata_spill_background_test";
+        fs::remove_all(bdir);
+        ConversationSpillCache cache;
+        check(cache.open(bdir, id, 1ull << 30, error, true), "background spill: open");
+        SavedConversation base = sample(1200);
+        SavedConversation meta = meta_of(base);
+        ConversationSpillWrite base_write;
+        check(cache.reserve_streamed(meta, base_write, error) && base_write.valid && cache.size() == 0,
+              "background spill: reserve a base without publishing it");
+        SessionWriteOptions opt;
+        opt.layout_v3 = true;
+        opt.background_state = true;
+        size_t base_bytes = 0;
+        bool released = false;
+        opt.on_sources_released = [&] { released = true; };
+        check(session_file_write(base_write.session_path(), meta, sources_of(base), base_write.identity, base_bytes,
+                                 error, opt) && released && cache.size() == 0,
+              "background spill: the file task writes v3 without touching the cache");
+        check(cache.publish_streamed(base_write, meta, base_bytes, error) && cache.size() == 1 &&
+              cache.newest_path() == base_write.session_path(),
+              "background spill: publish the completed base at the cache boundary");
+        const size_t index = cache.find(base_write.session_path());
+        ConversationSpillDeltaWrite delta_write;
+        check(cache.reserve_delta(index, delta_write, error) && delta_write.valid &&
+              delta_write.session_path() == base_write.session_path() && delta_write.delta_bytes == 0,
+              "background spill: reserve the first delta append");
+        SavedConversation first = base;
+        first.live.ids.push_back(8001);
+        meta = meta_of(first);
+        const uint64_t accounted_before_record = cache.bytes();
+        uint64_t first_record = 0;
+        check(session_delta_write(delta_write.delta_path(), delta_write.delta_bytes, meta, sources_of(first),
+                                  (int64_t) first.live.ids.size(), delta_write.identity, first_record, error, opt),
+              "background spill: write the first delta record");
+        check(cache.size() == 1 && cache.bytes() == accounted_before_record,
+              "background spill: the uncommitted record has not changed the cache or its accounting");
+        check(cache.publish_delta(delta_write, meta, (size_t) first_record, true, error),
+              "background spill: publish the first delta record");
+        int64_t saved_tokens = 0, deepest = 0;
+        uint64_t saved_base = 0, committed = 0;
+        bool prefix = true;
+        std::string saved_path;
+        check(cache.entry_info(index, saved_tokens, deepest, saved_base, committed, prefix, saved_path) &&
+              committed == first_record && saved_tokens == (int64_t) first.live.ids.size(),
+              "background spill: publication advances the committed length once");
+
+        SavedConversation failed = first;
+        failed.live.ids.push_back(8002);
+        meta = meta_of(failed);
+        ConversationSpillDeltaWrite failed_write;
+        check(cache.reserve_delta(index, failed_write, error), "background spill: reserve a later delta");
+        opt.fault = [](const char* step) { return std::strcmp(step, "write") == 0 ? EIO : 0; };
+        released = false;
+        opt.on_sources_released = [&] { released = true; };
+        uint64_t failed_record = 0;
+        check(!session_delta_write(failed_write.delta_path(), failed_write.delta_bytes, meta, sources_of(failed),
+                                   (int64_t) failed.live.ids.size(), failed_write.identity, failed_record, error, opt) &&
+              released && !cache.publish_delta(failed_write, meta, 0, false, error),
+              "background spill: a failed task releases sources and does not publish");
+        check(cache.entry_info(index, saved_tokens, deepest, saved_base, committed, prefix, saved_path) &&
+              committed == first_record && cache.best(failed.live.ids, {}, failed.cvec, 0.0, 0).live_tokens ==
+              (int64_t) first.live.ids.size(),
+              "background spill: failure leaves the previous committed chain visible");
+        ConversationSpillCache reopened;
+        check(reopened.open(bdir, id, 1ull << 30, error, true) && reopened.size() == 1 &&
+              reopened.best(failed.live.ids, {}, failed.cvec, 0.0, 0).delta_committed == first_record,
+              "background spill: the old chain also survives a reopen");
+
+        ConversationSpillDeltaWrite stale;
+        check(reopened.reserve_delta(0, stale, error), "background spill: reserve a generation guard");
+        SavedConversation newest = first;
+        newest.live.ids.push_back(8003);
+        size_t newest_bytes = 0;
+        check(reopened.spill_delta(0, meta_of(newest), sources_of(newest), (int64_t) newest.live.ids.size(),
+                                   newest_bytes, error),
+              "background spill: a newer generation commits");
+        uint64_t new_committed = 0;
+        check(reopened.entry_info(0, saved_tokens, deepest, saved_base, new_committed, prefix, saved_path) &&
+              new_committed > first_record, "background spill: read the newer committed length");
+        check(!reopened.publish_delta(stale, meta_of(failed), 1, true, error) &&
+              error.find("reservation") != std::string::npos,
+              "background spill: an old task cannot publish into the newer generation");
+        check(reopened.entry_info(0, saved_tokens, deepest, saved_base, committed, prefix, saved_path) &&
+              committed == new_committed && reopened.best(newest.live.ids, {}, newest.cvec, 0.0, 0).live_tokens ==
+              (int64_t) newest.live.ids.size(),
+              "background spill: rejecting the old task leaves the newer chain intact");
+        fs::remove_all(bdir);
     }
 
     std::printf("conversation_spill_test: %d checks passed\n", checks);

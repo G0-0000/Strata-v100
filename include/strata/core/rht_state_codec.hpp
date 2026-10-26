@@ -203,12 +203,9 @@ inline bool layout_from(const std::array<int64_t, 18>& geometry,
     return true;
 }
 
-inline constexpr uint64_t decode_scratch_bytes() noexcept {
-    return sizeof(std::array<float, detail::kDim>) + sizeof(std::array<int16_t, detail::kDim>);
-}
-
 inline uint64_t scratch_bytes(const Layout& layout) noexcept {
-    return detail::valid_layout(layout) ? decode_scratch_bytes() : 0;
+    if (!detail::valid_layout(layout)) return 0;
+    return sizeof(float) * detail::kDim + sizeof(int16_t) * detail::kDim;
 }
 
 inline bool all_finite(const void* src, uint64_t logical) noexcept {
@@ -219,28 +216,6 @@ inline bool all_finite(const void* src, uint64_t logical) noexcept {
     const uint64_t count = logical / sizeof(float);
     for (uint64_t i = 0; i < count; ++i) {
         if (!std::isfinite(values[static_cast<std::size_t>(i)])) return false;
-    }
-    return true;
-}
-
-// Validate the complete input and every recurrent row with encode_row(), but produce no bytes. Codec selection uses
-// this before sizing; the real encoder still reports any later sink failure to its caller.
-inline bool preflight_encode(const void* src, const Layout& layout) noexcept {
-    detail::Metrics metrics{};
-    if (!src || !detail::metrics_for(layout, metrics) || !all_finite(src, metrics.logical_bytes)) return false;
-
-    const auto* source = static_cast<const float*>(src);
-    const std::size_t per_layer_floats = static_cast<std::size_t>(metrics.per_layer_floats);
-    std::array<float, detail::kDim> work{};
-    std::array<int16_t, detail::kDim> quantized{};
-    for (uint64_t layer = 0; layer < layout.layers; ++layer) {
-        const std::size_t layer_offset = static_cast<std::size_t>(layer) * per_layer_floats;
-        const float* layer_src = source + layer_offset;
-        for (uint64_t row = 0; row < layout.rows; ++row) {
-            float scale = 0.0f;
-            const float* row_src = layer_src + static_cast<std::size_t>(row) * static_cast<std::size_t>(layout.dim);
-            if (!detail::encode_row(row_src, work.data(), quantized.data(), scale)) return false;
-        }
     }
     return true;
 }

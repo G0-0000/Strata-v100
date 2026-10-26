@@ -30,6 +30,26 @@ struct ConversationSpillMatch {
     explicit operator bool() const { return !path.empty() && tokens > 0; }
 };
 
+// A file target reserved on the request thread. The writer uses these owned paths and identity, never the cache,
+// while it runs in the background. Publication checks the same reservation before changing the index.
+struct ConversationSpillWrite {
+    std::filesystem::path stem;
+    SessionFileIdentity identity;
+    bool prefix = false;
+    bool valid = false;
+    std::string session_path() const { return stem.string() + ".sess"; }
+};
+struct ConversationSpillDeltaWrite {
+    size_t index = 0;
+    std::filesystem::path stem;
+    SessionFileIdentity identity;
+    uint64_t file_bytes = 0, delta_bytes = 0, delta_accounted_bytes = 0;
+    bool had_chain = false;
+    bool valid = false;
+    std::string session_path() const { return stem.string() + ".sess"; }
+    std::string delta_path() const { return stem.string() + ".dlog"; }
+};
+
 class ConversationSpillCache {
 public:
     // Opens (creating if needed) the spill directory and indexes conversations already in it. Left-over write
@@ -73,8 +93,8 @@ public:
     }
 
     // Reads a spilled conversation back into image (its K/V included), with the engine's read limits and identity.
-    // `status` (optional) reports the verified file format: on a RAM refusal of a verified format-v2 file the caller
-    // keeps the file for a later attempt (a format-v1 refusal, as before, discards it).
+    // `status` (optional) reports the verified file format: on a RAM refusal of a verified descriptor-format (v2/v3)
+    // file the caller keeps the file for a later attempt (a format-v1 refusal, as before, discards it).
     bool load(const std::string& path, SavedConversation& image, const SessionReadLimits& limits,
               std::string& error, SessionStatus* status = nullptr) const;
     // Writes a parked conversation (its K/V in RAM) as a session file plus its sidecar, and indexes it.
@@ -88,7 +108,8 @@ public:
     // removes them and the disk budget evicts every ordinary conversation before one of them.
     bool spill_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv, size_t& bytes,
                         std::string& error, bool durable = false, bool prefix = false, bool state_ref = false,
-                        bool state_codec_rht = false);
+                        bool state_codec_rht = false, SessionWriteTimings* timings = nullptr,
+                        bool layout_v3 = false);
     // --conversation-cache-disk-delta: appends one delta record for an indexed entry instead of rewriting its file.
     // `meta` + `kv` describe the conversation's current state; kv[i].sizes are full part sizes and first_bytes the
     // offset each part's data starts at.  The record is written to the entry's `<stem>.dlog`, its committed length is
@@ -97,7 +118,21 @@ public:
     // new state. A prefix, disabled directory or incomplete/unusable entry refuses.
     bool spill_delta(size_t index, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
                      int64_t first_token, size_t& bytes, std::string& error, bool durable = false,
-                     bool state_codec_rht = false);
+                     bool state_codec_rht = false, SessionWriteTimings* timings = nullptr,
+                     bool layout_v3 = false);
+    // Two-phase disk-only saves. reserve_* runs before the task starts; the task writes target.session_path() with
+    // session_file_write, or target.delta_path() at target.delta_bytes with session_delta_write, using target.identity.
+    // It owns all source/state inputs and never calls this cache. At a safe boundary, publish_* runs on the request
+    // thread, after joining the task. Base publication writes the sidecar and enforces the budget. Delta publication
+    // also accounts a failed or uncommitted append, preserving the previous committed length. A delta reservation is
+    // rejected if its entry's index, path, base size or committed/accounted log generation changed before publication.
+    bool reserve_streamed(const SavedConversation& meta, ConversationSpillWrite& target, std::string& error,
+                          bool prefix = false);
+    bool publish_streamed(const ConversationSpillWrite& target, const SavedConversation& meta, size_t bytes,
+                          std::string& error);
+    bool reserve_delta(size_t index, ConversationSpillDeltaWrite& target, std::string& error);
+    bool publish_delta(const ConversationSpillDeltaWrite& target, const SavedConversation& meta, size_t written,
+                       bool write_succeeded, std::string& error);
     // The index of the entry whose session file is `path`, or size() when none.
     size_t find(const std::string& path) const;
     // What a delta save needs to know about an entry (see generate.cpp): its token count, its deepest checkpoint,

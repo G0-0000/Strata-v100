@@ -618,27 +618,50 @@ bool ConversationSpillCache::spill(const SavedConversation& image, std::string& 
     return index_written(stem, file_bytes, image, error);
 }
 
-bool ConversationSpillCache::spill_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
-                                            size_t& bytes, std::string& error, bool durable, bool prefix,
-                                            bool state_ref, bool state_codec_rht) {
-    bytes = 0;
+bool ConversationSpillCache::reserve_streamed(const SavedConversation& meta, ConversationSpillWrite& target,
+                                              std::string& error, bool prefix) {
+    target = {};
     if (!enabled_) return false;
     if (meta.live.ids.empty() || !meta.stage_images.empty() || !meta.kv.empty()) {
         error = "a streamed spill needs a single-GPU conversation without a host K/V image"; return false;
     }
+    target.stem = next_stem(prefix);
+    target.identity = identity_;
+    target.prefix = prefix;
+    target.valid = true;
+    return true;
+}
+
+bool ConversationSpillCache::publish_streamed(const ConversationSpillWrite& target, const SavedConversation& meta,
+                                              size_t bytes, std::string& error) {
+    if (!enabled_ || !target.valid || target.identity.model != identity_.model ||
+        target.identity.config != identity_.config) {
+        error = "spill base reservation is no longer valid";
+        return false;
+    }
+    return index_written(target.stem, bytes, meta, error, target.prefix);
+}
+
+bool ConversationSpillCache::spill_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                                            size_t& bytes, std::string& error, bool durable, bool prefix,
+                                            bool state_ref, bool state_codec_rht, SessionWriteTimings* timings,
+                                            bool layout_v3) {
+    bytes = 0;
+    ConversationSpillWrite target;
+    if (!reserve_streamed(meta, target, error, prefix)) return false;
     std::error_code ec;
-    const std::filesystem::path stem = next_stem(prefix);
-    const std::string session = stem.string() + ".sess";
     SessionWriteOptions wo;
     wo.durable = durable;
     wo.state_ref = state_ref;   // only a prefix save passes this on; ordinary saves and the delta writer never do
     wo.state_codec_rht = !prefix && state_codec_rht;
+    wo.timings = timings;
+    wo.layout_v3 = !prefix && layout_v3;   // the K/V-first layout is only for ordinary disk-only saves
     SessionStatus st;
-    if (!session_file_write(session, meta, kv, identity_, bytes, error, wo, &st)) {
-        std::filesystem::remove(session, ec);
+    if (!session_file_write(target.session_path(), meta, kv, target.identity, bytes, error, wo, &st)) {
+        std::filesystem::remove(target.session_path(), ec);
         return false;
     }
-    return index_written(stem, bytes, meta, error, prefix);
+    return publish_streamed(target, meta, bytes, error);
 }
 
 bool ConversationSpillCache::has_prefix(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
@@ -932,10 +955,8 @@ bool ConversationSpillCache::write_chain(const std::filesystem::path& chain, uin
     return true;
 }
 
-bool ConversationSpillCache::spill_delta(size_t index, const SavedConversation& meta,
-                                         const std::vector<SessionKvSource>& kv, int64_t first_token,
-                                         size_t& bytes, std::string& error, bool durable, bool state_codec_rht) {
-    bytes = 0;
+bool ConversationSpillCache::reserve_delta(size_t index, ConversationSpillDeltaWrite& target, std::string& error) {
+    target = {};
     if (!enabled_ || index >= entries_.size()) { error = "spill cache is disabled"; return false; }
     if (!delta_) { error = "delta chains are off"; return false; }
     Entry& entry = entries_[index];
@@ -944,8 +965,36 @@ bool ConversationSpillCache::spill_delta(size_t index, const SavedConversation& 
         error = "spill entry is incomplete or its files are not valid regular files";
         return false;
     }
-    const bool had_chain = entry.has_chain;
-    auto account_log_after_attempt = [&]() {
+    target.index = index;
+    target.stem = entry.stem;
+    target.identity = identity_;
+    target.file_bytes = entry.file_bytes;
+    target.delta_bytes = entry.delta_bytes;
+    target.delta_accounted_bytes = entry.delta_accounted_bytes;
+    target.had_chain = entry.has_chain;
+    target.valid = true;
+    return true;
+}
+
+bool ConversationSpillCache::publish_delta(const ConversationSpillDeltaWrite& target, const SavedConversation& meta,
+                                           size_t written, bool write_succeeded, std::string& error) {
+    if (!enabled_ || !target.valid || target.index >= entries_.size()) {
+        error = "spill delta reservation is no longer valid";
+        return false;
+    }
+    Entry& entry = entries_[target.index];
+    auto same_reservation = [&]() {
+        return entry.stem == target.stem && entry.file_bytes == target.file_bytes &&
+               entry.delta_bytes == target.delta_bytes &&
+               entry.delta_accounted_bytes == target.delta_accounted_bytes &&
+               entry.has_chain == target.had_chain && entry.complete &&
+               target.identity.model == identity_.model && target.identity.config == identity_.config;
+    };
+    auto account_log_after_attempt = [&](std::string& account_error) {
+        if (!same_reservation()) {
+            account_error = "spill delta reservation changed before publication";
+            return false;
+        }
         const uint64_t before = entry.total_bytes();
         const PathInfo log = inspect_path_nofollow(entry.delta_path());
         if (!log.inspected) {
@@ -955,74 +1004,91 @@ bool ConversationSpillCache::spill_delta(size_t index, const SavedConversation& 
             if (log.regular) entry.delta_accounted_bytes = log.bytes;
             else entry.complete = false;
         }
-        if (!had_chain && entry.has_chain) entry.complete = false;
-        if (had_chain) {
+        if (!target.had_chain && entry.has_chain) entry.complete = false;
+        if (target.had_chain) {
             uint64_t still_committed = 0;
             std::string verify_error;
             if (!read_chain(entry.chain_path(), entry.file_bytes, entry.delta_path(), still_committed, verify_error) ||
                 still_committed != entry.delta_bytes) entry.complete = false;
         }
         adjust_bytes(before, entry.total_bytes());
+        return true;
     };
+    if (!write_succeeded) {
+        std::string account_error;
+        if (!account_log_after_attempt(account_error)) error += "; " + account_error;
+        return false;
+    }
+    std::string account_error;
+    if (!account_log_after_attempt(account_error)) { error = account_error; return false; }
+    if (written > UINT64_MAX - entry.delta_bytes) {
+        entry.complete = false;
+        error = "delta record length overflows the committed chain";
+        return false;
+    }
+    const uint64_t committed = entry.delta_bytes + written;
+    if (!write_chain(entry.chain_path(), entry.file_bytes, committed, error)) return false;
+    const PathInfo chain = inspect_path_nofollow(entry.chain_path());
+    if (!chain.inspected || !chain.regular) {
+        entry.has_chain = true;
+        entry.complete = false;
+        error = "published spill chain manifest is not a regular file";
+        return false;
+    }
+    {
+        const uint64_t before = entry.total_bytes();
+        entry.has_chain = true;
+        entry.delta_bytes = committed;
+        entry.chain_file_bytes = chain.bytes;
+        entry.complete = false;   // until the matching sidecar generation is published
+        adjust_bytes(before, entry.total_bytes());
+    }
+
+    // The sidecar describes the state the chain now holds; the read pass double-checks its tail before restore.
+    Entry updated = entry;
+    updated.live_meta.ids = meta.live.ids;
+    updated.live_meta.imgs = meta.live.imgs;
+    updated.checkpoint_lengths.clear();
+    for (const auto& c : meta.checkpoints) updated.checkpoint_lengths.push_back(c.ids.size());
+    updated.last_used = now_ms();
+    if (!write_sidecar(entry.meta_path(), updated, error, true)) return false;
+    const PathInfo sidecar = inspect_path_nofollow(entry.meta_path());
+    if (!sidecar.inspected || !sidecar.regular) {
+        error = "published spill sidecar is not a regular file";
+        return false;
+    }
+    {
+        const uint64_t before = entry.total_bytes();
+        entry.live_meta.ids = std::move(updated.live_meta.ids);
+        entry.live_meta.imgs = std::move(updated.live_meta.imgs);
+        entry.checkpoint_lengths = std::move(updated.checkpoint_lengths);
+        entry.last_used = updated.last_used;
+        entry.meta_bytes = sidecar.bytes;
+        entry.complete = true;
+        adjust_bytes(before, entry.total_bytes());
+    }
+    enforce_budget();
+    return true;
+}
+
+bool ConversationSpillCache::spill_delta(size_t index, const SavedConversation& meta,
+                                         const std::vector<SessionKvSource>& kv, int64_t first_token,
+                                         size_t& bytes, std::string& error, bool durable, bool state_codec_rht,
+                                         SessionWriteTimings* timings, bool layout_v3) {
+    bytes = 0;
     try {
+        ConversationSpillDeltaWrite target;
+        if (!reserve_delta(index, target, error)) return false;
         SessionWriteOptions opt;
         opt.durable = durable;
         opt.state_codec_rht = state_codec_rht;
+        opt.timings = timings;
+        opt.layout_v3 = layout_v3;
         SessionStatus st;
         uint64_t written = 0;
-        if (!session_delta_write(entry.delta_path(), entry.delta_bytes, meta, kv, first_token, identity_,
-                                 written, error, opt, &st)) {
-            account_log_after_attempt();
-            return false;
-        }
-        account_log_after_attempt();
-        if (written > UINT64_MAX - entry.delta_bytes) {
-            entry.complete = false;
-            error = "delta record length overflows the committed chain";
-            return false;
-        }
-        const uint64_t committed = entry.delta_bytes + written;
-        if (!write_chain(entry.chain_path(), entry.file_bytes, committed, error)) return false;
-        const PathInfo chain = inspect_path_nofollow(entry.chain_path());
-        if (!chain.inspected || !chain.regular) {
-            entry.has_chain = true;
-            entry.complete = false;
-            error = "published spill chain manifest is not a regular file";
-            return false;
-        }
-        {
-            const uint64_t before = entry.total_bytes();
-            entry.has_chain = true;
-            entry.delta_bytes = committed;
-            entry.chain_file_bytes = chain.bytes;
-            entry.complete = false;   // until the matching sidecar generation is published
-            adjust_bytes(before, entry.total_bytes());
-        }
-
-        // The sidecar describes the state the chain now holds; the read pass double-checks its tail before restore.
-        Entry updated = entry;
-        updated.live_meta.ids = meta.live.ids;
-        updated.live_meta.imgs = meta.live.imgs;
-        updated.checkpoint_lengths.clear();
-        for (const auto& c : meta.checkpoints) updated.checkpoint_lengths.push_back(c.ids.size());
-        updated.last_used = now_ms();
-        if (!write_sidecar(entry.meta_path(), updated, error, true)) return false;
-        const PathInfo sidecar = inspect_path_nofollow(entry.meta_path());
-        if (!sidecar.inspected || !sidecar.regular) {
-            error = "published spill sidecar is not a regular file";
-            return false;
-        }
-        {
-            const uint64_t before = entry.total_bytes();
-            entry.live_meta.ids = std::move(updated.live_meta.ids);
-            entry.live_meta.imgs = std::move(updated.live_meta.imgs);
-            entry.checkpoint_lengths = std::move(updated.checkpoint_lengths);
-            entry.last_used = updated.last_used;
-            entry.meta_bytes = sidecar.bytes;
-            entry.complete = true;
-            adjust_bytes(before, entry.total_bytes());
-        }
-        enforce_budget();
+        const bool ok = session_delta_write(target.delta_path(), target.delta_bytes, meta, kv, first_token,
+                                            target.identity, written, error, opt, &st);
+        if (!publish_delta(target, meta, (size_t) written, ok, error)) return false;
         bytes = (size_t) written;
         return true;
     } catch (const std::bad_alloc&) {

@@ -319,9 +319,10 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // must not go on.  An atomic replacement that is itself self-consistent and keeps the same sizes is NOT detected:
 // the file must have no writer but this engine. For any descriptor-format file (v2 or v3) the caller must pass
 // finite bounds with `bounds->admit` non-null; the legacy no-bounds form remains for compatibility but does not
-// provide descriptor admission protection.  A v3 file's state section follows its K/V: the apply pass validates
-// that section (positioned from the read pass's K/V directory) BEFORE the first block reaches the sink, so a v3
-// state corruption is refused just as cleanly as a v2 one.  Peak RAM: two 16 MiB buffers and `meta`.
+// provide descriptor admission protection.  A v3 file's state section follows its K/V and is consumed HASH-ONLY in
+// the apply walk - no second decode: its integrity is the read pass's full decode plus the same trailing payload
+// hash the K/V gets, so a v3 state corruption surfaces no later than the trailer check, after any K/V reached the
+// sink, and follows the identical fail-stop path.  Peak RAM: two 16 MiB buffers and `meta`.
 //
 // `layer` counts as the save wrote them (main layers, then the draft); `part` 0..4 is k, v, k_scale, v_scale,
 // pooled; `offset` is within the part.
@@ -383,6 +384,9 @@ struct SessionDeltaRecord {
     SavedConversation meta;                           // live + checkpoints + K/V headers; the K/V buffers stay empty
     std::vector<std::array<uint64_t, 5>> kv_offset;   // bytes skipped per layer/part (where the record's data goes)
     std::vector<std::array<uint64_t, 5>> kv_bytes;    // bytes the record holds per layer/part
+    // the absolute file offset where the record's payload ends (its trailer starts); the read pass records it and
+    // the v3 apply walk consumes the state section hash-only up to it (no second decode)
+    uint64_t payload_end = 0;
 };
 
 // Appends one record for `meta` + `kv` at `at` (the caller's committed length; the file is created if absent and cut
@@ -403,7 +407,9 @@ bool session_delta_read(const std::string& path, uint64_t at, uint64_t limit, co
 
 // The apply pass of one read record: re-reads it and hands its K/V blocks to `sink` at (offset + at within the
 // part), refusing a record whose structure differs from `expected` BEFORE a block is applied, and re-checking the
-// payload hash at the end.  As with session_file_apply_streamed, a failure after the first sink call leaves the
+// payload hash at the end.  A v3 record's state section is consumed hash-only (no second decode); its integrity is
+// the read pass's full decode plus the trailing hash, so a state corruption fails at that check, after the record's
+// K/V reached the sink.  As with session_file_apply_streamed, a failure after the first sink call leaves the
 // caller's state partly written: the caller must fail-stop.
 bool session_delta_apply(const std::string& path, uint64_t at, const SessionFileIdentity& id,
                          const SessionDeltaRecord& expected, const SessionKvBlock& sink, std::string& error,

@@ -2559,8 +2559,9 @@ int main() {
         }
 
         // v3 corruption: a flipped K/V byte fails the hash; a torn file fails the size; a bad state descriptor is
-        // refused by the apply pass BEFORE any block reaches the sink (the states-first layouts' clean refusal,
-        // preserved by the v3 apply's ahead-of-the-sink state validation)
+        // consumed hash-only and fails the trailing payload hash AFTER the K/V reached the sink - the same fail-stop
+        // path a K/V corruption takes (the caller must fail-stop; the states-first layouts refuse ahead of the sink
+        // only because their states precede the K/V)
         {
             const fs::path p = dir / "v3.bin";
             auto d = slurp(p);
@@ -2573,8 +2574,9 @@ int main() {
             spit(short_p, d);
             check(rejects(short_p, id, nullptr), "v3corr: a truncated v3 file is refused");
             // a corrupt state descriptor (codec 7), hash NOT recomputed: the read pass of the clean file succeeds
-            // first; corrupting the state section afterwards (a torn re-read between the passes) must be refused by
-            // the apply pass BEFORE any block reaches the sink - the same clean refusal the states-first layouts give
+            // first; corrupting the state section afterwards (a torn re-read between the passes) is consumed
+            // hash-only, so the K/V reaches the sink and the walk fails at the trailing payload hash - the same
+            // fail-stop path a K/V corruption takes
             d = slurp(p);
             size_t states_at = 64 + 21 * 8 + 8;
             for (const auto& k : original.kv) {
@@ -2593,8 +2595,8 @@ int main() {
             size_t calls = 0;
             check(!session_file_apply_streamed(bad_state.string(), id,
                   [&](size_t, size_t, uint64_t, const void*, size_t) { ++calls; return true; }, sizes, error) &&
-                  calls == 0 && error.find("codec") != std::string::npos,
-                  "v3corr: a bad state descriptor is refused before the first sink block");
+                  calls > 0 && error.find("checksum") != std::string::npos,
+                  "v3corr: a bad state descriptor fails the trailing hash after the K/V (fail-stop)");
         }
 
         // the sources-released notification: exactly once, after every K/V source read, before the state section
@@ -2765,7 +2767,8 @@ int main() {
                 }
             }
             check(rebuilt_same, "v3delta: the record's tails rebuild the grown K/V exactly");
-            // a corrupt state descriptor in a v3 record is refused before any block is applied
+            // a corrupt state descriptor in a v3 record is consumed hash-only: the K/V is applied, then the walk
+            // fails at the trailing payload hash (the caller fails stops, as for a K/V corruption)
             auto corrupted = log_bytes;
             uint64_t states_at = 40 + 21 * 8 + 8;   // magic..first_token, the geo prefix, the K/V count
             for (size_t l = 0; l < r.kv_bytes.size(); ++l) {
@@ -2779,8 +2782,8 @@ int main() {
             size_t calls = 0;
             check(!session_delta_apply(clog.string(), 0, id, r,
                   [&](size_t, size_t, uint64_t, const void*, size_t) { ++calls; return true; }, error) &&
-                  calls == 0 && error.find("codec") != std::string::npos,
-                  "v3delta: a bad record state descriptor is refused before any block is applied");
+                  calls > 0 && error.find("checksum") != std::string::npos,
+                  "v3delta: a bad record state descriptor fails the trailing hash after the K/V (fail-stop)");
             fs::remove(log);
             fs::remove(clog);
         }

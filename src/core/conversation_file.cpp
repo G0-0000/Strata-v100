@@ -1225,12 +1225,8 @@ constexpr uint64_t kDeltaVersionV1 = 1;
 constexpr uint64_t kDeltaVersion = 2;
 constexpr uint64_t kDeltaVersionV3 = 3;
 constexpr char kDeltaMagic[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
-// the record header before the geometry prefix: magic, version, model, config, first_token
-constexpr uint64_t kDeltaHead = 8 + 8 + 8 + 8 + 8;
-// the geometry prefix: 18 geometry words, layer_lo, layer_hi, cvec
-constexpr uint64_t kGeoPrefix = 18 * 8 + 3 * 8;
-// one K/V layer's header (7 words) and one part's (offset, size) framing
-constexpr uint64_t kKvHeaderBytes = 7 * 8, kKvPartBytes = 2 * 8;
+// one K/V layer's header (7 words)
+constexpr uint64_t kKvHeaderBytes = 7 * 8;
 
 void put_delta_record(Out& o, const SessionFileIdentity& id, int64_t first_token, const SavedConversation& s,
                       const std::vector<SessionKvSource>& kv, uint64_t version,
@@ -1306,6 +1302,20 @@ struct In {
         if (n > limit) return fail("element count " + std::to_string(n) + " exceeds this engine's limit " +
                                    std::to_string(limit));
         if (n > (uint64_t) std::numeric_limits<size_t>::max() / (elem ? elem : 1)) return fail("element count too large");
+        return true;
+    }
+    // The v3 apply walk's states section: `n` bytes feed the running hash with NO decode and no destination - the
+    // same bytes a full decode would read and hash, so the trailing-hash check covers them identically.  `scratch` is
+    // a reusable read block (the K/V walk's 16 MiB block); `n` must not exceed the payload bytes left.
+    bool hash_only(uint8_t* scratch, size_t cap, uint64_t n) {
+        if (n > left) return fail("payload ends early");
+        while (n) {
+            const size_t c = (size_t) std::min<uint64_t>(cap, n);
+            if (!f->read(scratch, c)) { kind = f->kind(); return fail("read error: " + f->error()); }
+            hash.update(scratch, c);
+            left -= c;
+            n -= c;
+        }
         return true;
     }
     template<class T, class A> bool resize(std::vector<T, A>& v, uint64_t n) {
@@ -1479,7 +1489,7 @@ struct DeltaIn {
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
     const ConversationCheckpoint* ref_live = nullptr;
-    const char* what = "delta record";   // the error prefix; the v3 session apply borrows this reader for its state section
+    const char* what = "delta record";   // the error prefix
      bool fail(const std::string& m) { if (error.empty()) error = std::string(what) + ": " + m; return false; }
      bool account_state_codec(uint64_t codec, uint64_t, uint64_t) { return codec <= 2; }
     bool raw(void* p, size_t c) {
@@ -1510,6 +1520,20 @@ struct DeltaIn {
         if (n > limit) return fail("element count " + std::to_string(n) + " exceeds this engine's limit " +
                                    std::to_string(limit));
         if (n > (uint64_t) std::numeric_limits<size_t>::max() / (elem ? elem : 1)) return fail("element count too large");
+        return true;
+    }
+    // The v3 apply walk's states section: `n` bytes feed the running hash with NO decode and no destination - the
+    // same bytes a full decode would read and hash, so the trailing-hash check covers them identically.  `scratch` is
+    // a reusable read block (the K/V walk's 16 MiB block); `n` must not exceed the record bytes left.
+    bool hash_only(uint8_t* scratch, size_t cap, uint64_t n) {
+        if (n > end - at) return fail("record ends early");
+        while (n) {
+            const size_t c = (size_t) std::min<uint64_t>(cap, n);
+            if (!f->read_at(at, scratch, c)) { kind = f->kind(); return fail("read error: " + f->error()); }
+            hash.update(scratch, c);
+            at += c;
+            n -= c;
+        }
         return true;
     }
     bool prepare_allocation(uint64_t count, size_t element_size) {
@@ -1711,6 +1735,20 @@ bool get_payload_streamed_v3(In& in, SavedConversation& s, const SessionKvBlock&
     if (!get_geo_prefix_t(in, s)) return false;
     if (!get_kv_streamed<true>(in, s, sink)) return false;
     return get_states_v2_t(in, s);
+}
+
+// the v3 APPLY walk: the geo prefix, the streamed K/V to the sink, then the state section consumed HASH-ONLY - every
+// remaining payload byte feeds the running hash with no decode, exactly the bytes the read pass decoded and hashed.
+// The states are protected exactly like the K/V: the read pass's full decode plus this same trailing payload hash,
+// so a state corruption surfaces no later than the trailer check - after any K/V reached the sink - and the caller
+// fails stops the same way it does for K/V corruption.
+bool get_payload_apply_v3(In& in, SavedConversation& s, const SessionKvBlock& sink) {
+    if (!get_geo_prefix_t(in, s)) return false;
+    if (!get_kv_streamed<true>(in, s, sink)) return false;
+    if (!in.left) return true;
+    Aligned block = aligned_block();
+    if (!block) { in.kind = SessionError::memory; return in.fail("out of memory for the state read block"); }
+    return in.hash_only(block.get(), kBlock, in.left);
 }
 
 // header, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
@@ -2302,32 +2340,6 @@ struct ReadFile {
     }
 };
 
-// where a v3 session file's state section starts (the absolute offset of its first byte), derived from the read
-// pass's K/V part directory: the header, the geometry prefix, the layer count, then each layer's header and its
-// five (size word + payload bytes).  UINT64_MAX on overflow.
-uint64_t session_states_offset(const std::vector<std::array<uint64_t, 5>>& kv_part_bytes) {
-    uint64_t n = sat_add(kHeader, kGeoPrefix);
-    n = sat_add(n, 8);
-    for (const auto& parts : kv_part_bytes) {
-        n = sat_add(n, kKvHeaderBytes);
-        for (uint64_t b : parts) n = sat_add(n, sat_add(8, b));
-    }
-    return n;
-}
-
-// where a v3 delta record's state section starts (the absolute offset of its first byte), derived from the read
-// pass's record: the record header, the geometry prefix, the layer count, then each layer's header and its five
-// (offset, size) framings and payload bytes.  UINT64_MAX on overflow.
-uint64_t delta_states_offset(uint64_t at0, const SessionDeltaRecord& expected) {
-    uint64_t n = sat_add(kDeltaHead, kGeoPrefix);
-    n = sat_add(n, 8);
-    for (size_t l = 0; l < expected.kv_bytes.size(); ++l) {
-        n = sat_add(n, kKvHeaderBytes);
-        for (uint64_t b : expected.kv_bytes[l]) n = sat_add(n, sat_add(kKvPartBytes, b));
-    }
-    return n > UINT64_MAX - at0 ? UINT64_MAX : at0 + n;
-}
-
 bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
     error.clear();
@@ -2406,7 +2418,10 @@ bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, Sa
 // pass's list: this walk refuses a file whose layer count or part sizes differ before applying that layer or part,
 // so the sink only ever sees the bytes the read pass admitted.  The payload hash is recomputed and compared to the
 // trailer at the end - a same-size divergence since the read pass ends the caller (fail-stop).  Any failure past
-// the first sink call leaves the caller's state partly written - the caller must fail-stop.
+// the first sink call leaves the caller's state partly written - the caller must fail-stop.  A v3 file's state
+// section is consumed HASH-ONLY in this walk (no second decode): its protection is the read pass's full decode plus
+// this same trailing hash, so a v3 state corruption surfaces no later than the trailer check - after any K/V
+// reached the sink - and takes the identical fail-stop path.
 bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
                        const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
                        SessionStatus& st, const SessionReadLimits* bounds) {
@@ -2430,34 +2445,7 @@ bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, c
             return false;
         }
     }
-    SavedConversation parsed;   // re-parsed, then discarded
-    if (rf.version == kVersionV3) {
-        // the v3 state section follows the K/V: validate it BEFORE any block reaches the sink, positioned from the
-        // read pass's K/V directory.  A buffered pread pass over the same descriptor reader does that (the
-        // sequential FileSource may use O_DIRECT, whose alignment arbitrary section offsets cannot meet), so a v3
-        // state corruption is refused just as cleanly, ahead of the sink, as a v2 one is in its single pass.
-        const uint64_t payload_end = rf.size - kTrailer;
-        const uint64_t states_at = session_states_offset(kv_part_bytes);
-        if (states_at >= payload_end) {
-            error = "session file: the K/V directory does not reach the state section";
-            return false;
-        }
-        RawFile buffered;
-        uint64_t buffered_size = 0;
-        if (!buffered.open_session(path, buffered_size, /*allow_direct=*/false)) {
-            st.error = buffered.refused() ? SessionError::invalid : buffered.kind();
-            error = "session file: " + path + ": " + buffered.error();
-            return false;
-        }
-        SessionReadLimits pread_limits = bounds ? *bounds : open;
-        pread_limits.admit = {};   // the apply peak admitted above covers this pass's bounded allocations
-        DeltaIn geo_in{&buffered, kHeader, payload_end, SessionHasher(0), error, pread_limits};
-        geo_in.what = "session file";
-        if (!get_geo_prefix_t(geo_in, parsed)) { st.error = geo_in.kind; return false; }
-        DeltaIn states_in{&buffered, states_at, payload_end, SessionHasher(0), error, pread_limits};
-        states_in.what = "session file";
-        if (!get_states_v2_t(states_in, parsed)) { st.error = states_in.kind; return false; }
-    }
+    SavedConversation parsed;   // the geo/K-V headers the walk needs; v3 states are not re-decoded here (hash-only)
     SessionReadLimits apply_limits = bounds ? *bounds : open;
     apply_limits.admit = {};    // the descriptor extra peak above covered this pass's staging; a caller passing
                                 // bounds MUST set admit itself (both current callers do), or the apply pass runs
@@ -2466,7 +2454,7 @@ bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, c
     in.verify_kv = &kv_part_bytes;
     const bool ok = rf.version == kVersion ? get_payload_streamed(in, parsed, sink)
                   : rf.version == kVersionV2 ? get_payload_streamed_v2(in, parsed, sink)
-                                             : get_payload_streamed_v3(in, parsed, sink);
+                                             : get_payload_apply_v3(in, parsed, sink);
     if (!ok) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
@@ -2790,6 +2778,7 @@ bool delta_read_impl(const std::string& path, uint64_t at0, uint64_t limit, cons
     }
     uint64_t ph = 0;
     char endm[8];
+    result.payload_end = in.at;   // the record's payload end, for the v3 apply walk's hash-only states consumption
     if (!in.tail(&ph, 8) || !in.tail(endm, 8)) { st.error = in.kind; return false; }
     if (ph != in.hash.digest()) { error = "delta record: payload checksum mismatch"; return false; }
     if (std::memcmp(endm, kEnd, 8) != 0) { error = "delta record: bad end marker"; return false; }
@@ -2856,36 +2845,41 @@ bool delta_apply_impl(const std::string& path, uint64_t at0, const SessionFileId
     if (first_token != expected.first_token) { in.fail("the record's first token differs from the read pass"); st.error = in.kind; return false; }
     SavedConversation parsed;
     if (version == kDeltaVersionV3) {
-        // the K/V-first record: the state section follows the K/V, so validate it BEFORE any block reaches the
-        // sink.  Its position follows from the read pass's directory (the record must match it, checked per part
-        // below before that part is sunk); the descriptor reader over a pread window refuses a corrupt state
-        // section cleanly, the way the states-first records do in their single pass.
+        // the K/V-first record: only the geometry prefix is parsed here; the state section is consumed HASH-ONLY
+        // after the K/V directory (below) - exactly the protection the K/V gets: the read pass's full decode plus
+        // the trailing payload hash.  A live/checkpoint divergence is a state-section change, caught by that hash
+        // no later than the trailer check, after the record's K/V reached the sink (the caller fails stops, as for
+        // a K/V change).
         if (!get_geo_prefix_t(in, parsed)) { st.error = in.kind; return false; }
-        const uint64_t states_at = delta_states_offset(at0, expected);
-        if (states_at == UINT64_MAX || states_at >= size - kTrailer) {
-            in.fail("the record's state section is outside the file");
-            st.error = SessionError::invalid;
-            return false;
-        }
-        DeltaIn states_in{&f, states_at, size - kTrailer, SessionHasher(0), error, bounded};
-        if (!get_states_v2_t(states_in, parsed)) { st.error = states_in.kind; return false; }
     } else {
         const bool parsed_meta = version == kDeltaVersion ? get_meta_prefix_v2(in, parsed)
                                                           : get_meta_prefix_t(in, parsed);
         if (!parsed_meta) { st.error = in.kind; return false; }
     }
-    if (parsed.live.ids.size() != expected.meta.live.ids.size() || parsed.geometry != expected.meta.geometry ||
-        parsed.layer_lo != expected.meta.layer_lo || parsed.layer_hi != expected.meta.layer_hi ||
-        parsed.cvec != expected.meta.cvec || parsed.checkpoints.size() != expected.meta.checkpoints.size()) {
+    // the v3 record's live/checkpoint counts come from its (hash-only) state section: they cannot be compared here
+    const bool meta_differs =
+        version == kDeltaVersionV3
+            ? (parsed.geometry != expected.meta.geometry || parsed.layer_lo != expected.meta.layer_lo ||
+               parsed.layer_hi != expected.meta.layer_hi || parsed.cvec != expected.meta.cvec)
+            : (parsed.live.ids.size() != expected.meta.live.ids.size() || parsed.geometry != expected.meta.geometry ||
+               parsed.layer_lo != expected.meta.layer_lo || parsed.layer_hi != expected.meta.layer_hi ||
+               parsed.cvec != expected.meta.cvec || parsed.checkpoints.size() != expected.meta.checkpoints.size());
+    if (meta_differs) {
         in.fail("the record differs from the read pass");
         st.error = in.kind;
         return false;
     }
     if (!delta_kv_dir_apply(in, expected, sink)) { st.error = in.kind; return false; }
     if (version == kDeltaVersionV3) {
-        // consume and hash the state section again in record order (it was validated ahead of the sink); the
-        // sequential re-parse re-checks every descriptor against the bounded limits
-        if (!get_states_v2_t(in, parsed)) { st.error = in.kind; return false; }
+        // the state section, in record order: consumed HASH-ONLY - every byte between the K/V directory and the
+        // record's trailer feeds the running hash with no decode, exactly the bytes the read pass decoded and hashed
+        if (expected.payload_end < in.at) { in.fail("the record's state section overlaps its trailer"); st.error = in.kind; return false; }
+        const uint64_t states = expected.payload_end - in.at;
+        if (states) {
+            Aligned block = aligned_block();
+            if (!block) { in.kind = SessionError::memory; st.error = in.kind; error = "delta record: out of memory for the state read block"; return false; }
+            if (!in.hash_only(block.get(), kBlock, states)) { st.error = in.kind; return false; }
+        }
     }
     uint64_t ph = 0;
     char endm[8];

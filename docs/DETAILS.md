@@ -926,8 +926,10 @@ without authorization.
 format-v3 `.sess` file and version-3 delta records. The fixed header, geometry, layer range and cvec flag still come
 first. The K/V headers and payload follow, then the live and checkpoint RAW/REF/RHT descriptors, the payload hash and
 the end marker. The v1/v2 formats and their state-first order stay unchanged when this flag is off. The reader accepts
-all three versions, including mixed-version delta chains. Before a v3 apply pass sends any K/V to the session, it
-validates the later state section too. An old binary that does not know v3 refuses it; the engine-version identity
+all three versions, including mixed-version delta chains. A v3 apply pass consumes the later state section
+hash-only: the read pass's full decode plus the trailing payload hash protect it, exactly like the K/V, so a v3
+state corruption is caught at the trailer check and the restore fails closed like any K/V corruption. An old
+binary that does not know v3 refuses it; the engine-version identity
 keeps such a file separate from older caches.
 
 The save still waits while it captures the live state and reads the K/V sources. The v3 order lets it release those

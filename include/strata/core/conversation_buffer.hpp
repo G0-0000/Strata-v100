@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -65,7 +66,8 @@ public:
             (count > SIZE_MAX / sizeof(Segment) || !add(total, count * sizeof(Segment)))) return SIZE_MAX;
         return total;
     }
-    void resize(size_t n, uint8_t value = 0) {
+    void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value); }
+    void resize_impl(size_t n, const uint8_t* value) {
         if (n > size_) {
             const size_t held = size_;
             const bool growing = held != 0;
@@ -85,7 +87,8 @@ public:
                                      "the segment's pages take the process's memory policy\n", cold, why.c_str());
             segments_.reserve(segments_.size() + extra / segment_bytes + (extra % segment_bytes != 0));
             if (extend) {
-                segments_.back().resize(segments_.back().size() + extend, value);
+                if (value) segments_.back().resize(segments_.back().size() + extend, *value);
+                else segments_.back().resize(segments_.back().size() + extend);
                 size_ += extend;
             }
             while (size_ < n) {
@@ -94,9 +97,10 @@ public:
                 // The segment's whole life is one mmap named for the parked class (vma_alloc.hpp): a reader
                 // attributes its resident pages by that name.  mmap takes no page (the resize below is the first
                 // touch, under the binding above), and the name is set before the zero fill, as it should be.
-                Segment segment{VmaAllocator<uint8_t>(vma_class::conv_cache)};
+                Segment segment{SegmentAllocator<uint8_t>(vma_class::conv_cache)};
                 segment.reserve(segment_capacity(count, previous, growing, held));
-                segment.resize(count, value);
+                if (value) segment.resize(count, *value);
+                else segment.resize(count);
                 segments_.push_back(std::move(segment));
                 size_ += count;
                 progress_beat();   // #2049: zero-filling 16 MiB of fresh pages is slow when the host is paging
@@ -111,6 +115,9 @@ public:
         }
     }
     void pop_back() { resize(size_ - 1); }
+    // resize() without the zero fill of what it adds (the fresh pages are not touched here): only for a caller that
+    // writes every added byte before anything reads it (STRATA_PARK_ASYNC's background copy)
+    void resize_for_overwrite(size_t n) { resize_impl(n, nullptr); }
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
@@ -141,8 +148,19 @@ public:
     }
 
 private:
-    // One segment is one mmap named `strata/conv_cache` (vma_alloc.hpp); the directory stays ordinary heap.
-    using Segment = std::vector<uint8_t, VmaAllocator<uint8_t>>;
+    // One segment is one mmap named `strata/conv_cache` (vma_alloc.hpp) - a reader attributes its resident pages
+    // by that name, so the directory alone stays ordinary heap.  The construct below is upstream's DefaultInit on
+    // top of that: value-initializes only when asked (resize's explicit fill value), so resize_for_overwrite
+    // leaves the bytes alone instead of zero-filling them first.
+    template<class T> struct SegmentAllocator : VmaAllocator<T> {
+        template<class U> struct rebind { using other = SegmentAllocator<U>; };
+        SegmentAllocator() = default;
+        SegmentAllocator(const char* class_name) : VmaAllocator<T>(class_name) {}
+        template<class U> SegmentAllocator(const SegmentAllocator<U>& other) noexcept : VmaAllocator<T>(other) {}
+        template<class U> void construct(U* p) { ::new ((void*) p) U; }
+        template<class U, class... A> void construct(U* p, A&&... a) { ::new ((void*) p) U(std::forward<A>(a)...); }
+    };
+    using Segment = std::vector<uint8_t, SegmentAllocator<uint8_t>>;
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.

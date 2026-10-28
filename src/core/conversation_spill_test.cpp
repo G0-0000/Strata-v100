@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <thread>
@@ -1993,6 +1994,257 @@ int main() {
               (int64_t) newest.live.ids.size(),
               "background spill: rejecting the old task leaves the newer chain intact");
         fs::remove_all(bdir);
+    }
+
+    // ---- the opt-in recompute gate: a same-model/other-config sidecar is normally kept but never indexed; the
+    // directory ledger (.strata-cache-gate) can approve exactly those entries for this identity and engine build.
+    {
+        const fs::path gdir = fs::temp_directory_path() / "strata_spill_gate_test";
+        fs::remove_all(gdir);
+        const SessionFileIdentity legacy{id.model, id.config ^ 0x0f0f0f0f0f0f0f0full};
+        const SessionFileIdentity other_model{id.model ^ 0x10, id.config};
+        SavedConversation foreign1 = sample(600);
+        SavedConversation foreign2 = sample(640);
+        SavedConversation foreign_other_model = sample(680);
+        SavedConversation same = sample(720);
+        for (auto& c : same.checkpoints) for (auto& v : c.ids) v += 4000;
+        for (auto& v : same.live.ids) v += 4000;
+        {
+            ConversationSpillCache w1;
+            check(w1.open(gdir, legacy, 1ull << 30, error) && w1.spill(foreign1, error) && w1.spill(foreign2, error),
+                  "gate fixture: two legacy-config entries");
+            ConversationSpillCache w2;
+            check(w2.open(gdir, other_model, 1ull << 30, error) && w2.spill(foreign_other_model, error),
+                  "gate fixture: an other-model entry");
+            ConversationSpillCache w3;
+            check(w3.open(gdir, id, 1ull << 30, error) && w3.spill(same, error),
+                  "gate fixture: a same-identity entry");
+        }
+        struct GateRow {
+            std::string stem, path;
+            uint64_t bytes = 0;
+            int64_t tokens = 0;
+        };
+        auto entry_at = [&](const SessionFileIdentity& who, size_t index) {
+            ConversationSpillCache c;
+            GateRow row;
+            check(c.open(gdir, who, 1ull << 30, error) && index < c.size(), "gate fixture: reopen for entry info");
+            int64_t deepest = 0, tokens = 0;
+            uint64_t base = 0, delta_bytes = 0;
+            bool prefix = false;
+            check(c.entry_info(index, tokens, deepest, base, delta_bytes, prefix, row.path),
+                  "gate fixture: entry info");
+            row.stem = fs::path(row.path).stem().string();
+            row.bytes = base;
+            row.tokens = tokens;
+            return row;
+        };
+        const GateRow legacy1 = entry_at(legacy, 0);
+        const GateRow legacy2 = entry_at(legacy, 1);
+        const GateRow foreign_model_row = entry_at(other_model, 0);
+        const GateRow same_row = entry_at(id, 0);
+        check(legacy1.tokens == 600 && same_row.tokens == 720, "gate fixture: token counts");
+
+        ConversationSpillCache off;
+        check(off.open(gdir, id, 1ull << 30, error) && off.size() == 1,
+              "gate off: only the same-identity entry indexes");
+        const fs::path legacy1_meta = fs::path(legacy1.path).replace_extension(".meta");
+        check(fs::exists(legacy1.path) && fs::exists(legacy1_meta) && fs::exists(legacy2.path),
+              "gate off: the foreign files are kept");
+
+        ConversationSpillGateOptions gate;
+        gate.enabled = true;
+        gate.engine_build = "test-build";
+        auto reopen = [&](size_t& size, std::string& e) {
+            ConversationSpillCache c;
+            const bool ok = c.open(gdir, id, 1ull << 30, e, false, gate);
+            size = c.size();
+            return ok;
+        };
+        size_t indexed = 0;
+        check(reopen(indexed, error) && indexed == 1, "gate on without a ledger: nothing foreign is approved");
+        {
+            ConversationSpillCache c;
+            check(c.open(gdir, id, 1ull << 30, error, false, gate), "gate on: open for a same-identity load");
+            SavedConversation back;
+            SessionStatus gst;
+            check(c.load(same_row.path, back, {}, error, &gst) && back.live.ids == same.live.ids,
+                  "gate on without a ledger: same-identity loads as before");
+        }
+
+        ConversationSpillGateBatch batch;
+        batch.id = "b1";
+        batch.source = legacy;
+        batch.target = id;
+        batch.engine_build = "test-build";
+        batch.sample = legacy1.stem;
+        batch.passed = false;
+        batch.verified_ms = 1234;
+        batch.reason = "route counts differ";
+        std::vector<ConversationSpillGateBatch> batches{batch};
+        std::vector<ConversationSpillGateEntry> rows{{legacy1.stem, "b1", legacy1.bytes, legacy1.tokens, 99}};
+        check(session_spill_gate_write(gdir, batches, rows, error), "gate: write the ledger");
+        check(reopen(indexed, error) && indexed == 1, "gate: a failed batch approves nothing");
+
+        batch.passed = true;
+        batch.reason.clear();
+        batch.engine_build = "other-build";
+        batches = {batch};
+        check(session_spill_gate_write(gdir, batches, rows, error) && reopen(indexed, error) && indexed == 1,
+              "gate: another engine build approves nothing");
+        batch.engine_build = "test-build";
+        batch.target.config = id.config ^ 1;
+        batches = {batch};
+        check(session_spill_gate_write(gdir, batches, rows, error) && reopen(indexed, error) && indexed == 1,
+              "gate: another target configuration approves nothing");
+        batch.target = id;
+        batches = {batch};
+        const std::vector<ConversationSpillGateEntry> no_rows;
+        check(session_spill_gate_write(gdir, batches, no_rows, error) && reopen(indexed, error) && indexed == 1,
+              "gate: a batch without an entry row approves nothing");
+        rows[0].file_bytes = legacy1.bytes + 1;
+        check(session_spill_gate_write(gdir, batches, rows, error) && reopen(indexed, error) && indexed == 1,
+              "gate: a stale file size approves nothing");
+        rows[0].file_bytes = legacy1.bytes;
+        rows[0].tokens = legacy1.tokens + 1;
+        check(session_spill_gate_write(gdir, batches, rows, error) && reopen(indexed, error) && indexed == 1,
+              "gate: a stale token count approves nothing");
+        rows[0].tokens = legacy1.tokens;
+        batch.source = other_model;
+        rows[0].stem = foreign_model_row.stem;
+        rows[0].file_bytes = foreign_model_row.bytes;
+        rows[0].tokens = foreign_model_row.tokens;
+        batches = {batch};
+        check(session_spill_gate_write(gdir, batches, rows, error) && reopen(indexed, error) && indexed == 1,
+              "gate: another model is never approved");
+
+        batch.source = legacy;
+        rows[0] = {legacy1.stem, "b1", legacy1.bytes, legacy1.tokens, 1700000000000ull};
+        batches = {batch};
+        check(session_spill_gate_write(gdir, batches, rows, error), "gate: write the approving ledger");
+        ConversationSpillCache approved;
+        check(approved.open(gdir, id, 1ull << 30, error, false, gate) && approved.size() == 2,
+              "gate: a passed batch and its row index the approved entry");
+        check(approved.find(legacy2.path) == approved.size(),
+              "gate: an entry without a row stays unindexed");
+        // the next turn's prompt extends the cached conversation: its live state is a strict prefix of the prompt
+        std::vector<int32_t> prompt(foreign1.live.ids.begin(), foreign1.live.ids.end());
+        prompt.push_back(7777);
+        const ConversationSpillMatch hit = approved.best(prompt, {}, foreign1.cvec, 0.0, 0);
+        check(bool(hit) && hit.tokens == 600 && hit.path == legacy1.path,
+              "gate: the approved entry is the match");
+        SavedConversation restored;
+        SessionStatus load_st;
+        check(approved.load(hit.path, restored, {}, error, &load_st) && restored.live.ids == foreign1.live.ids &&
+                  restored.checkpoints.size() == foreign1.checkpoints.size(),
+              "gate: the approved entry loads with its own config");
+        SessionFileIdentity kept;
+        check(approved.entry_source_identity(approved.find(hit.path), kept) && kept.model == legacy.model &&
+                  kept.config == legacy.config,
+              "gate: the entry keeps its original identity");
+
+        // the ledger is a rebuildable cache: corrupt, half-written or missing approves nothing, and the
+        // same-identity cache keeps working.
+        const fs::path ledger = gdir / ".strata-cache-gate";
+        std::string text;
+        {
+            std::ifstream in(ledger, std::ios::binary);
+            text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        auto spit_text = [&](const std::string& bytes) {
+            std::ofstream out(ledger, std::ios::binary | std::ios::trunc);
+            out.write(bytes.data(), (std::streamsize) bytes.size());
+        };
+        std::string edited = text;
+        edited[edited.size() / 3] = char(edited[edited.size() / 3] ^ 0x01);
+        spit_text(edited);
+        check(reopen(indexed, error) && indexed == 1, "gate: a corrupt ledger approves nothing");
+        {
+            ConversationSpillCache c;
+            check(c.open(gdir, id, 1ull << 30, error, false, gate), "gate: open with a corrupt ledger");
+            SavedConversation back;
+            SessionStatus gst;
+            check(c.load(same_row.path, back, {}, error, &gst) && back.live.ids == same.live.ids,
+                  "gate: a corrupt ledger does not stop same-identity loads");
+        }
+        std::vector<ConversationSpillGateBatch> corrupt_batches;
+        std::vector<ConversationSpillGateEntry> corrupt_rows;
+        check(!session_spill_gate_read(gdir, corrupt_batches, corrupt_rows, error) && !error.empty(),
+              "gate: the reader refuses a corrupt ledger");
+        spit_text(text.substr(0, text.size() / 2));
+        check(reopen(indexed, error) && indexed == 1, "gate: a half-written ledger approves nothing");
+        fs::remove(ledger);
+        check(reopen(indexed, error) && indexed == 1, "gate: a missing ledger approves nothing");
+
+        // the format round-trips and refuses fields it could not keep on one line
+        std::vector<ConversationSpillGateBatch> read_batches;
+        std::vector<ConversationSpillGateEntry> read_rows;
+        check(!session_spill_gate_read(gdir, read_batches, read_rows, error), "gate: reading a missing ledger fails");
+        check(session_spill_gate_write(gdir, batches, rows, error), "gate: rewrite the approving ledger");
+        check(session_spill_gate_read(gdir, read_batches, read_rows, error) && read_batches.size() == 1 &&
+                  read_rows.size() == 1 && read_batches[0].passed && read_batches[0].source.config == legacy.config &&
+                  read_batches[0].target.config == id.config && read_rows[0].stem == legacy1.stem &&
+                  read_rows[0].tokens == legacy1.tokens && error.empty(),
+              "gate: the ledger round-trips");
+        {
+            std::vector<ConversationSpillGateBatch> bad = batches;
+            bad[0].sample = "has space";
+            check(!session_spill_gate_write(gdir, bad, rows, error), "gate: the writer refuses whitespace");
+            std::vector<ConversationSpillGateEntry> bad_rows = rows;
+            bad_rows[0].batch_id.clear();
+            check(!session_spill_gate_write(gdir, batches, bad_rows, error), "gate: the writer refuses an empty field");
+            check(session_spill_gate_read(gdir, read_batches, read_rows, error) && read_rows.size() == 1,
+                  "gate: a refused write leaves the previous ledger");
+        }
+        // A gate-approved entry is read-only: appending a record would put this engine configuration's bytes behind
+        // a file of the other one, so the chain would no longer be what the ledger approved.
+        {
+            check(session_spill_gate_write(gdir, batches, rows, error), "gate write: restore the approving ledger");
+            ConversationSpillCache dm;
+            check(dm.open(gdir, id, 1ull << 30, error, true, gate) && dm.size() == 2,
+                  "gate write: delta mode indexes the approved entry");
+            ConversationSpillDeltaWrite target;
+            const size_t legacy_index = dm.find(legacy1.path);
+            check(legacy_index < dm.size() && !dm.reserve_delta(legacy_index, target, error) &&
+                      error.find("read-only") != std::string::npos && !target.valid,
+                  "gate write: reserve_delta refuses an entry of another configuration");
+            size_t written = 0;
+            SavedConversation appended = foreign1;
+            appended.live.ids.push_back(8888);
+            check(!dm.spill_delta(legacy_index, appended, {}, 600, written, error) && written == 0,
+                  "gate write: spill_delta refuses an entry of another configuration");
+            const size_t same_index = dm.find(same_row.path);
+            check(same_index < dm.size() && dm.reserve_delta(same_index, target, error) && target.valid,
+                  "gate write: reserve_delta still accepts this cache's own entries");
+            // A hit stamps the entry (touch rewrites the sidecar): the rewritten sidecar must keep the entry's OWN
+            // identity, or the file would be forged as this cache's and read after a restart without the ledger.
+            {
+                SavedConversation back;
+                SessionStatus tst;
+                check(dm.load(legacy1.path, back, {}, error, &tst) && back.live.ids == foreign1.live.ids,
+                      "gate touch: the approved entry loads with its own configuration");
+                dm.touch(legacy1.path);
+                ConversationSpillCache without_gate;
+                check(without_gate.open(gdir, id, 1ull << 30, error) && without_gate.size() == 1 &&
+                          without_gate.find(legacy1.path) == without_gate.size(),
+                      "gate touch: the rewritten sidecar still needs the gate (unindexed without it)");
+                ConversationSpillCache with_gate;
+                check(with_gate.open(gdir, id, 1ull << 30, error, true, gate) &&
+                          with_gate.find(legacy1.path) < with_gate.size(),
+                      "gate touch: with the ledger the rewritten entry is still indexed");
+                SessionFileIdentity kept_after;
+                check(with_gate.entry_source_identity(with_gate.find(legacy1.path), kept_after) &&
+                          kept_after.model == legacy.model && kept_after.config == legacy.config,
+                      "gate touch: the rewritten sidecar keeps the entry's own identity");
+                SavedConversation again;
+                SessionStatus ast;
+                check(with_gate.load(legacy1.path, again, {}, error, &ast) &&
+                          again.live.ids == foreign1.live.ids,
+                      "gate touch: the rewritten entry still loads under the ledger");
+            }
+            fs::remove(ledger);
+        }
+        fs::remove_all(gdir);
     }
 
     std::printf("conversation_spill_test: %d checks passed\n", checks);

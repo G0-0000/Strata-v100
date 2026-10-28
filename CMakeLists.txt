@@ -160,9 +160,21 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conversation_spill_test src/core/conversation_spill_test.cpp src/core/conversation_spill.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_spill_test PRIVATE include)
   add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
+  # host-only: the opt-in accepted configuration (SessionReadLimits::accept_config) of a gate-approved cache entry,
+  # for the base file and for a delta record's read and apply passes; no model, no GPU
+  add_executable(conversation_accept_config_test src/core/conversation_accept_config_test.cpp src/core/conversation_file.cpp)
+  target_include_directories(conversation_accept_config_test PRIVATE include)
+  add_test(NAME conversation_accept_config_test COMMAND conversation_accept_config_test)
   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
+  # host-only: one base session file's format-independent digest (session_file_digest), for the test/orchestration
+  # scripts that compare a re-saved file with the one it replaces; no model, no GPU
+  add_executable(strata-session-digest src/core/session_digest_main.cpp src/core/conversation_file.cpp)
+  target_include_directories(strata-session-digest PRIVATE include)
+  add_executable(conversation_digest_test src/core/conversation_digest_test.cpp src/core/conversation_file.cpp)
+  target_include_directories(conversation_digest_test PRIVATE include)
+  add_test(NAME conversation_digest_test COMMAND conversation_digest_test)
   add_executable(rht_state_codec_test src/core/rht_state_codec_test.cpp)
   target_include_directories(rht_state_codec_test PRIVATE include)
   add_test(NAME rht_state_codec_test COMMAND rht_state_codec_test)

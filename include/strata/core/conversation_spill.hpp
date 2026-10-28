@@ -50,6 +50,68 @@ struct ConversationSpillDeltaWrite {
     std::string delta_path() const { return stem.string() + ".dlog"; }
 };
 
+// ---- The opt-in RECOMPUTE GATE and its directory ledger (.strata-cache-gate).
+//
+// A sidecar written under another engine CONFIGURATION is normally kept, never indexed.  With the gate on, the
+// directory also reads its ledger: a text file the recompute tool writes after it has re-run a sample of a cached
+// conversation's tokens on the current engine and found the result identical.  A foreign-config entry is indexed,
+// and its stored config accepted when it is read, only when the ledger names it AND its batch passed for exactly
+// (source model+config -> this model+config+this engine build).  A foreign MODEL is never approved.  The ledger is
+// a rebuildable cache, never authority: the sidecar and the session file decide what an entry is, and a missing,
+// truncated, edited or checksum-mismatched ledger approves nothing while the same-identity cache works as before.
+//
+// Format: UTF-8 text, one record per line, fields separated by single spaces, in this order (version 1):
+//   strata-cache-gate <version>
+//   batch <id> <src_model> <src_config> <dst_model> <dst_config> <engine_build> <sample> <pass|fail> <time_ms> <reason>
+//   entry <stem> <batch_id> <file_bytes> <tokens> <last_used_ms>
+//   sum <hash>
+// The tokens <id>, <engine_build>, <sample>, <stem>, <batch_id> and <reason> carry no whitespace (a writer replaces
+// it with '_'; an empty reason is '-').  Fingerprints are 0x followed by 16 hex digits; byte counts, token counts
+// and times are decimal.  <stem> is a file name without its extension ("strata-conv-prefix-34").  <hash> is the
+// 64-bit session hash (session_hash64, seed 0) of every byte before the "sum " line, as 16 hex digits, so a
+// half-written or edited ledger is refused whole.  A writer must create a temporary file beside the ledger and
+// rename it into place; a reader never sees a partially written one.  The recompute tool writes this file; the
+// engine only reads it.
+struct ConversationSpillGateBatch {
+    std::string id;
+    SessionFileIdentity source{};   // the identity the cached files carry
+    SessionFileIdentity target{};   // the identity this cache serves
+    std::string engine_build;       // the build that recomputed the sample
+    std::string sample;             // the stem of the file the recompute used
+    bool passed = false;            // result: pass (true) or fail (false)
+    uint64_t verified_ms = 0;       // wall-clock time of the recompute, milliseconds since the epoch
+    std::string reason;             // why a fail failed; empty for a pass
+};
+struct ConversationSpillGateEntry {
+    std::string stem;               // the file name without its extension
+    std::string batch_id;
+    uint64_t file_bytes = 0;        // the base .sess size the batch approved
+    int64_t tokens = 0;             // the sidecar's live token count at approval time
+    uint64_t last_used = 0;         // wall-clock milliseconds since the epoch, informational
+};
+// Reads <directory>/.strata-cache-gate.  False (outputs cleared) for a missing, unreadable, unknown-version,
+// malformed or checksum-mismatched file: a caller then approves nothing.
+bool session_spill_gate_read(const std::filesystem::path& directory, std::vector<ConversationSpillGateBatch>& batches,
+                             std::vector<ConversationSpillGateEntry>& entries, std::string& error);
+// Writes the ledger atomically: an exclusive temporary beside it, flushed, then renamed over it.  False when a
+// field would break the format (empty or whitespace-bearing token field) or the write fails.
+bool session_spill_gate_write(const std::filesystem::path& directory,
+                              const std::vector<ConversationSpillGateBatch>& batches,
+                              const std::vector<ConversationSpillGateEntry>& entries, std::string& error);
+// True when an entry row names this stem with this base size and token count, and its batch passed for exactly
+// the given source identity, target identity and engine build.
+bool session_spill_gate_approves(const std::vector<ConversationSpillGateBatch>& batches,
+                                 const std::vector<ConversationSpillGateEntry>& entries, const std::string& stem,
+                                 const SessionFileIdentity& source, const SessionFileIdentity& target,
+                                 const std::string& engine_build, uint64_t file_bytes, int64_t tokens);
+
+// Opt-in knobs of ConversationSpillCache::open.  The defaults are today's behaviour: the ledger is neither read nor
+// written and a sidecar of another identity stays retained and unindexed.
+struct ConversationSpillGateOptions {
+    bool enabled = false;
+    std::string engine_build;   // the current engine build (e.g. "0.1.52.20"); part of a batch's target tuple
+};
+
 class ConversationSpillCache {
 public:
     // Opens (creating if needed) the spill directory and indexes conversations already in it. Left-over write
@@ -60,13 +122,24 @@ public:
     // sidecar v2 (last-use stamp) and the budget evicts least-recently-used; without it (the default) new sidecars
     // stay baseline v1 and first-spilled eviction runs. Both modes read v1/v2 sidecars; a valid chain is retained and
     // accounted in base-only mode, but only delta mode offers it to the streaming restore.
+    // gate.enabled (opt-in, default off): read the directory's recompute ledger and index a same-model file that
+    // was saved under another engine configuration when the ledger approves it for this identity and engine build
+    // (see ConversationSpillGateOptions); such an entry is read with its own config accepted.  A failed ledger read
+    // approves nothing and leaves the rest of the cache unaffected; its reason is kept for gate_error().  A
+    // gate-approved entry is READ-ONLY: reserve_delta (and so spill_delta) refuses it, since an appended record would
+    // hold this cache's bytes after a file of the other configuration - such a conversation is written as a new file.
     bool open(const std::filesystem::path& directory, SessionFileIdentity identity, uint64_t budget_bytes,
-              std::string& error, bool delta_chains = false);
+              std::string& error, bool delta_chains = false, const ConversationSpillGateOptions& gate = {});
     bool enabled() const { return enabled_; }
     size_t size() const { return entries_.size(); }
     uint64_t bytes() const { return bytes_; }
     size_t stale_files_wiped() const { return stale_files_wiped_; }
     size_t disk_evictions() const { return disk_evictions_; }
+    // The recompute gate's startup facts, for the caller's one log line (open only reads the ledger when the gate is
+    // on).  `gate_error` is the ledger read's refusal, empty when there was none or the gate is off.
+    size_t gate_batch_count() const { return gate_batches_.size(); }
+    size_t gate_approved_count() const;
+    const std::string& gate_error() const { return gate_error_; }
 
     // The best resume this directory offers for the prompt, from the sidecars only (no K/V read). similarity and
     // n_min filter weak hits exactly as the RAM cache's best() does.
@@ -135,6 +208,9 @@ public:
                        bool write_succeeded, std::string& error);
     // The index of the entry whose session file is `path`, or size() when none.
     size_t find(const std::string& path) const;
+    // The identity the entry's file and sidecar carry: this cache's identity, except for a gate-approved entry saved
+    // under another engine configuration.  False for an unknown index.
+    bool entry_source_identity(size_t index, SessionFileIdentity& out) const;
     // What a delta save needs to know about an entry (see generate.cpp): its token count, its deepest checkpoint,
     // its file sizes and whether its live ids are a prefix of this conversation's tokens and images.  False for a
     // prefix entry or an unknown index.
@@ -181,6 +257,7 @@ private:
         uint64_t meta_bytes = 0;              // zero for a legacy v1 sidecar; otherwise its charged bytes
         uint64_t chain_file_bytes = 0;        // charged bytes of "<stem>.dchain"
         uint64_t last_used = 0;               // milliseconds since the epoch of the last save or successful restore
+        SessionFileIdentity source_identity{};   // the identity the sidecar/file carry (its config may be a gate-approved legacy one)
         bool cvec = true;
         ConversationCheckpoint live_meta;    // ids + imgs only; no running state
         std::vector<size_t> checkpoint_lengths;
@@ -200,6 +277,13 @@ private:
     // a false result retains an incomplete, ineligible entry with exact remaining ownership charges for retry.
     bool remove_group(Entry& entry, uint64_t& removed, std::vector<std::string>& left);
     std::filesystem::path next_stem(bool prefix = false);
+    // The gate's identity-level approval: a passed batch for exactly this source identity -> this cache's identity
+    // and the configured engine build.  False when the gate is off or the ledger approved nothing.
+    bool gate_identity_approved(const SessionFileIdentity& source) const;
+    // The gate's entry-level approval: a ledger row for this stem whose batch also passes (identity + build), and
+    // the row's size and token count match the file and sidecar (which stay authoritative).
+    bool gate_entry_approved(const std::string& stem, const SessionFileIdentity& source, uint64_t file_bytes,
+                             int64_t tokens) const;
     bool index_written(const std::filesystem::path& stem, uint64_t file_bytes, const SavedConversation& meta,
                        std::string& error, bool prefix = false);
     bool read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity,
@@ -222,6 +306,11 @@ private:
     std::vector<Entry> entries_;   // index order only; the budget evicts by Entry::last_used (least recent first)
                                    // when delta_chains is on, else first-spilled first (the baseline policy)
     bool delta_ = false;           // --conversation-cache-disk-delta: v2 sidecars, LRU eviction, chain appends
+    bool gate_ = false;            // the opt-in recompute gate: the ledger below may approve foreign-config entries
+    std::string gate_engine_build_;
+    std::vector<ConversationSpillGateBatch> gate_batches_;
+    std::vector<ConversationSpillGateEntry> gate_entries_;
+    std::string gate_error_;       // the ledger read's refusal (empty: none, or the gate is off); see gate_error()
     std::string pinned_path_;
 };
 

@@ -286,6 +286,11 @@ struct SessionReadLimits {
     // per K/V layer (the QSA layers, then the draft): the most bytes of each part (k, v, k_scale, v_scale, pooled).
     // A layer past the end of the list is bounded by the payload only.
     std::vector<std::array<uint64_t, 5>> max_kv_bytes;
+    // Opt-in ACCEPTED CONFIG (0 = off): a base file or delta record saved under another engine CONFIGURATION is
+    // read when its stored config fingerprint equals this value; the model fingerprint must still match.  Only the
+    // disk cache's recompute gate sets it (conversation_spill.hpp), and only for an entry that gate approved with a
+    // passing recompute record; every other reader leaves it 0, so today's refusals are unchanged.
+    uint64_t accept_config = 0;
     // The RAM ADMISSION callback: session-file readers screen their baseline, then account decoded state descriptors and
     // check allocations; delta readers ask before each count-based allocation. False refuses the read. Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
@@ -357,6 +362,26 @@ uint64_t session_read_meta_peak_bytes(const SessionReadLimits& limits);
 // record count and streamed K/V payload length.
 uint64_t session_delta_walk_peak_bytes(const SessionReadLimits& limits);
 
+// ---- Session digest: what a base `.sess` file holds, independent of the on-disk format.  One streaming pass over
+// the file: the K/V is hashed block by block (never materialized) and the running state is decoded exactly as a
+// restore decodes it, so a v1 file, a v2 REF file and a K/V-first v3 file of the same conversation give the same
+// three digests.  The lossy RHT state codec (opt-in) decodes to different floats: its file still digests equal in
+// `tokens` and `kv`, and `state_exact` is false there so callers compare those two only.
+struct SessionFileDigest {
+    uint32_t file_version = 0; // the verified header's format version (1, 2 or 3)
+    uint64_t tokens = 0;       // the live checkpoint's and every checkpoint's token ids and image keys, in order
+    uint64_t kv = 0;           // every K/V layer's header and its five parts, in layer/part order
+    uint64_t state = 0;        // the decoded running state: gdn, ple, tails, dead, block_pos, used; live then checkpoints
+    bool state_exact = true;   // false when an array used RHT: `state` is a lossy decode, do not compare it
+    bool state_ref = false;    // the file stored REF state descriptors (decoded content is exact)
+    bool state_rht = false;    // the file stored RHT-coded GDN
+};
+// Reads and validates one BASE session file and fills `out`; a delta record stream (a `.dlog`) is refused with a
+// message naming it - pass the base file the chain belongs to.  `id` is the model/config identity the file must
+// carry; no runtime geometry is needed.  On failure `out` is unchanged and `error` says why.
+bool session_file_digest(const std::string& path, const SessionFileIdentity& id, SessionFileDigest& out,
+                         std::string& error, SessionStatus* status = nullptr);
+
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
@@ -410,10 +435,11 @@ bool session_delta_read(const std::string& path, uint64_t at, uint64_t limit, co
 // payload hash at the end.  A v3 record's state section is consumed hash-only (no second decode); its integrity is
 // the read pass's full decode plus the trailing hash, so a state corruption fails at that check, after the record's
 // K/V reached the sink.  As with session_file_apply_streamed, a failure after the first sink call leaves the
-// caller's state partly written: the caller must fail-stop.
+// caller's state partly written: the caller must fail-stop.  The optional accept_config is the read pass's
+// SessionReadLimits::accept_config for a gate-approved legacy configuration (0 = off); the model must still match.
 bool session_delta_apply(const std::string& path, uint64_t at, const SessionFileIdentity& id,
                          const SessionDeltaRecord& expected, const SessionKvBlock& sink, std::string& error,
-                         SessionStatus* status = nullptr);
+                         SessionStatus* status = nullptr, uint64_t accept_config = 0);
 
 // The bytes one record takes, for a sizing/preflight pass (saturating: `overflow` says the size does not fit).
 // `layout_v3` must be the same value the matching session_delta_write receives, so the count and the written record

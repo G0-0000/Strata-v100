@@ -1276,6 +1276,9 @@ struct In {
     // outputs, which resize_admitted prices once per allocation; descriptor handling must not repeat the aggregate
     // peak ask after earlier allocations. REF arrays copy live bytes into independent vectors.
     const ConversationCheckpoint* ref_live = nullptr;
+    // the digest's: set when a state descriptor is REF or RHT (RHT decodes lossily, so its state cannot be compared)
+    bool* saw_ref = nullptr;
+    bool* saw_rht = nullptr;
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
     bool raw(void* p, size_t c) {
         if (c > left) return fail("payload ends early");
@@ -1489,6 +1492,9 @@ struct DeltaIn {
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
     const ConversationCheckpoint* ref_live = nullptr;
+    // the digest's: see In's (no current delta caller sets them)
+    bool* saw_ref = nullptr;
+    bool* saw_rht = nullptr;
     const char* what = "delta record";   // the error prefix
     bool fail(const std::string& m) { if (error.empty()) error = std::string(what) + ": " + m; return false; }
     bool account_state_codec(uint64_t codec, uint64_t, uint64_t) { return codec <= 2; }
@@ -1648,6 +1654,7 @@ bool get_state_v2(R& in, Vec& dst, const Vec& live_src, uint64_t limit, bool liv
     if (codec == 1) {
         // REF: only a non-live checkpoint, no stored bytes, the live same-order array's exact length (a logical size
         // may exceed the file's remaining bytes - that is what REF is for)
+        if (in.saw_ref) *in.saw_ref = true;
         if (live) return in.fail("the live state cannot reference itself");
         if (stored != 0) return in.fail(std::string("a REF state array stores no bytes (") + name + ")");
         if (logical != (uint64_t) live_src.size())
@@ -1657,6 +1664,7 @@ bool get_state_v2(R& in, Vec& dst, const Vec& live_src, uint64_t limit, bool liv
         return true;
     }
     if (codec == 2) {
+        if (in.saw_rht) *in.saw_rht = true;
         if (!gdn) return in.fail(std::string("RHT codec is only valid for gdn state (") + name + ")");
         rht::Layout layout{};
         if (!rht::layout_from(geometry, layer_lo, layer_hi, layout))
@@ -2252,8 +2260,8 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
 namespace {
 // The header every read checks first: magic, version, fields, size and both fingerprints, leaving `payload` and
 // the format `version` (1 or 2) set.
-bool header_ok(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, uint32_t& version, uint64_t& payload,
-               std::string& error) {
+bool header_ok(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, uint64_t accept_config,
+               uint32_t& version, uint64_t& payload, std::string& error) {
     uint32_t hsize = 0;
     uint64_t model = 0, config = 0, r0 = 0, r1 = 0, hh = 0;
     std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
@@ -2267,7 +2275,11 @@ bool header_ok(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, u
     }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
-    if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
+    // the opt-in accepted config (a gate-approved cache entry): the model still has to match
+    if (config != id.config && !(accept_config && config == accept_config)) {
+        error = "session file: saved with another engine configuration (config fingerprint differs)";
+        return false;
+    }
     if (payload > size || size - kHeader - kTrailer != payload) {
         error = "session file: size " + std::to_string(size) + " does not match the header (" +
                 std::to_string(kHeader + payload + kTrailer) + ")";
@@ -2317,7 +2329,7 @@ struct ReadFile {
             error = "session file: header read error: " + source.error();
             return false;
         }
-        if (!header_ok(h, size, id, version, payload, error)) return false;
+        if (!header_ok(h, size, id, limits.accept_config, version, payload, error)) return false;
         if (over_v1) {
             if (version == kVersion) {
                 error = "session file: size " + std::to_string(size) + " exceeds this engine's limit of " +
@@ -2757,7 +2769,8 @@ bool delta_read_impl(const std::string& path, uint64_t at0, uint64_t limit, cons
         st.error = in.kind;
         return false;
     }
-    if (model != id.model || config != id.config) {
+    // the optional accepted config (a gate-approved cache entry): the model still has to match
+    if (model != id.model || (config != id.config && !(limits.accept_config && config == limits.accept_config))) {
         error = "delta record: saved with another model or engine configuration";
         return false;
     }
@@ -2817,7 +2830,7 @@ bool delta_apply_limits(const SessionDeltaRecord& expected, SessionReadLimits& l
 
 bool delta_apply_impl(const std::string& path, uint64_t at0, const SessionFileIdentity& id,
                       const SessionDeltaRecord& expected, const SessionKvBlock& sink, std::string& error,
-                      SessionStatus& st) {
+                      uint64_t accept_config, SessionStatus& st) {
     error.clear();
     st = {};
     st.error = SessionError::invalid;
@@ -2838,7 +2851,7 @@ bool delta_apply_impl(const std::string& path, uint64_t at0, const SessionFileId
     if (!in.raw(magic, 8) || std::memcmp(magic, kDeltaMagic, 8) != 0 || !in.u64(version) ||
         (version != kDeltaVersionV1 && version != kDeltaVersion && version != kDeltaVersionV3) ||
         !in.u64(model) || !in.u64(config) || !in.i64(first_token)) { st.error = in.kind; return false; }
-    if (model != id.model || config != id.config) {
+    if (model != id.model || (config != id.config && !(accept_config && config == accept_config))) {
         error = "delta record: saved with another model or engine configuration";
         return false;
     }
@@ -2925,11 +2938,11 @@ bool session_delta_read(const std::string& path, uint64_t at, uint64_t limit, co
 
 bool session_delta_apply(const std::string& path, uint64_t at, const SessionFileIdentity& id,
                          const SessionDeltaRecord& expected, const SessionKvBlock& sink, std::string& error,
-                         SessionStatus* status) {
+                         SessionStatus* status, uint64_t accept_config) {
     SessionStatus st;
     bool ok = false;
     try {
-        ok = delta_apply_impl(path, at, id, expected, sink, error, st);
+        ok = delta_apply_impl(path, at, id, expected, sink, error, accept_config, st);
     } catch (const std::bad_alloc&) {
         error = "delta record: out of memory while reading " + path;
         st.error = SessionError::memory;
@@ -2996,6 +3009,128 @@ bool session_delta_first_bytes(SessionKvSource& s, int64_t kept_tokens, bool ind
         s.first_bytes[part] = keep;
     }
     return true;
+}
+
+namespace {
+// A delta record stream beside a base file: its magic is not a session file's, so the digest can name it instead of
+// reporting "not a Strata session file".
+bool is_delta_stream(const std::string& path) {
+    RawFile raw;
+    uint64_t size = 0;
+    char magic[8];
+    // buffered: the eight bytes are read at offset 0, which need not satisfy O_DIRECT's alignment
+    return raw.open_session(path, size, false) && size >= 8 &&
+           raw.read_at(0, reinterpret_cast<uint8_t*>(magic), 8) && std::memcmp(magic, kDeltaMagic, 8) == 0;
+}
+
+// The digest's token part: the ids as stored (int32, little-endian) and every image key, framed by the builder.
+void digest_tokens(SessionIdentityBuilder& b, const ConversationCheckpoint& c) {
+    b.u64("ids.size", c.ids.size());
+    b.bytes("ids", c.ids.data(), c.ids.size() * sizeof(int32_t));
+    b.u64("imgs.size", c.imgs.size());
+    for (const auto& k : c.imgs) {
+        b.i64("img.start", k.start);
+        b.u64("img.hash", k.hash);
+    }
+}
+
+// The digest's state part: the arrays a restore decodes (REF already resolved to the live bytes, RHT already decoded),
+// in a fixed order so a v1, a v2 and a v3 file of the same state agree.
+void digest_state(SessionIdentityBuilder& b, const ConversationCheckpoint& c) {
+    b.bytes("gdn", c.gdn.data(), c.gdn.size());
+    b.bytes("ple", c.ple.data(), c.ple.size());
+    b.bytes("tails", c.tails.data(), c.tails.size());
+    b.bytes("dead", c.dead.data(), c.dead.size());
+    b.bytes("block_pos", c.block_pos.data(), c.block_pos.size());
+    b.u64("used", c.used);
+}
+
+bool digest_impl(const std::string& path, const SessionFileIdentity& id, SessionFileDigest& out, std::string& error,
+                 SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
+    if (is_delta_stream(path)) {
+        error = "session digest: " + path + " is a delta record stream, not a base session file";
+        return false;
+    }
+    ReadFile rf;
+    uint64_t payload = 0;
+    const SessionReadLimits limits;   // the file's own counts bound it; a digest has no runtime geometry
+    if (!rf.open(path, id, limits, payload, error, st)) return false;
+    SavedConversation meta;
+    SessionHasher blocks(0);
+    const SessionKvBlock sink = [&blocks](size_t layer, size_t part, uint64_t offset, const void* data, size_t n) {
+        const uint64_t frame[4] = {(uint64_t) layer, (uint64_t) part, offset, (uint64_t) n};
+        blocks.update(frame, sizeof frame);
+        blocks.update(data, n);
+        return true;
+    };
+    In in{&rf.source, SessionHasher(0), payload, error, limits};
+    bool saw_ref = false, saw_rht = false;
+    in.saw_ref = &saw_ref;
+    in.saw_rht = &saw_rht;
+    const bool ok = rf.version == kVersion ? get_payload_streamed(in, meta, sink)
+                  : rf.version == kVersionV2 ? get_payload_streamed_v2(in, meta, sink)
+                                             : get_payload_streamed_v3(in, meta, sink);
+    if (!ok) { st.error = in.kind; return false; }
+    if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
+    uint8_t t[kTrailer];
+    if (!rf.source.read(t, kTrailer)) {
+        st.error = rf.source.kind();
+        error = "session file: trailer read error: " + rf.source.error();
+        return false;
+    }
+    uint64_t ph = 0;
+    std::memcpy(&ph, t, 8);
+    if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
+    if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
+
+    SessionFileDigest digest;
+    digest.file_version = rf.version;
+    SessionIdentityBuilder tokens(0), state(0);
+    digest_tokens(tokens, meta.live);
+    digest_state(state, meta.live);
+    for (const auto& c : meta.checkpoints) {
+        digest_tokens(tokens, c);
+        digest_state(state, c);
+    }
+    digest.tokens = tokens.digest();
+    digest.state = state.digest();
+    // the layer headers, then the block stream (which frames each layer/part/offset), so a different header can never
+    // pass for the same bytes
+    SessionHasher kv(0);
+    const uint64_t layers = meta.kv.size();
+    kv.update(&layers, sizeof layers);
+    for (const auto& k : meta.kv) {
+        const int64_t header[7] = {k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim};
+        kv.update(header, sizeof header);
+    }
+    const uint64_t streamed = blocks.digest();
+    kv.update(&streamed, sizeof streamed);
+    digest.kv = kv.digest();
+    digest.state_ref = saw_ref;
+    digest.state_rht = saw_rht;
+    digest.state_exact = !saw_rht;
+    out = digest;
+    st.error = SessionError::none;
+    return true;
+}
+} // namespace
+
+bool session_file_digest(const std::string& path, const SessionFileIdentity& id, SessionFileDigest& out,
+                         std::string& error, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = digest_impl(path, id, out, error, st);
+    } catch (const std::bad_alloc&) {
+        error = "session digest: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
 }
 
 } // namespace strata::core

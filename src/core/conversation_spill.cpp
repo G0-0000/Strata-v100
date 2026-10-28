@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <new>
 #include <sstream>
@@ -184,6 +186,64 @@ bool read_chain_header(const std::filesystem::path& chain, uint64_t& base_size, 
     return true;
 }
 
+// ---- the recompute gate ledger (format documented in conversation_spill.hpp) ----
+constexpr char kGateName[] = ".strata-cache-gate";
+constexpr char kGateTempName[] = ".strata-cache-gate.tmp";
+constexpr uint64_t kGateVersion = 1;
+constexpr uint64_t kMaxGateLedgerBytes = 4u << 20;   // a ledger for 256 files and their batches is far smaller
+
+// A token field: non-empty and free of whitespace and control characters, so a line never needs quoting.
+bool gate_token_ok(const std::string& s) {
+    if (s.empty()) return false;
+    for (const unsigned char c : s)
+        if (c <= ' ' || c == 0x7f) return false;
+    return true;
+}
+bool gate_parse_u64(const std::string& s, int base, uint64_t& out) {
+    if (s.empty() || s[0] == '-' || s[0] == '+') return false;   // no signs: a byte count or a fingerprint is unsigned
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(s.c_str(), &end, base);
+    if (errno != 0 || end != s.c_str() + s.size()) return false;
+    out = (uint64_t) v;
+    return true;
+}
+bool gate_parse_i64(const std::string& s, int64_t& out) {
+    if (s.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(s.c_str(), &end, 10);
+    if (errno != 0 || end != s.c_str() + s.size()) return false;
+    out = (int64_t) v;
+    return true;
+}
+std::string gate_hex(uint64_t v) {
+    char b[19];
+    std::snprintf(b, sizeof b, "0x%016llx", (unsigned long long) v);
+    return b;
+}
+// Split one line on single spaces; an empty field (two spaces, a leading or a trailing one) is kept and later
+// rejected by the exact field-count check.
+std::vector<std::string> gate_fields(const std::string& line) {
+    std::vector<std::string> out;
+    std::size_t at = 0;
+    for (;;) {
+        const std::size_t space = line.find(' ', at);
+        if (space == std::string::npos) { out.push_back(line.substr(at)); break; }
+        out.push_back(line.substr(at, space - at));
+        at = space + 1;
+    }
+    return out;
+}
+// A reason as one token: empty is written as '-', whitespace is replaced so a writer never breaks the line.
+std::string gate_reason_token(const std::string& reason) {
+    if (reason.empty()) return "-";
+    std::string s = reason;
+    for (char& c : s)
+        if ((unsigned char) c <= ' ') c = '_';
+    return s;
+}
+
 } // namespace
 
 bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity,
@@ -207,7 +267,15 @@ bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Ent
         error = "unknown spill sidecar magic or version"; return false;
     }
     stamped = version >= kMetaVersion;   // the v2 sidecar carries the persisted last-use stamp
-    if (model != identity_.model || config != identity_.config) { other_identity = true; return false; }
+    entry.source_identity = {model, config};
+    const bool foreign_config = config != identity_.config;
+    // Another MODEL is never approved.  Another CONFIGURATION is parsed only when the gate's ledger holds a passed
+    // batch for exactly this source -> this cache's identity and engine build; the per-entry row is checked after
+    // the parse (its size and token count must match what the sidecar and file say).
+    if (model != identity_.model || (foreign_config && !gate_identity_approved(entry.source_identity))) {
+        other_identity = true;
+        return false;
+    }
     uint64_t cvec = 0;
     if (!r.u64(cvec) || cvec > 1) { error = "invalid cvec flag in sidecar"; return false; }
     entry.cvec = cvec != 0;
@@ -228,6 +296,15 @@ bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Ent
     if (version >= 2 && !r.u64(entry.last_used)) { error = "truncated sidecar last-use stamp"; return false; }
     if (!r.finish()) { error = "spill sidecar checksum or length mismatch"; return false; }
     if (!valid_meta_chain(entry.live_meta, entry.checkpoint_lengths)) { error = "spill sidecar is not a valid prefix chain"; return false; }
+    if (foreign_config) {
+        const PathInfo session = inspect_path_nofollow(entry.session_path());
+        if (!session.inspected || !session.regular ||
+            !gate_entry_approved(entry.stem.filename().string(), entry.source_identity, session.bytes,
+                                 (int64_t) entry.live_meta.ids.size())) {
+            other_identity = true;
+            return false;
+        }
+    }
     return true;
 }
 
@@ -237,9 +314,13 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
     std::ostringstream payload;
     {
         MetaWriter w(payload);
+        // The sidecar records the identity the FILE carries, not this cache's: for a gate-approved entry they differ,
+        // and stamping this cache's model/config would forge the file's identity on the next open (touch() rewrites
+        // the sidecar on every hit), letting it be read after a restart without the ledger.  A new entry has
+        // source_identity = identity_ (index_written), so its bytes are unchanged.
         if (!w.raw(kMetaMagic, 4) ||
-            !w.u64(with_last_used ? kMetaVersion : kMetaVersionMin) || !w.u64(identity_.model) ||
-            !w.u64(identity_.config) || !w.u64(entry.cvec ? 1 : 0) || !w.u64(entry.live_meta.ids.size())) {
+            !w.u64(with_last_used ? kMetaVersion : kMetaVersionMin) || !w.u64(entry.source_identity.model) ||
+            !w.u64(entry.source_identity.config) || !w.u64(entry.cvec ? 1 : 0) || !w.u64(entry.live_meta.ids.size())) {
             error = "cannot write spill sidecar"; return false;
         }
         for (int32_t id : entry.live_meta.ids) if (!w.i64(id)) { error = "cannot write spill sidecar ids"; return false; }
@@ -298,8 +379,200 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
     return true;
 }
 
+bool session_spill_gate_read(const std::filesystem::path& directory, std::vector<ConversationSpillGateBatch>& batches,
+                             std::vector<ConversationSpillGateEntry>& entries, std::string& error) {
+    batches.clear();
+    entries.clear();
+    error.clear();
+    const std::filesystem::path path = directory / kGateName;
+    const PathInfo info = inspect_path_nofollow(path);
+    if (!info.inspected) { error = "recompute gate: cannot inspect " + path.string(); return false; }
+    if (!info.regular) { error = "recompute gate: ledger is missing or not a regular file"; return false; }
+    if (info.bytes > kMaxGateLedgerBytes) { error = "recompute gate: ledger is larger than the format allows"; return false; }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { error = "recompute gate: cannot open " + path.string(); return false; }
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // A writer publishes by rename, so a wrong length or a missing final newline means a half-written or changed file.
+    if (text.size() != info.bytes || text.empty() || text.back() != '\n') {
+        error = "recompute gate: ledger is truncated or changed while it was read";
+        return false;
+    }
+    // The checksum is the last line and covers every byte before it.
+    const std::size_t last = text.size() - 1;
+    const std::size_t previous = last == 0 ? std::string::npos : text.rfind('\n', last - 1);
+    const std::size_t sum_at = previous == std::string::npos ? 0 : previous + 1;
+    const std::vector<std::string> sum = gate_fields(text.substr(sum_at, last - sum_at));
+    uint64_t want = 0;
+    if (sum.size() != 2 || sum[0] != "sum" || !gate_parse_u64(sum[1], 16, want)) {
+        error = "recompute gate: ledger has no checksum line";
+        return false;
+    }
+    if (want != session_hash64(text.data(), sum_at, 0)) {
+        error = "recompute gate: ledger checksum mismatch";
+        return false;
+    }
+    std::istringstream body(text.substr(0, sum_at));
+    std::string line;
+    bool header = false;
+    while (std::getline(body, line)) {
+        const std::vector<std::string> f = gate_fields(line);
+        if (!header) {
+            if (f.size() != 2 || f[0] != "strata-cache-gate" ||
+                f[1] != std::to_string((unsigned long long) kGateVersion)) {
+                error = "recompute gate: unknown ledger header or version";
+                return false;
+            }
+            header = true;
+            continue;
+        }
+        if (!f.empty() && f[0] == "batch") {
+            ConversationSpillGateBatch b;
+            uint64_t time = 0;
+            if (f.size() != 11 || !gate_token_ok(f[1]) || !gate_token_ok(f[6]) || !gate_token_ok(f[7]) ||
+                !gate_parse_u64(f[2], 16, b.source.model) || !gate_parse_u64(f[3], 16, b.source.config) ||
+                !gate_parse_u64(f[4], 16, b.target.model) || !gate_parse_u64(f[5], 16, b.target.config) ||
+                !gate_parse_u64(f[9], 10, time) || (f[8] != "pass" && f[8] != "fail") ||
+                (f[10] != "-" && !gate_token_ok(f[10]))) {
+                error = "recompute gate: malformed batch line";
+                return false;
+            }
+            b.id = f[1];
+            b.engine_build = f[6];
+            b.sample = f[7];
+            b.passed = f[8] == "pass";
+            b.verified_ms = time;
+            b.reason = f[10] == "-" ? std::string() : f[10];
+            batches.push_back(std::move(b));
+        } else if (!f.empty() && f[0] == "entry") {
+            ConversationSpillGateEntry e;
+            int64_t tokens = 0;
+            if (f.size() != 6 || !gate_token_ok(f[1]) || !gate_token_ok(f[2]) ||
+                !gate_parse_u64(f[3], 10, e.file_bytes) || !gate_parse_i64(f[4], tokens) || tokens < 0 ||
+                !gate_parse_u64(f[5], 10, e.last_used)) {
+                error = "recompute gate: malformed entry line";
+                return false;
+            }
+            e.stem = f[1];
+            e.batch_id = f[2];
+            e.tokens = tokens;
+            entries.push_back(std::move(e));
+        } else {
+            error = "recompute gate: unknown ledger line";
+            return false;
+        }
+    }
+    if (!header) { error = "recompute gate: ledger has no header"; return false; }
+    return true;
+}
+
+bool session_spill_gate_write(const std::filesystem::path& directory,
+                              const std::vector<ConversationSpillGateBatch>& batches,
+                              const std::vector<ConversationSpillGateEntry>& entries, std::string& error) {
+    error.clear();
+    std::string body = "strata-cache-gate " + std::to_string((unsigned long long) kGateVersion) + "\n";
+    for (const auto& b : batches) {
+        if (!gate_token_ok(b.id) || !gate_token_ok(b.engine_build) || !gate_token_ok(b.sample)) {
+            error = "recompute gate: a batch id, engine build or sample is empty or contains whitespace";
+            return false;
+        }
+        body += "batch " + b.id + " " + gate_hex(b.source.model) + " " + gate_hex(b.source.config) + " " +
+                gate_hex(b.target.model) + " " + gate_hex(b.target.config) + " " + b.engine_build + " " +
+                b.sample + " " + (b.passed ? "pass" : "fail") + " " + std::to_string(b.verified_ms) + " " +
+                gate_reason_token(b.reason) + "\n";
+    }
+    for (const auto& e : entries) {
+        if (!gate_token_ok(e.stem) || !gate_token_ok(e.batch_id) || e.tokens < 0) {
+            error = "recompute gate: an entry stem or batch id is empty or contains whitespace, or its token count is negative";
+            return false;
+        }
+        body += "entry " + e.stem + " " + e.batch_id + " " + std::to_string(e.file_bytes) + " " +
+                std::to_string(e.tokens) + " " + std::to_string(e.last_used) + "\n";
+    }
+    char sum[32];
+    std::snprintf(sum, sizeof sum, "sum %016llx\n", (unsigned long long) session_hash64(body.data(), body.size(), 0));
+    const std::string bytes = body + sum;
+    const std::filesystem::path temporary = directory / kGateTempName;
+    const std::filesystem::path target = directory / kGateName;
+    // A leftover temporary is a crashed writer's; remove it only when it is a regular file (never a link).
+    const PathInfo stale = inspect_path_nofollow(temporary);
+    if (!stale.inspected) { error = "recompute gate: cannot inspect the ledger temporary"; return false; }
+    if (stale.exists) {
+        if (!stale.regular) { error = "recompute gate: the ledger temporary path is not a regular file"; return false; }
+        std::error_code rm;
+        std::filesystem::remove(temporary, rm);
+        if (rm) { error = "recompute gate: cannot remove a stale ledger temporary"; return false; }
+    }
+    // created like the sidecar's temp: exclusive, never following a link, owner-only (0600)
+#if defined(_WIN32)
+    std::wstring w;
+    if (!wide(temporary.string(), w)) { error = "recompute gate: the path is not valid UTF-8"; return false; }
+    const HANDLE h = CreateFileW(w.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { error = "recompute gate: cannot create the ledger temporary: " + last_error(); return false; }
+    bool ok = true;
+    size_t off = 0;
+    while (ok && off < bytes.size()) {
+        DWORD wrote = 0;
+        const DWORD want = (DWORD) std::min<size_t>(bytes.size() - off, size_t(1) << 30);
+        if (!WriteFile(h, bytes.data() + off, want, &wrote, nullptr) || wrote == 0) ok = false;
+        else off += (size_t) wrote;
+    }
+    if (!ok) error = "recompute gate: cannot write the ledger temporary: " + last_error();
+    if (CloseHandle(h) == 0 && ok) { ok = false; error = "recompute gate: cannot close the ledger temporary: " + last_error(); }
+    if (!ok) { std::error_code rm; std::filesystem::remove(temporary, rm); return false; }
+#else
+    const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) { error = std::string("recompute gate: cannot create the ledger temporary: ") + std::strerror(errno); return false; }
+    size_t off = 0;
+    while (off < bytes.size()) {
+        const ssize_t n = ::write(fd, bytes.data() + off, bytes.size() - off);
+        if (n > 0) { off += (size_t) n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        error = std::string("recompute gate: cannot write the ledger temporary: ") +
+                (n < 0 ? std::strerror(errno) : "short write");
+        ::close(fd);
+        std::error_code rm;
+        std::filesystem::remove(temporary, rm);
+        return false;
+    }
+    if (::close(fd) != 0) {
+        error = std::string("recompute gate: cannot close the ledger temporary: ") + std::strerror(errno);
+        std::error_code rm;
+        std::filesystem::remove(temporary, rm);
+        return false;
+    }
+#endif
+    std::error_code ec;
+    std::filesystem::rename(temporary, target, ec);
+    if (ec) {
+        std::filesystem::remove(temporary, ec);
+        error = "recompute gate: cannot commit the ledger";
+        return false;
+    }
+    return true;
+}
+
+bool session_spill_gate_approves(const std::vector<ConversationSpillGateBatch>& batches,
+                                 const std::vector<ConversationSpillGateEntry>& entries, const std::string& stem,
+                                 const SessionFileIdentity& source, const SessionFileIdentity& target,
+                                 const std::string& engine_build, uint64_t file_bytes, int64_t tokens) {
+    if (!gate_token_ok(stem) || !gate_token_ok(engine_build)) return false;
+    for (const auto& e : entries) {
+        if (e.stem != stem || e.file_bytes != file_bytes || e.tokens != tokens) continue;
+        for (const auto& b : batches) {
+            if (b.id != e.batch_id || !b.passed) continue;
+            if (b.source.model != source.model || b.source.config != source.config) continue;
+            if (b.target.model != target.model || b.target.config != target.config) continue;
+            if (b.engine_build != engine_build) continue;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool ConversationSpillCache::open(const std::filesystem::path& directory, SessionFileIdentity identity,
-                                  uint64_t budget_bytes, std::string& error, bool delta_chains) {
+                                  uint64_t budget_bytes, std::string& error, bool delta_chains,
+                                  const ConversationSpillGateOptions& gate) {
     enabled_ = false;
     stale_files_wiped_ = 0;
     disk_evictions_ = 0;
@@ -307,6 +580,11 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
     bytes_ = 0;
     pinned_path_.clear();
     delta_ = delta_chains;
+    gate_ = gate.enabled;
+    gate_engine_build_ = gate.engine_build;
+    gate_batches_.clear();
+    gate_entries_.clear();
+    gate_error_.clear();
     directory_ = directory;
     identity_ = identity;
     budget_ = budget_bytes;
@@ -328,6 +606,17 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
 #endif
         if (ec || !std::filesystem::is_directory(directory_, ec) || ec) {
             error = "cannot create or inspect spill directory " + directory_.string(); return false;
+        }
+        if (gate_) {
+            // A missing, corrupt or half-written ledger approves nothing; it must never stop the same-identity cache.
+            // The reason is kept for the caller's startup line, never printed here: the caller knows whether the gate
+            // is worth a line at all.
+            if (gate_engine_build_.empty()) {
+                gate_error_ = "no engine build was given";
+            } else if (!session_spill_gate_read(directory_, gate_batches_, gate_entries_, gate_error_)) {
+                gate_batches_.clear();
+                gate_entries_.clear();
+            }
         }
         std::vector<std::filesystem::path> metas;
         for (std::filesystem::directory_iterator it(directory_, ec), end; !ec && it != end; it.increment(ec)) {
@@ -549,7 +838,12 @@ bool ConversationSpillCache::load(const std::string& path, SavedConversation& im
         return false;
     }
     size_t bytes = 0;
-    return session_file_read(path, identity_, image, bytes, error, limits, status);
+    // A gate-approved entry keeps its own configuration: accept exactly that config for this read (the model was
+    // checked when the entry was indexed).  Every other entry reads under this cache's identity, as before.
+    SessionReadLimits accepted = limits;
+    const SessionFileIdentity source = entries_[index].source_identity;
+    if (source.config != identity_.config) accepted.accept_config = source.config;
+    return session_file_read(path, identity_, image, bytes, error, accepted, status);
 }
 
 std::filesystem::path ConversationSpillCache::next_stem(bool prefix) {
@@ -571,6 +865,7 @@ bool ConversationSpillCache::index_written(const std::filesystem::path& stem, ui
     Entry entry;
     entry.stem = stem;
     entry.file_bytes = file_bytes;
+    entry.source_identity = identity_;
     entry.last_used = delta_ ? now_ms() : 0;   // a save is the newest use; delta-off writes the baseline v1 sidecar,
                                                // which carries no stamp, so the entry stays at the unknown age
     entry.prefix = prefix;
@@ -961,6 +1256,13 @@ bool ConversationSpillCache::reserve_delta(size_t index, ConversationSpillDeltaW
     if (!delta_) { error = "delta chains are off"; return false; }
     Entry& entry = entries_[index];
     if (entry.prefix) { error = "a prefix entry has no delta chain"; return false; }
+    // An entry of another engine configuration is a gate-approved READ-ONLY file: its K/V was computed under that
+    // config and a record appended here would carry this config's bytes behind them, so the chain would no longer be
+    // the one the ledger approved.  Such a conversation is saved as a new file under this cache's identity instead.
+    if (entry.source_identity.model != identity_.model || entry.source_identity.config != identity_.config) {
+        error = "a gate-approved entry of another engine configuration is read-only";
+        return false;
+    }
     if (!entry.complete || !entry_files_valid(entry)) {
         error = "spill entry is incomplete or its files are not valid regular files";
         return false;
@@ -1095,6 +1397,36 @@ bool ConversationSpillCache::spill_delta(size_t index, const SavedConversation& 
         error = "not enough RAM to index the delta record";
         return false;
     }
+}
+
+bool ConversationSpillCache::entry_source_identity(size_t index, SessionFileIdentity& out) const {
+    if (index >= entries_.size()) return false;
+    out = entries_[index].source_identity;
+    return true;
+}
+
+size_t ConversationSpillCache::gate_approved_count() const {
+    size_t n = 0;
+    for (const Entry& entry : entries_)
+        if (entry.source_identity.model != identity_.model || entry.source_identity.config != identity_.config) ++n;
+    return n;
+}
+
+bool ConversationSpillCache::gate_identity_approved(const SessionFileIdentity& source) const {
+    if (!gate_ || gate_engine_build_.empty()) return false;
+    for (const auto& b : gate_batches_) {
+        if (!b.passed || b.engine_build != gate_engine_build_) continue;
+        if (b.source.model != source.model || b.source.config != source.config) continue;
+        if (b.target.model != identity_.model || b.target.config != identity_.config) continue;
+        return true;
+    }
+    return false;
+}
+
+bool ConversationSpillCache::gate_entry_approved(const std::string& stem, const SessionFileIdentity& source,
+                                                 uint64_t file_bytes, int64_t tokens) const {
+    return gate_ && session_spill_gate_approves(gate_batches_, gate_entries_, stem, source, identity_,
+                                                gate_engine_build_, file_bytes, tokens);
 }
 
 size_t ConversationSpillCache::find(const std::string& path) const {

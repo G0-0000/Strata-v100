@@ -166,6 +166,12 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error,
                                    std::vector<ConversationCheckpoint>* move_checkpoints = nullptr);
+// The same with `draft == nullptr`: the sources hold the session's own QSA layers only, no draft layer - the shape a
+// run with no drafter saves, and the one such a run restores (conversation_kv_targets with a null draft).
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                   std::vector<ConversationCheckpoint>* move_checkpoints = nullptr);
 // --conversation-cache-disk-delta: the same sources, but each keeps its part's full size and starts at the first
 // page (or indexer row) at or after `unchanged_tokens`, the tokens whose K/V still matches the state the record's
 // base already holds (the same keep rule conversation_kv_save applies; the per-part arithmetic is

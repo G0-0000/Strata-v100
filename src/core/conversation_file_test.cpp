@@ -145,6 +145,9 @@ SavedConversation rht_sample(size_t tokens = 32) {
 // format v1 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
 constexpr size_t kGoldenSize = 17878535;
 constexpr uint64_t kGoldenHash = 0x70f812b350360d09ull;
+// format v3 golden: the same sample with NO checkpoints (--session-out's shape), v3 layout
+constexpr size_t kLiveOnlyV3Size = 17867317;
+constexpr uint64_t kLiveOnlyV3Hash = 0xacc8282be67be147ull;
 
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
@@ -3254,6 +3257,55 @@ int main() {
                 fs::remove(a);
                 fs::remove(b);
             }
+        }
+    }
+
+    // ---- --session-out (generate.cpp's recomputation export: the prompt as the LIVE state, no checkpoints, and no
+    // draft layer when the run has none).  Every other writer saves at least the deepest checkpoint and the draft
+    // layer, so both shapes are new here: v1, the state-ref flag (nothing to reference without a checkpoint) and the
+    // v3 K/V-first layout must each round-trip them exactly.
+    {
+        SavedConversation live_only = original;
+        live_only.checkpoints.clear();
+        for (int layout = 0; layout < 3; ++layout) {
+            const fs::path p = dir / ("liveonly-" + std::to_string(layout) + ".bin");
+            SessionWriteOptions wo;
+            wo.layout_v3 = layout == 2;
+            wo.state_ref = layout == 1;
+            size_t n = 0;
+            check(session_file_write(p.string(), live_only, id, n, error, wo), "liveonly: a checkpoint-free session writes");
+            SavedConversation back;
+            SessionStatus st;
+            check(session_file_read(p.string(), id, back, n, error, {}, &st), "liveonly: it reads back");
+            check(same(live_only, back) && back.checkpoints.empty(), "liveonly: the round trip is identical, with no checkpoint");
+            // state_ref has nothing to reference without a checkpoint: only the v3 layout changes the version
+            check(st.file_version == (uint32_t) (layout == 2 ? 3 : 1), "liveonly: the version follows the layout alone");
+            if (layout == 2 && std::getenv("STRATA_SESSION_GOLDEN_PRINT"))
+                std::printf("liveonly golden size %zu hash %016llx\n", fs::file_size(p),
+                            (unsigned long long) session_hash64(slurp(p).data(), (size_t) fs::file_size(p), 0));
+        }
+        // golden: the v3 checkpoint-free file is the export's shape; its bytes are pinned like the v1 golden above
+        {
+            const std::vector<char> d = slurp(dir / "liveonly-2.bin");
+            check(d.size() == kLiveOnlyV3Size && session_hash64(d.data(), d.size(), 0) == kLiveOnlyV3Hash,
+                  "liveonly: the v3 checkpoint-free bytes are unchanged");
+        }
+        // no draft layer: the K/V count is the session's own layers, and the file reads back that way (a run without
+        // a drafter restores it with a null draft)
+        {
+            SavedConversation no_draft = live_only;
+            no_draft.kv.pop_back();
+            const fs::path p = dir / "liveonly-nodraft.bin";
+            SessionWriteOptions v3;
+            v3.layout_v3 = true;
+            size_t n = 0;
+            check(session_file_write(p.string(), no_draft, id, n, error, v3), "liveonly: a draftless session writes");
+            check(read_u64(slurp(p), 64 + 21 * 8) == no_draft.kv.size(),
+                  "liveonly: its K/V count is the session's own layers");
+            SavedConversation back;
+            check(session_file_read(p.string(), id, back, n, error) &&
+                  back.kv.size() == no_draft.kv.size() && same(no_draft, back),
+                  "liveonly: the draftless session round-trips");
         }
     }
 

@@ -624,6 +624,13 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
                                    const QsaState& draft, std::string& error,
                                    std::vector<ConversationCheckpoint>* move_checkpoints) {
+    return conversation_snapshot_sources(meta, sources, view, ss, g, &draft, error, move_checkpoints);
+}
+
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                   const QsaState* draft, std::string& error,
+                                   std::vector<ConversationCheckpoint>* move_checkpoints) {
     if (move_checkpoints && move_checkpoints != &view.checkpoints)
         return fail(error, "moved checkpoints must be the capture view's checkpoints");
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
@@ -640,10 +647,10 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     conversation_checkpoint_join(captured.live.gdn.data());
     const int64_t upto = (int64_t) view.ids.size();
     const size_t layers = owned_qsa(ss);
-    std::vector<SessionKvSource> out(layers + 1);
+    std::vector<SessionKvSource> out(layers + (draft ? 1 : 0));
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
-    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
+    if (draft && !conversation_kv_source(out.back(), *draft, g, upto, false, error)) return false;
     if (move_checkpoints) {
         captured.checkpoints = std::move(*move_checkpoints);
         for (ConversationCheckpoint& c : captured.checkpoints)

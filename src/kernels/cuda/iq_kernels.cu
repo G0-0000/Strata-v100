@@ -6661,9 +6661,9 @@ namespace {
 constexpr int WG_BM = 64, WG_BN = 128, WG_THREADS = 256, WG_XK = 128, WG_MT = 4;
 // A block: BN = 128 weight rows of one expert x up to WG_MT * BM = 256 of its token rows (blockIdx.y walks an expert's
 // rows in such chunks), so every weight superblock is dequantized ONCE per chunk into shared memory (WK 256: an IQ
-// superblock through dq_dispatch; WK 128: two Q2_0 blocks, or four IQ4_NL blocks); the activations stream through a
+// superblock through dq_dispatch; WK 128: two Q2_0 blocks, four IQ4_NL blocks, or four Q5_1 blocks); the activations stream through a
 // BM x 128 tile.  8 warps of 32 x 32 per m-tile (2 x 2 fragments), FP32 accumulators for the chunk's m-tiles in registers.
-template<int WK, bool Q20, bool IQNL = false>
+template<int WK, bool Q20, bool IQNL = false, bool Q51 = false>
 __global__ void __launch_bounds__(WG_THREADS) gemm_iq_f16_grouped_kernel(int ty, const uint8_t* __restrict__ W,
                                                                          size_t expert_bytes, size_t row_bytes, int K,
                                                                          const __half* __restrict__ X, int ldx,
@@ -6723,6 +6723,25 @@ __global__ void __launch_bounds__(WG_THREADS) gemm_iq_f16_grouped_kernel(int ty,
                 for (int p = 0; p < 16; ++p) {
                     o[bl * 32 + p] = cvt<__half>(d * kvalues_iq4nl[b->qs[p] & 0xf]);
                     o[bl * 32 + p + 16] = cvt<__half>(d * kvalues_iq4nl[b->qs[p] >> 4]);
+                }
+            }
+        } else if constexpr (Q51) {
+            // Q5_1 down (WK 128 = 4 x block_q5_1): one thread per (row, 64-value half), dq_q5_1's value order - the low
+            // nibble of qs[p] is value p, the high nibble value p + 16, the fifth bits at qh's bit p and p + 16 (shift p + 12, mask 0x10) (two blocks a thread)
+            const int r = tid >> 1, half = tid & 1;
+            const block_q5_1* bp = reinterpret_cast<const block_q5_1*>(we + (size_t) (n0 + r) * row_bytes) + k0 / 32 + half * 2;
+            __half* o = sw + r * LDW + half * 64;
+#pragma unroll
+            for (int bl = 0; bl < 2; ++bl) {
+                const block_q5_1* b = bp + bl;
+                const float2 dm = __half22float2(b->dm);
+                uint32_t qh;
+                memcpy(&qh, b->qh, sizeof(qh));
+#pragma unroll
+                for (int p = 0; p < 16; ++p) {
+                    const int xh_0 = ((qh >> p) << 4) & 0x10, xh_1 = (qh >> (p + 12)) & 0x10;
+                    o[bl * 32 + p] = cvt<__half>((float) ((b->qs[p] & 0xF) | xh_0) * dm.x + dm.y);
+                    o[bl * 32 + p + 16] = cvt<__half>((float) ((b->qs[p] >> 4) | xh_1) * dm.x + dm.y);
                 }
             }
         } else if constexpr (!Q20) {
@@ -7026,7 +7045,8 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
     }
     const bool q20 = ty == 42;
     const bool nl = ty == 20 && K % 256 != 0;   // IQ4_NL down (K=640): there is no WK=256 path for this K
-    if (q20 || nl ? K % 128 != 0 : (K % 256 != 0 || !is_iq(ty))) return false;
+    const bool q51 = ty == 7 && K % 256 != 0;   // Q5_1 down (K=640): the WK=128 lane, four block_q5_1 a window
+    if (q20 || nl || q51 ? K % 128 != 0 : (K % 256 != 0 || !is_iq(ty))) return false;
     const size_t row_bytes = iq_row_bytes(ty, K);
     const int mt = (max_rows + WG_MT * WG_BM - 1) / (WG_MT * WG_BM);   // row chunks per expert
     const dim3 grid((unsigned) (n_out / WG_BN), (unsigned) (n_experts * mt));
@@ -7041,6 +7061,7 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
         cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<256, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem(256));
         cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem(128));
         cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem(128));
+        cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem(128));
         attr[dev] = true;
     }
     if (q20)
@@ -7049,6 +7070,10 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
     else if (nl)
         gemm_iq_f16_grouped_kernel<128, false, true><<<grid, WG_THREADS, smem(128), s>>>(ty, (const uint8_t*) W, expert_bytes, row_bytes, K,
                                                                                          (const __half*) X, ldx, bounds, mt, Y, ldy);
+    else if (q51)
+        gemm_iq_f16_grouped_kernel<128, false, false, true><<<grid, WG_THREADS, smem(128), s>>>(ty, (const uint8_t*) W, expert_bytes,
+                                                                                                row_bytes, K, (const __half*) X, ldx, bounds, mt,
+                                                                                                Y, ldy);
     else
         gemm_iq_f16_grouped_kernel<256, false><<<grid, WG_THREADS, smem(256), s>>>(ty, (const uint8_t*) W, expert_bytes, row_bytes, K,
                                                                                   (const __half*) X, ldx, bounds, mt, Y, ldy);

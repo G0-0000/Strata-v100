@@ -62,7 +62,7 @@ decided per architecture when the engine is built.
 | --- | --- |
 | `STRATA_SM70_TABLE=1` | Turns on the three decode kernels in the second table above together. Bitwise the default kernels' output. Individual switches `STRATA_EXP_MODE`, `STRATA_MMVQ_IL` and `STRATA_GR_FAST` still apply on top. |
 | `STRATA_FUSE_DECODE=1` | The decode GEMV / MoE fusions of #1097. Bitwise the unfused kernels. |
-| `STRATA_PF_WMMA=1` | The FP16 tensor-core prompt experts; also takes IQ4_NL down projections. |
+| `STRATA_PF_WMMA=1` | The FP16 tensor-core prompt experts; also takes IQ4_NL down projections. Also covers Q4_K gate/up + Q5_1 down (types 12/7) for the UD-Q4_K_XL pack, opt-in as before. |
 | `STRATA_PF_WMMA2=1` | A second prompt-expert kernel for IQ2_S gate/up and IQ4_NL down (#2356). |
 | `STRATA_ARGMAX_ROWS_SM70=1` | The multi-block greedy pick on sm_7x (#2357), bitwise the one-block pick. |
 | `STRATA_GR_NORM_FAST=1` | The register-split hyper-connection norm (#2358). |

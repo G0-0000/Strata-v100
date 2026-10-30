@@ -1358,8 +1358,21 @@ const MmqPlan& mmq_plan() {
         p.fallback = !on || layers <= 0;
         for (int64_t l = 0; on && l < layers; ++l) {
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+            const bool mmq_fits = mmq::fits(gt, 1280) && mmq::fits(dt, N);
+            // pf_wmma: the Q4_K gate/up + Q5_1 down pack rides the WMMA tiles when STRATA_PF_WMMA=1, checked ahead of the
+            // MMQ fits fallback (STRATA_MMQ_KQUANTS's dp4a fits it too): gate/up is the generic WK=256 lane (dq_q4_k),
+            // down the Q5_1 WK=128 lane; the chunk gate below admits the same pair
+            if (pf_wmma() && lay.native && gt == 12 && dt == 7 && !lay.fmt[(size_t) l].tail_off &&
+                strata::kernels::iq_row_bytes(gt, N) > 0 && strata::kernels::iq_row_bytes(dt, 640) > 0) {
+                p.layer[(size_t) l] = 1;
+                p.wmma_only[(size_t) l] = mmq_fits ? 0 : 1;
+                p.any = true;
+                p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
+                p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
+                continue;
+            }
             // #420: a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
-            if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) {
+            if (!mmq_fits) {
                 // pf_wmma: a format dq_dispatch takes (IQ1_M, an IQ4_NL down) rides the MMQ grouping, computed by the WMMA tiles only
                 if (pf_wmma() && lay.native && (dt == 42 || dt == 20) && strata::kernels::iq_row_bytes(gt, N) > 0) {
                     p.layer[(size_t) l] = 1;
@@ -4650,12 +4663,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return true;
                             });
                         }
-                        // pf_wmma: this layer's groups on the FP16 tensor-core tiles (single GPU, native pack, Q2_0 / IQ4_NL down)
+                        // pf_wmma: this layer's groups on the FP16 tensor-core tiles (single GPU, native pack, a
+                        // Q2_0 / IQ4_NL / Q5_1 down)
                         const bool wmma_l = use_mmq && pf_wmma() && !fused_l && on_peer.empty() && lay.native &&
-                                            (mmq_dt == 42 || mmq_dt == 20) && !lay.fmt[(size_t) l].tail_off &&
+                                            (mmq_dt == 42 || mmq_dt == 20 || mmq_dt == 7) && !lay.fmt[(size_t) l].tail_off &&
                                             strata::kernels::iq_row_bytes(mmq_gt, N) > 0;
                         if (use_mmq && mmq_plan().wmma_only[(size_t) l] && !wmma_l) {
-                            err = "prefill: an IQ1_M layer in the MMQ grouping needs the WMMA tiles, which this chunk cannot take";
+                            err = "prefill: a layer the MMQ grouping marks for the WMMA tiles needs them, and this chunk cannot take them";
                             return false;
                         }
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;

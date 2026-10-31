@@ -436,6 +436,20 @@ class SessionRefused(ValueError):
         return self.STATUS[self.kind]
 
 
+class SpliceConflict(Exception):
+    """strata_session splice refused: the base recorded in the token sidecar cannot be trusted for this request.
+    A 409 (never a silent mismatch): `kind` is splice_stale (the sidecar is missing, was written by another
+    tokenizer/template, or the engine restored fewer tokens than it holds - the client resends the whole
+    conversation once to rebuild the base) or splice_base_seam (the base does not end on a full turn's stop
+    token, e.g. it was cut mid-turn).  `fields` become the error body's extra keys: expected / got only where two
+    numbers are genuinely compared (the sidecar's version, the restored token count); an identity-hash mismatch
+    (another tokenizer/template) names the changed class in `detail`, with no expected/got at all."""
+
+    def __init__(self, kind: str, message: str, **fields):
+        super().__init__(message)
+        self.kind, self.fields = kind, fields
+
+
 class EngineStuck(RuntimeError):
     """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
     reporting its GPU and RAM as given back."""
@@ -4146,6 +4160,69 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+
+def find_subsequence(haystack: list, needle: list) -> int:
+    """The index of `needle`'s first occurrence inside `haystack`, -1 when it does not occur."""
+    if not needle or len(needle) > len(haystack):
+        return -1
+    first = needle[0]
+    for i in range(len(haystack) - len(needle) + 1):
+        if haystack[i] == first and haystack[i:i + len(needle)] == needle:
+            return i
+    return -1
+
+
+def strata_session_of(req: dict, messages, slot_save_path, batched: bool) -> dict | None:
+    """POST /v1/chat/completions' opt-in "strata_session": restore a saved session before the request and/or save it
+    after the answer, with the new turns spliced onto the base's recorded token ids when "splice" is true.  None
+    when the request does not ask (that path is byte-identical to a request without the field).  A bad shape is a
+    ValueError (400); a base that cannot be trusted is a SpliceConflict (409), raised later, in prepare() / run()."""
+    raw = req.get("strata_session")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError('strata_session: expected an object with "restore", "save" and/or "splice"')
+    extra = set(raw) - {"restore", "save", "splice"}
+    if extra:
+        raise ValueError(f"strata_session: unknown key {sorted(extra)[0]!r} (restore, save, splice)")
+    restore, save, splice = raw.get("restore"), raw.get("save"), raw.get("splice")
+    for name, which in ((restore, "restore"), (save, "save")):
+        if name is None:
+            continue
+        why = slot_filename_problem(name)
+        if why:
+            raise ValueError(f'strata_session "{which}" {why}')
+    if splice is None:
+        splice = False
+    if not isinstance(splice, bool):
+        raise ValueError('strata_session "splice": true or false')
+    if restore is None and save is None and not splice:
+        return None                     # an empty strata_session asks for nothing: the ordinary path, as without it
+    if req.get("stream"):
+        raise ValueError("strata_session: not with stream=true (v1 saves the session after the answer, inside the "
+                         "same engine turn; send the request without streaming)")
+    if splice and restore is None:
+        raise ValueError('strata_session "splice": true needs "restore" (the base session the new turns continue)')
+    if restore is not None or save is not None:
+        if not slot_save_path:
+            raise ValueError("strata_session needs --slot-save-path on the server's command line (the session files "
+                             "live in that directory)")
+        if batched:
+            raise ValueError('strata_session is not available with parallel requests ("parallel" / --batch): the '
+                             "requests do not hold the engine's turn one at a time")
+    if splice:
+        if images_of(messages):
+            raise ValueError('strata_session "splice": not with images (v1: a spliced base holds text turns only)')
+        if any(m.get("role") == "system" for m in messages):
+            raise ValueError('strata_session "splice": the new turns must not carry a system turn (the base holds '
+                             "the system prompt; it cannot change)")
+        if not messages or messages[0].get("role") != "user":
+            raise ValueError('strata_session "splice": the first new turn must be role "user"')
+    return {"restore": os.path.join(slot_save_path, restore) if restore is not None else None,
+            "save": os.path.join(slot_save_path, save) if save is not None else None,
+            "splice": splice, "restore_name": restore or "", "save_name": save or ""}
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -4251,6 +4328,16 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # strata_session's splice: the ids of the text the template puts between a finished turn's <|im_end|> and the
+        # next <|im_start|> ("\n" in ChatML), probed once.  The engine's token stream has no such separator - a saved
+        # base ends on its stop token - so a spliced delta opens with these.
+        self.splice_sep_ids = self._probe_splice_sep() if self.template is not None else []
+        # the sidecar's identity: the tokenizer's hash is set in main() (Service never sees the pack's files); the
+        # template's hash is of the very source the requests are rendered with, computed once here (None template:
+        # no rendering, no hash - the read side skips a falsy hash)
+        self.session_tok_hash = None
+        self.session_tpl_hash = hashlib.sha256(self.template.source.encode("utf-8")).hexdigest()[:16] \
+            if self.template is not None else None
         self.family = None                              # the model family ("deepseek41"): set_family() below
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
@@ -5160,11 +5247,117 @@ class Service:
         if self.prompts is not None:
             self.prompts.forget(ids)
 
+    def _probe_splice_sep(self) -> list[int]:
+        """strata_session splice: the ids of the text a template puts between a finished turn's <|im_end|> and the
+        next <|im_start|> ("\n" in ChatML).  [] when the template shows no such seam: then a base is only spliced
+        when the delta needs no separator."""
+        mark = "strata splice probe"
+        try:
+            rendered = self.template.render([{"role": "user", "content": mark},
+                                             {"role": "assistant", "content": mark},
+                                             {"role": "user", "content": mark}])
+        except Exception:
+            print("[strata] strata_session splice: the chat template could not be probed for a turn separator; "
+                  "spliced deltas will carry none", flush=True)
+            return []                                       # a template that refuses the probe: splicing needs no seam
+        at = rendered.find(mark)
+        if at < 0:
+            print("[strata] strata_session splice: the probe mark is not in the template's render; no turn "
+                  "separator found, spliced deltas will carry none", flush=True)
+            return []
+        end = rendered.find(IM_END, at + len(mark))
+        nxt = rendered.find("<|im_start|>", end + len(IM_END)) if end >= 0 else -1
+        if end < 0 or nxt < 0:
+            print("[strata] strata_session splice: no turn separator found between the probe turns; spliced deltas "
+                  "will carry none", flush=True)
+            return []
+        return self.tok.encode(rendered[end + len(IM_END):nxt], parse_special=True)
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
+    def _sidecar_base_ids(self, session) -> list[int]:
+        """The base turn ids of a spliced strata_session request: <restore path>.sess.tokens.json, written by an
+        earlier save.  A SpliceConflict (409 splice_stale) when the file is missing, unreadable, of an unknown
+        version, or carries another tokenizer/template's hash - the client resends the whole conversation once to
+        rebuild the base; the file itself is reported, never deleted."""
+        path = session["restore"] + ".tokens.json"
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        ids = data.get("ids") if isinstance(data, dict) else None
+        if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(ids, list) \
+                or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+            raise SpliceConflict("splice_stale", f"{session['restore_name']}: the token sidecar is missing, "
+                                                 "unreadable or not a version-1 token file; resend the whole "
+                                                 "conversation once to rebuild the base", expected=1,
+                                 got=(data.get("version") if isinstance(data, dict) else None) or 0)
+        bad = None
+        if self.session_tok_hash and data.get("tokenizer") != self.session_tok_hash:
+            bad = "the session was saved with another tokenizer (the pack's tokenizer files changed)"
+        elif self.session_tpl_hash and data.get("template") != self.session_tpl_hash:
+            bad = "the session was saved with another chat template"
+        if bad is not None:
+            # identity-hash mismatch: no two numbers are compared, so no expected/got - the explanation rides detail
+            raise SpliceConflict("splice_stale", f"{session['restore_name']}: {bad}; resend the whole conversation "
+                                                 "once to rebuild the base", detail=bad)
+        return ids
+
+    def _spliced_prompt(self, ids_new, messages, session) -> list[int]:
+        """The prompt of a spliced strata_session request: the sidecar's base ids + the freshly rendered new turns.
+        The delta is cut out of `ids_new` at the first new turn's opening (<|im_start|> + role, with and without
+        the newline some tokenizers merge); a base that does not end on a stop token is a 409 splice_base_seam;
+        a render without the opening is a 400 splice_render_mismatch.  The seam between base and delta is the
+        template's turn separator, which the engine's token stream does not carry."""
+        base_ids = self._sidecar_base_ids(session)
+        if not base_ids or base_ids[-1] not in self.stop_ids:
+            raise SpliceConflict("splice_base_seam", f"{session['restore_name']}: the base does not end on a full "
+                                                     "turn's stop token (it was cut mid-turn or is corrupt), so the "
+                                                     "new turns cannot be spliced onto it",
+                                 expected="a base ending on a stop token",
+                                 got=f"last token {base_ids[-1] if base_ids else 'none'}")
+        role = messages[0].get("role")
+        anchors, seen = [], set()
+        for text in ("<|im_start|>" + role, "<|im_start|>" + role + "\n"):
+            a = self.tok.encode(text, parse_special=True)
+            if a and tuple(a) not in seen:
+                seen.add(tuple(a))
+                anchors.append(a)
+        k = -1
+        for anchor in anchors:
+            k = find_subsequence(ids_new, anchor)
+            if k >= 0:
+                break
+        if k < 0:
+            raise ValueError("splice_render_mismatch: the rendered new turns do not contain the first turn's "
+                             "opening; resend the whole conversation instead of splicing")
+        delta = ids_new[k:]
+        if self.splice_sep_ids:
+            delta = self.splice_sep_ids + delta
+        session["splice_base_len"] = len(base_ids)
+        session["splice_delta_len"] = len(delta)
+        session["splice_base_ids"] = base_ids     # kept for the in-turn re-read (a same-name save can swap the sidecar)
+        return base_ids + delta
+
+    def _write_sidecar(self, path: str, ids: list[int]) -> None:
+        """The token sidecar of a saved session: <save path>.sess.tokens.json, the ids the engine will be handed on
+        a later spliced restore (the submitted prompt + the generated ids, stop token included).  Written to a
+        temporary file and renamed, so a reader never sees a half-written file; the temporary is removed on failure."""
+        data = {"version": 1, "tokenizer": self.session_tok_hash, "template": self.session_tpl_hash,
+                "created": int(time.time()), "ids": ids}
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None, session=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
-        prompt; with thinking, Service.run writes it once the thinking is over."""
+        prompt; with thinking, Service.run writes it once the thinking is over.  `session` (strata_session): with
+        "splice", `messages` holds only new turns and the prompt is the saved base's ids + theirs (a SpliceConflict,
+        409, when the base cannot be trusted)."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
@@ -5187,6 +5380,9 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        if session is not None and session.get("splice"):
+            # strata_session: `messages` held only the new turns - the prompt is the sidecar's base + their delta
+            ids = self._spliced_prompt(ids, messages, session)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
@@ -5437,19 +5633,19 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-            declared_only=False) -> Iterator[tuple[str, object]]:
+            declared_only=False, session=None) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, session)
         finally:
             if ka is not None:
                 ka.release()
 
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-             declared_only=False) -> Iterator[tuple[str, object]]:
+             declared_only=False, session=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
@@ -5531,6 +5727,7 @@ class Service:
         # so the generated reasoning must not become this request's cached input (#615).
         segments = []
         timed_out = False
+        session_out = {} if session is not None else None   # the strata_session answer block, built inside the turn
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
         first_engine_token_s = None  # this request, from entering the engine queue; includes queue/prefill
@@ -5610,6 +5807,36 @@ class Service:
                     elif not (self.loaded() and not self._vision_down()):
                         with self._inference_fifo(deadline, cancel):
                             self.ensure_loaded()
+                    if session is not None and session.get("restore"):
+                        # a composite strata_session request: the restore runs here, inside this request's fifo turn
+                        # and before any generation, so restore -> generate -> save cannot interleave with another
+                        # request.  A refusal (SessionRefused) or a dead engine fails the whole request: nothing is
+                        # generated and nothing is saved.  Only the phase is set: busy stays off until the prompt is
+                        # read, so a failed restore records no history row.
+                        with self.status_lock:
+                            st.update(phase="restoring a session", started=time.time(), first_token=None)
+                        restored = self.engine.session_file("restore", session["restore"])
+                        session_out["restored"] = restored
+                        if session.get("splice") and restored["tokens"] != session.get("splice_base_len"):
+                            raise SpliceConflict("splice_stale", f"{session['restore_name']}: the engine restored "
+                                                 f"{restored['tokens']} tokens, the sidecar holds "
+                                                 f"{session['splice_base_len']}; the base changed underneath "
+                                                 "(resend the whole conversation once to rebuild it)",
+                                                 expected=session["splice_base_len"], got=restored["tokens"])
+                        if session.get("splice"):
+                            # the sidecar was first read in prepare(), outside the fifo: another request could have
+                            # restored and saved the same name in between, swapping .sess and sidecar under this one.
+                            # The fifo is held now, so this re-read is stable: the ids must be exactly the base the
+                            # prompt was rendered with (value by value: a same-length swap passes the count check)
+                            now_ids = self._sidecar_base_ids(session)
+                            if now_ids != session.get("splice_base_ids"):
+                                raise SpliceConflict("splice_stale", f"{session['restore_name']}: the token sidecar "
+                                                     "changed after the prompt was rendered (another request saved "
+                                                     "the same name); resend the whole conversation once to rebuild "
+                                                     "the base", expected=len(session["splice_base_ids"]),
+                                                     got=len(now_ids),
+                                                     detail="the sidecar's token ids differ from the base the prompt "
+                                                            "was rendered with")
                     with self.status_lock:
                         if par:
                             self.status["queued"] -= 1
@@ -5627,6 +5854,7 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    splice_resume = None                # the FIRST pass's reused count, for the splice advisory below
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -5750,12 +5978,19 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if splice_resume is None and session is not None and session.get("splice"):
+                            # the advisory compares the FIRST pass's RESUME against the base: a two-pass request (a
+                            # thinking-budget wrap or a thinking-close retry) continues from a longer prompt, whose
+                            # RESUME counts more than the base, and would false-report resume_ok=false
+                            splice_resume = int(getattr(self.engine, "reused", 0) or 0)
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
                             if n == 0 and not nf_retried:
                                 nf_retried = True
                                 # the retry reads from token 0: its DONE, not this one's, says what was reused
+                                splice_resume = None   # the first pass's latched count predates the resend: the
+                                #                        latch at the pass end refires on the retry's own reused
                                 del segments[segments_before:]
                                 print("[strata] the engine's logits became non-finite before the first token (#879); it "
                                       "dropped its cached state: sending the request again once", flush=True)
@@ -5940,6 +6175,48 @@ class Service:
                                 self.status.update(busy=False)
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
+                if session is not None and not cancel.is_set() and finish in ("stop", "length"):
+                    # the generation is over and its raw ids are final: a composite strata_session request does the
+                    # rest here, still inside this request's fifo turn - restore -> generate -> save is atomic
+                    # because the fifo is held throughout, no lock of its own
+                    if session.get("splice"):
+                        resume = splice_resume if splice_resume is not None \
+                            else int(getattr(self.engine, "reused", 0) or 0)
+                        ok = resume == session["splice_base_len"]
+                        if not ok:
+                            print(f"[strata] splice: the engine reused {resume} tokens, not the "
+                                  f"{session['splice_base_len']} the base holds (its cache changed): the answer is "
+                                  "still correct, recomputed from the fork; the client is told resume_ok=false",
+                                  flush=True)
+                        session_out["splice"] = {"base_tokens": session["splice_base_len"],
+                                                 "delta_tokens": session["splice_delta_len"],
+                                                 "resume": resume, "resume_ok": ok}
+                    if session.get("save"):
+                        with self.status_lock:
+                            st.update(phase="saving the session")
+                        try:
+                            saved = self.engine.session_file("save", session["save"])
+                        except SessionRefused as e:
+                            # the engine is still in step: the answer stands, the failure rides it (the sidecar is
+                            # not written, so a later splice of this name answers 409 until a save succeeds)
+                            session_out["save_error"] = {"kind": e.kind, "reason": str(e)}
+                            if e.published:
+                                session_out["save_error"]["published"] = True
+                        else:
+                            session_out["saved"] = saved
+                            if recovery_count:
+                                # the engine state is right (.sess is saved), but this server's submitted ids were
+                                # re-sent mid-generation (reasoning_loop_recovery): a sidecar written from them
+                                # would not replay - skip it; the next splice of the name answers 409 and the client
+                                # resends the whole conversation once (self-healing by design)
+                                session_out["sidecar"] = "skipped_recovery"
+                            else:
+                                try:
+                                    self._write_sidecar(session["save"] + ".tokens.json", list(ids) + raw_ids)
+                                except OSError as e:
+                                    session_out["save_error"] = {"kind": "io",
+                                                                 "reason": "the session saved, but its token "
+                                                                           "sidecar could not be written: " + str(e)}
         except QueueCancelled:
             finish = "cancel"
             yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
@@ -5985,6 +6262,8 @@ class Service:
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n,
                 "reasoning_recoveries": recovery_count}
+        if session_out:
+            done["session"] = session_out
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         if rejected:
@@ -6360,9 +6639,10 @@ def prompt_progress(svc: Service):
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
 
 
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None, session=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
-    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
+    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run.  `session`
+    (strata_session): handed to Service.run; its answer block rides the final chunk."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model_for(req)
     # llama.cpp's flag, and its default: a client that wants prompt progress asks for it, and nothing changes for one
@@ -6384,7 +6664,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                                       declared_only=True, session=session):
         if kind == "ping":
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
@@ -6428,6 +6709,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
             if x.get("rejected_tool_calls"):
                 last["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796: only when a call was refused as undeclared
+            if x.get("session"):
+                last["session"] = x["session"]          # a strata_session composite's restore/save/splice report
             yield last
 
 
@@ -6482,6 +6765,8 @@ def openai_collect(chunks) -> dict:
         out["timings"] = last["timings"]
     if last.get("strata_rejected_tool_calls"):
         out["strata_rejected_tool_calls"] = last["strata_rejected_tool_calls"]
+    if last.get("session"):
+        out["session"] = last["session"]                # a strata_session composite's restore/save/splice report
     return out
 
 
@@ -7519,6 +7804,9 @@ def make_handler(svc: Service):
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except ModelBusy as e:
                 self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
+            except SpliceConflict as e:
+                # strata_session splice: the base cannot be trusted; the client resends the whole conversation once
+                self._json(409, {"error": {"type": e.kind, "message": str(e), **e.fields}})
             except QueueWaitExpired as e:
                 error = {"type": "rate_limit_error", "code": "queue_wait_timeout", "message": str(e)}
                 self._note(error=error)
@@ -7845,13 +8133,20 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
+            # strata_session (opt-in composite): validated here, before anything is queued; the restore/save run
+            # inside the request's engine turn (Service.run) and a splice rewrites the prompt in prepare()
+            session = strata_session_of(req, messages, svc.slot_save_path, bool(getattr(svc.engine, "batch", 0)))
+            if session is not None and use_mcp:
+                raise ValueError("strata_session with MCP tools (strata_mcp) is not supported (v1)")
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel,
+                                                 session=session)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force,
+                                   session=session)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -9205,6 +9500,17 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
+    vocab_json = tpath / "vocab.json"
+    if vocab_json.exists():
+        # strata_session's token sidecar names the tokenizer that wrote it (Service never sees the pack's files):
+        # one hash over every tokenizer file the load above read, in a fixed order, so a change to any of them
+        # (vocab, merges, token types, the pre-tokenizer config) invalidates saved sidecars
+        sidecar_hash = hashlib.sha256()
+        for name in ("vocab.json", "merges.txt", "token_type.json", "tokenizer.json"):
+            tfile = tpath / name
+            if tfile.exists():
+                sidecar_hash.update(tfile.read_bytes())
+        svc.session_tok_hash = sidecar_hash.hexdigest()[:16]
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
         # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader process.
         # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures are refused with the 400 as before.

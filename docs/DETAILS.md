@@ -1196,6 +1196,60 @@ without penalties, so more of its guesses are now rejected. Requests without pen
 
 **Sampled drafting (opt-in, 0.1.40.2).** With temperature above 0 the engine keeps a draft only when it equals the token the model sampled for that position, and the draft layer proposes its best guess. Two opt-in switches change how the draft layer drafts a sampled request; greedy requests (temperature 0) are never touched and stay byte-identical. `STRATA_SPEC_COUPLED=1` (or `--coupled-draft`) drafts by sampling with the request's own settings and the random number the checking row will use; the text for a seed does not change. `STRATA_SPEC_PROB=1` is speculative rejection sampling: the draft layer samples its guess from its own distribution q, the check accepts it with probability min(1, p/q) (p is the model's distribution after penalties, top_k, top_p, min_p and temperature) and otherwise samples the replacement from the leftover distribution, so every token is distributed exactly as without drafts (the text for a seed then depends on the drafts, so it is reproducible only for the same engine, flags and prompt). Guesses without a distribution (prompt lookup, suffix drafts) keep the exact-match rule, which is already exact. Neither is faster in a way that holds up: on an RTX 3060 (IQ3_XXS, 200-token story and code answers, 10 interleaved pairs) the default's median output speed was 42.4 / 43.2 / 43.3 tok/s at temperature 0.3 / 0.7 / 1.0, coupled drafting 40.6 / 42.4 / 43.3 and rejection sampling 41.0 / 42.6 / 42.6, with run-to-run differences of up to 5% between repeats; drafts kept per round fell at 0.3 and rose by about 5 points at 1.0, which the cost of the longer sampled windows ate. `STRATA_SPEC_DEPTH=1` prints the acceptance by draft depth for each request; `STRATA_SPEC_MIN_TEMP=0.9` limits sampled drafting to hotter requests. Proof that the rejection rule keeps the distribution: `spec_prob_test` (chi-square, 2 million trials per case) and `spec_verify_parity` (GPU against the host reference).
 
+### Session files in chat requests (strata_session)
+
+A `POST /v1/chat/completions` can do the restore and the save inside the one request, so a client never
+holds the engine between them: add an opt-in `strata_session` object beside `messages`:
+
+```json
+"strata_session": {"restore": "chat1.sess", "save": "chat1.sess", "splice": true}
+```
+
+- `restore` and `save` are plain file names in the `--slot-save-path DIR` from above; they may name different
+  files. Four combinations: `restore` alone (answer from the saved conversation, write nothing), `save` alone
+  (answer, then save), `restore` + `save` (continue and keep the result), and neither (an empty object asks for
+  nothing: the request is ordinary).
+- The restore runs after the model is loaded and before the prompt is read; the save runs after the answer is
+  complete, both inside the request's own engine turn. No other request can interleave: restore → answer → save
+  is atomic because the engine's turn is held throughout. There is no lock of its own.
+- The answer carries a `session` block: `"restored"` / `"saved"` are the engine's `{tokens, bytes, ms}` answers.
+- A restore the engine refuses (or a dead engine) fails the whole request: nothing is generated, nothing is saved.
+  A save the engine refuses does not fail the answer: the response is still 200, `"saved"` is absent and
+  `"save_error": {"kind", "reason"}` (plus `published` when it applies, as above) says why. The session file
+  keeps the rules of the section above: its identity is checked by the engine on restore, and a failure there
+  changes nothing. When the session file saves but its token sidecar cannot be written (an IO failure on disk),
+  the response is still 200 and carries both: `"saved"` (the engine's save succeeded) and
+  `"save_error": {"kind": "io", "reason"}` — a later splice of that name answers 409 until a save writes the
+  sidecar.
+
+With `"splice": true` the request's `messages` carry only the new turns. The server keeps a small token sidecar
+beside each saved session — `NAME.sess.tokens.json`, the token ids the engine was handed plus the ids the answer
+added (stop token included) — and splices the rendered new turns onto it, so the client never resends the base:
+
+- The first new message must be a `user` turn, and no `system` turn may be among the new turns: the system prompt
+  belongs to the base and cannot change. `splice` needs `restore`. Images are not spliced (v1).
+- The seam between base and new turns is the template's turn separator (a newline in ChatML). The engine's token
+  stream has no such separator — a saved base ends on its stop token — so the server adds the separator's ids
+  itself. The base's last token must be a stop token; a base cut mid-turn (a truncated generation) is refused.
+- The sidecar names the tokenizer and chat template that wrote it (content hashes). A missing sidecar, an unknown
+  version, or a different tokenizer or template answers `409 splice_stale`: resend the whole conversation once to
+  rebuild the base; the server reports the mismatch and never deletes anything. The same answer comes when the
+  engine restores a different number of tokens than the sidecar holds (its file changed underneath). A seam
+  violation answers `409 splice_base_seam`.
+- When the splice runs, the answer's `"splice"` block reports `base_tokens`, `delta_tokens`, the tokens the engine
+  actually reused (`resume`) and `resume_ok`. `resume_ok` is true only when `resume` equals `base_tokens` (the
+  comparison is `!=`, and `resume` is the first generation pass's count: a request that ran a second pass continued
+  from a longer prompt); any other count means the engine's cache had changed: the answer is still correct
+  (recomputed from the fork) and the client is told with `resume_ok: false`.
+- On save the sidecar is rewritten atomically (a temporary file, renamed after the save succeeded) with the submitted
+  ids plus the answer's ids. When the request's reasoning was recovered mid-generation (`reasoning_loop_recovery`
+  re-sent the prompt), the engine state is right but a sidecar would not replay: it is skipped, the answer says
+  `"sidecar": "skipped_recovery"`, and the next splice of that name answers 409 until a clean save rebuilds it.
+
+**v1 limits:** non-streaming requests only (the save must follow the answer inside one engine turn); no images with
+`splice`; `strata_session` is not read by `/v1/messages` or `/v1/responses`; not with parallel requests (`"parallel"` /
+`--batch`) or MCP tools. Everything above is opt-in: a request without `strata_session` is handled exactly as before.
+
 ### The web page (Chat, Images, Monitor, About)
 
 Open the server's address in a browser. Everything in it runs from the server's own files: no CDN, no outside address. Chats,

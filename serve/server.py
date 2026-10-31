@@ -3201,6 +3201,25 @@ def drafting_card_class() -> str:
     return _CARD_CLASS[0]
 
 
+CACHE_ASSUME_PASS_SWITCH = "--conversation-cache-assume-pass"
+
+
+def cache_assume_pass(cfg: dict) -> bool:
+    """The owner's ASSUME PASS for the disk cache's recompute gate: the config key
+    "conversation_cache_assume_pass": true, or --conversation-cache-assume-pass among the engine options ("args", or
+    "user_args" which win over them).  Off by default.  The owner decided the reuse is wanted now, without waiting
+    for the KV test (docs/CACHE_REUSE_RULES.md): the verification run before the engine approves the same-model files
+    of another configuration and marks every row it writes with reason assume_pass, so no reader takes it for a
+    verified pass.
+
+    SERVE-ONLY: engine_args takes the option out (the engine has no such option and refuses an unknown argument, and it
+    must not serve differently for it - what changes is the verification before it).  Independent of
+    --conversation-cache-disk-recompute-gate: with the gate off nothing is read, written or approved."""
+    if cfg.get("conversation_cache_assume_pass") is True:
+        return True
+    return any(CACHE_ASSUME_PASS_SWITCH in list(cfg.get(key) or ()) for key in ("args", "user_args"))
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
@@ -3210,6 +3229,11 @@ def engine_args(cfg: dict) -> list[str]:
     # so a setup run or the app rewriting "args" cannot undo them (#3216 #3215 #3270)
     if cfg.get("user_args"):
         args = user_args.merge(args, cfg["user_args"])
+    if CACHE_ASSUME_PASS_SWITCH in args:
+        # --serve's own switch (cache_assume_pass): the engine would refuse it as an unknown argument, and only the
+        # verification before the engine changes for it, never the engine itself
+        args = [arg for arg in args if arg != CACHE_ASSUME_PASS_SWITCH]
+        print(f"[strata] {CACHE_ASSUME_PASS_SWITCH} is the server's: the engine starts without it", flush=True)
     # "drafting": auto | mtp | dflash2 | off (strata_control/drafting.py; the Models screen and `strata launch --drafting` write it): which drafter
     # guesses ahead. A choice that cannot be applied starts the MTP and says why in the engine's /metrics ("drafting_note").
     if cfg.get("drafting") is not None or drafting.suggest(drafting_card_class()) != "mtp":
@@ -3291,7 +3315,7 @@ def slot_save_dir_of(a, cfg: dict) -> str | None:
 
 
 def cache_gate_verify(exe: str, args: list[str], slots: list[str], env: dict | None = None,
-                      cwd: str | None = None) -> None:
+                      cwd: str | None = None, assume_pass: bool = False) -> None:
     """R1/R2/R4 of docs/CACHE_REUSE_RULES.md: with the recompute gate on, the PROGRAM verifies the cache before the
     engine starts - the engine needs the GPU the verification run's engine is about to take (the same one, load the
     model, recompute one sample, exit).  Same tool and same ledger as the slot/disk-cache files themselves, so a
@@ -3304,7 +3328,12 @@ def cache_gate_verify(exe: str, args: list[str], slots: list[str], env: dict | N
 
     Nothing to verify (no cache file this model could use, every one approved, or this identity's own): nothing runs,
     nothing is printed, and the start is exactly the start without the gate.  A scan the tool REFUSED (an unreadable
-    slot directory) is said once on stderr: it verified nothing, and silence would read as "checked"."""
+    slot directory) is said once on stderr: it verified nothing, and silence would read as "checked".
+
+    assume_pass (cache_assume_pass, off by default) is the OWNER'S decision to reuse now without the KV test
+    (docs/CACHE_REUSE_RULES.md): the verification run appends --assume-pass, starts no engine, compares no digest and
+    writes each same-model source's rows with reason assume_pass.  It changes nothing else here: the gate itself stays
+    on, a foreign model is never approved, and the start says in words that nothing was tested."""
     if "--conversation-cache-disk-recompute-gate" not in args:
         return                                     # the gate is off: no ledger is read or written here
     spill = None
@@ -3340,9 +3369,13 @@ def cache_gate_verify(exe: str, args: list[str], slots: list[str], env: dict | N
     argv = ["--cache-dir", str(cache_dir), "--engine", exe, "--engine-build", build]
     for slot in slots:
         argv += ["--slot-dir", slot]
+    if assume_pass:
+        # the owner's assume pass: approve the same-model files of another configuration without the KV test
+        # (docs/CACHE_REUSE_RULES.md); the tool starts no engine, compares no digest and marks every row assume_pass
+        argv.append("--assume-pass")
     for arg in args:
-        if arg == "--conversation-cache-disk-recompute-gate":
-            continue                               # a --serve option; the verification run does not serve
+        if arg in ("--conversation-cache-disk-recompute-gate", CACHE_ASSUME_PASS_SWITCH):
+            continue                               # --serve options; the verification run does not serve
         # one token, --engine-arg=ARG: given as the next token, a flag-shaped value (the engine's own --kv,
         # --max-context 131072, ...) is what argparse calls a missing argument and refuses with SystemExit(2)
         argv.append(f"--engine-arg={arg}")
@@ -3362,7 +3395,11 @@ def cache_gate_verify(exe: str, args: list[str], slots: list[str], env: dict | N
         print(f"[strata] recompute gate: the verification could not run ({exc}); starting the engine anyway",
               file=sys.stderr, flush=True)
         return
-    if status == 0:
+    if status == 0 and assume_pass:
+        # never let an approved-by-assumption cache read as a verified one: the ledger's reason says the same
+        print("[strata] recompute gate: the cache is APPROVED BY ASSUMPTION for this engine build - no KV test was run "
+              "(the owner asked for the reuse now; every ledger row says reason assume_pass)", flush=True)
+    elif status == 0:
         print("[strata] recompute gate: the cache is verified for this engine build", flush=True)
     else:
         print(f"[strata] recompute gate: the verification did not pass (status {status}); the files stay on disk and "
@@ -9139,7 +9176,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                 slots = [slot_dir]
             # the verification engine gets this engine's own environment and working directory, so the K/V it
             # recomputes are the ones the engine below would write (R1)
-            cache_gate_verify(exe, engine_args(cfg) + (effort_end or []), slots, env=env, cwd=cfg.get("cwd"))
+            cache_gate_verify(exe, engine_args(cfg) + (effort_end or []), slots, env=env, cwd=cfg.get("cwd"),
+                              assume_pass=cache_assume_pass(cfg))
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it

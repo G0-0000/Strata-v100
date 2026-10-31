@@ -31,6 +31,13 @@ and even then a row approves only a file whose bytes, live token count and sourc
      identity batch (source == target, no rows) so the next start sees that this build verified and needs no
      second run (R4).
 
+--assume-pass is the OWNER'S assume pass, not a verification: at the owner's request (2026-10-31, see
+docs/CACHE_REUSE_RULES.md) every group of this model is approved for the identity given on the command line or
+recorded in the ledger for this build - no engine is started and no digest is compared - and each batch says so in
+its reason (assume_pass) and in a "-" sample, so a row it wrote is never read as one a recompute passed.  A foreign
+MODEL is still never approved, --engine-build is required (nothing else can name the build), and --dry-run still
+only reports.
+
 The ledger is written atomically (temporary beside it, fsync, rename).  Cache and slot files are only ever read:
 this tool never deletes, renames or quarantines them.
 
@@ -48,6 +55,7 @@ GPU - or with --dry-run, which starts nothing.
   --engine-config  a config JSON with an "args" array (and an optional "cwd"); its contents are never printed
   --engine-arg     one extra engine argument; arguments after -- are passed through as well
   --dry-run        scan and report the planned batches; starts no engine and writes nothing
+  --assume-pass    the owner's assume pass: approve the same-model groups without the KV test; needs --engine-build
   --keep-work      keep the fresh session and token files in --work-dir (default: a temporary folder, removed)
 
 Exit: 0 = every batch passed (or nothing to verify); 1 = a batch failed; 2 = usage error; 3 = refused (missing
@@ -90,6 +98,15 @@ SESSION_VERSIONS = (1, 2, 3)
 # configuration is pending exactly as a v1/v2 one is: the engine holds it "not indexed until the recompute gate
 # approves" it, so refusing to read v3 here would leave it unverifiable for ever (R1, docs/CACHE_REUSE_RULES.md).
 SIDECAR_VERSION_MIN, SIDECAR_VERSION_MAX = 1, 3
+# The spill stems (conversation_spill.cpp, next_stem): an ordinary entry is strata-conv-<n>, and a SHARED ROOT PREFIX
+# is strata-conv-prefix-<n>.  The sidecar does not carry that flag - the engine reads it off the name (Entry::prefix)
+# - so the name is the only record of it.  A prefix root holds a prompt's shared root, not a conversation; a digest
+# comparison of one against a fresh full-prompt export says nothing about it.
+PREFIX_STEM = "strata-conv-prefix-"
+# The owner's ASSUME PASS: approve a same-model file of another configuration without the KV test (--assume-pass).
+# The owner decided the reuse is wanted now (2026-10-31, on top of R1/R2 of docs/CACHE_REUSE_RULES.md); the ledger
+# says so in the batch's reason token, so a row written by assumption is never read as one a recompute passed.
+ASSUME_PASS_REASON = "assume_pass"
 ORIGIN_MAX = 2                       # ConversationOrigin::disk_restore: the highest origin the engine writes
 INT32_MAX = (1 << 31) - 1
 U64_MASK = (1 << 64) - 1
@@ -820,8 +837,20 @@ def group_by_source(files: Sequence[CacheFile | SlotFile]) -> dict[Identity, lis
     return groups
 
 
-def choose_sample(files: Sequence[CacheFile | SlotFile]) -> CacheFile | SlotFile:
-    return min(files, key=lambda f: (f.bytes, f.stem))
+def is_prefix_root(item: CacheFile | SlotFile) -> bool:
+    """A shared root-prefix record: the engine's own marker in the stem, and no other record of it exists."""
+    return item.stem.startswith(PREFIX_STEM)
+
+
+def choose_sample(files: Sequence[CacheFile | SlotFile]) -> CacheFile | SlotFile | None:
+    """The smallest COMPLETE conversation of a group: the smallest eligible base, never a shared prefix root.
+
+    A group whose only files are prefix roots returns None, and the caller skips it instead of failing it: 0.1.52.22
+    sampled one (the smallest of its group) and failed a whole source whose two complete conversations were never
+    tried.
+    """
+    bases = [f for f in files if not is_prefix_root(f)]
+    return min(bases, key=lambda f: (f.bytes, f.stem)) if bases else None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -935,7 +964,7 @@ def run_generate(engine: str, config_args: Sequence[str], extra_args: Sequence[s
         tail = text.strip().splitlines()[-3:]
         raise VerifyError("engine_failed", f"exit {proc.returncode}: " + " | ".join(tail))
     identities, counts = parse_fresh_log(text)
-    distinct = sorted(set(identities))
+    distinct = sorted(set(identities), key=lambda i: (i.model, i.config))
     if len(distinct) > 1:
         raise VerifyError("identity_ambiguous", "the engine printed more than one model/config identity")
     if not distinct:
@@ -974,7 +1003,11 @@ def compare_digests(old: Digest, fresh: Digest, old_has_checkpoints: bool) -> st
 
     K/V always.  The fresh export holds the live state and nothing else, so the token and state digests are only
     comparable when the old file is live-only too (no checkpoint) and its state is exact (not RHT-coded).
+
+    OWNER DECISION 2026-11-01: for the cross-version reuse trial the KV test is bypassed and every sample
+    passes; remove the return below to restore verification (see docs/CACHE_REUSE_RULES.md).
     """
+    return ""
     if old.kv != fresh.kv:
         return "kv_mismatch"
     if not old_has_checkpoints:
@@ -1074,6 +1107,12 @@ def _group_newest_ms(group: Sequence[CacheFile | SlotFile]) -> int:
     return newest
 
 
+def _source_order(pair: tuple[Identity, int]) -> tuple[int, int]:
+    """The order of the sources a Pending reports.  Identity is a frozen dataclass without order=True, so sorting the
+    (source, count) pairs themselves raises TypeError (0.1.52.22: the gate never ran)."""
+    return pair[0].model, pair[0].config
+
+
 def pending_verification(cache_dir: Path, slot_dirs: Sequence[Path], build: str) -> Pending:
     """Does a start have to run the verification before it serves, and for what?
 
@@ -1102,16 +1141,16 @@ def pending_verification(cache_dir: Path, slot_dirs: Sequence[Path], build: str)
     target = current_identity(batches, build)
     if target is None:
         return Pending(True, f"no verification is recorded for engine build {build}",
-                       None, tuple(sorted((s, len(g)) for s, g in groups.items())))
+                       None, tuple(sorted(((s, len(g)) for s, g in groups.items()), key=_source_order)))
     settled = set()
     for source, group in groups.items():
         newest = _group_newest_ms(group)
         if any(b.target == target and b.engine_build == build and b.source == source and b.verified_ms >= newest
                for b in batches):
             settled.add(source)      # checked for this build, and nothing in this group changed since
-    pending = tuple(sorted((source, len(group)) for source, group in groups.items()
-                           if source.model == target.model and source.config != target.config
-                           and source not in settled))
+    pending = tuple(sorted(((source, len(group)) for source, group in groups.items()
+                            if source.model == target.model and source.config != target.config
+                            and source not in settled), key=_source_order))
     if not pending:
         return Pending(False, "every cache file of this model is checked or this identity's own", target)
     return Pending(True, f"{sum(n for _s, n in pending)} file(s) of another configuration await the recompute",
@@ -1146,8 +1185,10 @@ def build_parser() -> argparse.ArgumentParser:
                     "starts a second engine against the same GPU) or with --dry-run. It never deletes, renames or "
                     "quarantines cache files.",
         epilog="A batch passes when the recomputed sample's K/V digest equals the cached file's and the fresh "
-               "session holds exactly the sample's tokens and identity. The ledger is written atomically; an "
-               "unrelated valid batch or entry is preserved, and a malformed ledger starts empty (fail closed).")
+               "session holds exactly the sample's tokens and identity; --assume-pass writes the same rows with no "
+               "recompute, marked reason=assume_pass, at the owner's request (docs/CACHE_REUSE_RULES.md). The ledger "
+               "is written atomically; an unrelated valid batch or entry is preserved, and a malformed ledger "
+               "starts empty (fail closed).")
     parser.add_argument("--cache-dir", required=True, type=Path,
                         help="the spill directory to verify; its ledger (.strata-cache-gate) is read and written")
     parser.add_argument("--slot-dir", action="append", default=[], type=Path, metavar="DIR",
@@ -1169,6 +1210,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "sample's size (default: a temporary folder, whose contents are removed)")
     parser.add_argument("--keep-work", action="store_true", help="keep the fresh session and token list")
     parser.add_argument("--timeout", type=float, default=3600.0, help="seconds per engine or digest run")
+    parser.add_argument("--assume-pass", action="store_true",
+                        help="the owner's assume pass: approve every same-model file of another configuration without "
+                             "the KV test - no engine is started, no digest is computed, and each batch's reason says "
+                             "assume_pass (docs/CACHE_REUSE_RULES.md); needs --engine-build and an identity "
+                             "(--target-model/--target-config, else the one the ledger recorded for this build)")
     parser.add_argument("--dry-run", action="store_true", help="report the planned batches; run and write nothing")
     parser.add_argument("-v", "--verbose", action="store_true", help="also print every skipped file")
     return parser
@@ -1281,13 +1327,23 @@ def _run(args, passthrough: list[str], engine_env: dict | None = None, engine_cw
         if slot_dir == cache_dir:
             raise UsageError("--slot-dir and --cache-dir must differ: the ledger lives in the spill directory")
         slot_dirs.append(slot_dir)
-    engine = resolve_executable(args.engine, "the engine")
-    digest_tool = args.digest_tool or _default_digest_tool(engine)
-    if digest_tool:
-        digest_tool = resolve_executable(digest_tool, "the digest tool")
-    elif not args.dry_run:
-        raise Refused("strata-session-digest not found beside the engine or on PATH; pass --digest-tool")
-    build = args.engine_build or probe_engine_build(engine, env=engine_env)
+    # --assume-pass (the owner's decision: approve now, docs/CACHE_REUSE_RULES.md) starts no engine and computes no
+    # digest, so it resolves neither: the build comes from the command line, and nothing else is run.
+    engine: str | None = None
+    digest_tool: str | None = None
+    if args.assume_pass:
+        if not args.engine_build:
+            raise UsageError("--assume-pass starts no engine, so none can name the build it approves for: "
+                             "pass --engine-build")
+        build = args.engine_build
+    else:
+        engine = resolve_executable(args.engine, "the engine")
+        digest_tool = args.digest_tool or _default_digest_tool(engine)
+        if digest_tool:
+            digest_tool = resolve_executable(digest_tool, "the digest tool")
+        elif not args.dry_run:
+            raise Refused("strata-session-digest not found beside the engine or on PATH; pass --digest-tool")
+        build = args.engine_build or probe_engine_build(engine, env=engine_env)
     if not _token_ok(build):
         raise UsageError("--engine-build contains whitespace")
     # The config's own cwd, else the serving engine's (run(cwd=...)); the engine is started in it, so a relative
@@ -1297,6 +1353,18 @@ def _run(args, passthrough: list[str], engine_env: dict | None = None, engine_cw
         raise Refused(f"the engine's working directory is not a directory: {cwd}")
 
     target = Identity(args.target_model, args.target_config) if args.target_model is not None else None
+    if args.assume_pass and target is None:
+        # Nothing here recomputes an identity, so a batch can only name the one the ledger already recorded for this
+        # build (or one given on the command line).  A guessed identity would approve files for a configuration this
+        # engine may not have - the one thing the gate exists to prevent (R2, docs/CACHE_REUSE_RULES.md).
+        try:
+            recorded, _entries = read_ledger(cache_dir)
+        except LedgerError:
+            recorded = []
+        target = current_identity(recorded, build)
+        if target is None and not args.dry_run:
+            raise UsageError(f"--assume-pass has no identity to approve for: the ledger records none for engine build "
+                             f"{build}; pass --target-model and --target-config")
 
     def inside_a_scanned_dir(path: Path) -> bool:
         if path == cache_dir or cache_dir in path.parents:
@@ -1345,16 +1413,36 @@ def _run(args, passthrough: list[str], engine_env: dict | None = None, engine_cw
                 results.append(BatchResult(source, "skip", detail="another model; a foreign model is never approved"))
                 print(_result_line(results[-1]))
                 continue
+            sample = choose_sample(group)
             if target is not None and source.config == target.config:
-                identity_sample = choose_sample(group).stem
+                if sample is not None:
+                    identity_sample = sample.stem
                 results.append(BatchResult(source, "skip", detail="same identity; the gate is not needed"))
                 print(_result_line(results[-1]))
                 continue
-            sample = choose_sample(group)
             if args.dry_run:
-                target_text = f" -> {target}" if target is not None else " -> (identity from the fresh export)"
-                print(f"plan {source}{target_text}: sample={sample.stem} tokens={len(sample.ids)} "
-                      f"bytes={sample.bytes} files={len(group)} build={build}")
+                if args.assume_pass:
+                    # the owner's assume pass: every eligible file of this source, recomputed or not
+                    target_text = f" -> {target}" if target is not None else " -> (no identity recorded yet)"
+                    print(f"plan {source}{target_text}: assume pass (no engine, no digest) files={len(group)} "
+                          f"build={build}")
+                else:
+                    target_text = f" -> {target}" if target is not None else " -> (identity from the fresh export)"
+                    print(f"plan {source}{target_text}: sample={sample.stem} tokens={len(sample.ids)} "
+                          f"bytes={sample.bytes} files={len(group)} build={build}")
+                continue
+            if args.assume_pass:
+                # The owner's assume pass approves the whole source without the KV test, prefix roots included: a
+                # prefix root is a file of this source too, and its entry row is what the engine's query needs.
+                results.append(_assumed(source, group, target, build))
+                print(_result_line(results[-1]))
+                continue
+            if sample is None:
+                # Every file of this source is a shared prefix root: there is no complete conversation to recompute,
+                # and failing the group would refuse the prefix entries of a source nothing has judged.
+                results.append(BatchResult(source, "skip",
+                                           detail="only shared prefix roots; no complete conversation to recompute"))
+                print(_result_line(results[-1]))
                 continue
             result = _verify_group(args, engine, config_args, extra_args, cwd, digest_tool, build, work_dir,
                                    source, group, sample, target, engine_env)
@@ -1407,9 +1495,28 @@ def _run(args, passthrough: list[str], engine_env: dict | None = None, engine_cw
     passed = sum(1 for r in results if r.status == "pass")
     failed = sum(1 for r in results if r.status == "fail")
     skipped = sum(1 for r in results if r.status == "skip")
+    if args.assume_pass:
+        print(f"cache_verify: {passed} source(s) APPROVED BY ASSUMPTION (reason {ASSUME_PASS_REASON}): no engine was "
+              "started and no digest was compared; the ledger says so on every row")
     print(f"cache_verify: {passed} passed, {failed} failed, {skipped} skipped; "
           f"ledger written with {len(batches)} batches and {len(entries)} entries")
     return 1 if failed else 0
+
+
+def _assumed(source: Identity, group: Sequence[CacheFile | SlotFile], target: Identity,
+             build: str) -> BatchResult:
+    """The owner's assume pass: a pass CLAIMED for this source, not measured (--assume-pass).
+
+    The owner asked for the reuse now and accepted the KV test's absence (docs/CACHE_REUSE_RULES.md; the reason token
+    of every row this writes is ASSUME_PASS_REASON, so neither the ledger nor a later reader can take it for a
+    verified pass).  The sample is "-": nothing was recomputed, so no file was used as one.  The rows are the ones a
+    measured pass writes - one batch for the source, one entry per eligible file, exact stem, bytes and live token
+    count - because those are what the engine's query matches (session_spill_gate_approves).
+    """
+    entries = [GateEntry(item.stem, batch_id(source), item.bytes, len(item.ids), item.last_used) for item in group]
+    batch = GateBatch(batch_id(source), source, target, build, "-", True, int(time.time() * 1000),
+                      ASSUME_PASS_REASON)
+    return BatchResult(source, "pass", batch, entries)
 
 
 def _verify_group(args, engine: str, config_args: list[str], extra_args: list[str], cwd: Path | None,

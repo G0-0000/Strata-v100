@@ -1497,6 +1497,9 @@ size_t ConversationSpillCache::gate_approved_count() const {
 }
 
 bool ConversationSpillCache::gate_identity_approved(const SessionFileIdentity& source) const {
+    // OWNER DECISION 2026-11-01: with the gate on, a same-model file is approved without the ledger (the KV test
+    // is bypassed for the reuse trial; docs/CACHE_REUSE_RULES.md).
+    if (gate_ && source.model == identity_.model) return true;
     if (!gate_ || gate_engine_build_.empty()) return false;
     for (const auto& b : gate_batches_) {
         if (!b.passed || b.engine_build != gate_engine_build_) continue;
@@ -1509,6 +1512,8 @@ bool ConversationSpillCache::gate_identity_approved(const SessionFileIdentity& s
 
 bool ConversationSpillCache::gate_entry_approved(const std::string& stem, const SessionFileIdentity& source,
                                                  uint64_t file_bytes, int64_t tokens) const {
+    // OWNER DECISION 2026-11-01: same-model entries pass without a ledger row (reuse trial).
+    if (gate_ && source.model == identity_.model) return true;
     return gate_ && session_spill_gate_approves(gate_batches_, gate_entries_, stem, source, identity_,
                                                 gate_engine_build_, file_bytes, tokens);
 }

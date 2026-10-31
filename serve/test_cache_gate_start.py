@@ -112,12 +112,13 @@ class CacheGateStart(unittest.TestCase):
             self.skipTest("tools/cache_verify.py is not in this install")
         return module
 
-    def call(self, verifier, args=None, slots=None, env=None, cwd=None):
+    def call(self, verifier, args=None, slots=None, env=None, cwd=None, assume_pass=False):
         out = io.StringIO()
         with mock.patch.object(server, "_cache_verify_module", return_value=verifier), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             server.cache_gate_verify(self.engine, self.args() if args is None else args,
-                                     [str(self.slots)] if slots is None else slots, env=env, cwd=cwd)
+                                     [str(self.slots)] if slots is None else slots, env=env, cwd=cwd,
+                                     assume_pass=assume_pass)
         return out.getvalue()
 
     def test_the_gate_off_touches_nothing(self):
@@ -192,6 +193,55 @@ class CacheGateStart(unittest.TestCase):
         self.assertEqual(options.engine_build, "0.1.52.20")
         self.assertEqual(options.slot_dir, [self.slots])
         self.assertIn("verified for this engine build", text)
+
+    def test_assume_pass_reaches_the_verifier_only_when_switched_on(self):
+        # the owner's assume pass (docs/CACHE_REUSE_RULES.md): off by default, and when on the verification run is
+        # told to approve without the KV test rather than to recompute
+        off = FakeVerifier(Pending(True))
+        self.call(off)
+        self.assertNotIn("--assume-pass", off.calls[2][1])
+        on = FakeVerifier(Pending(True))
+        self.call(on, assume_pass=True)
+        self.assertIn("--assume-pass", on.calls[2][1])
+
+    def test_the_real_parser_takes_assume_pass(self):
+        verifier = RealParserVerifier(Pending(True), self.real_module())
+        self.call(verifier, assume_pass=True)
+        options = verifier.calls[-1][1]
+        self.assertTrue(options.assume_pass)
+        self.assertIn("--assume-pass", verifier.calls[2][1])
+
+    def test_assume_pass_does_not_switch_the_gate_on(self):
+        # independent of --conversation-cache-disk-recompute-gate: with the gate off nothing is read, written or
+        # approved, whatever the assume pass says
+        verifier = FakeVerifier(Pending(True))
+        self.assertEqual(self.call(verifier, args=self.args(gate=False), assume_pass=True), "")
+        self.assertEqual(verifier.calls, [])
+
+    def test_the_assumption_is_said_and_never_called_verified(self):
+        verifier = FakeVerifier(Pending(True))
+        text = self.call(verifier, assume_pass=True)
+        self.assertIn("APPROVED BY ASSUMPTION", text)
+        self.assertIn("assume_pass", text)
+        self.assertNotIn("is verified for this engine build", text)
+
+    def test_the_switch_in_the_engine_options_is_the_servers(self):
+        # --conversation-cache-assume-pass is serve-only: it reaches the verification run as --assume-pass and never
+        # the engine (which refuses an unknown argument), and it never rides along as one of the engine's arguments
+        self.assertFalse(server.cache_assume_pass({"args": ["--max-context", "131072"]}))
+        self.assertTrue(server.cache_assume_pass({"args": ["--conversation-cache-assume-pass"]}))
+        self.assertTrue(server.cache_assume_pass({"args": [], "user_args": ["--conversation-cache-assume-pass"]}))
+        self.assertTrue(server.cache_assume_pass({"args": [], "conversation_cache_assume_pass": True}))
+        self.assertFalse(server.cache_assume_pass({"args": [], "conversation_cache_assume_pass": "yes"}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            got = server.engine_args({"args": ["--pack", "p", "--conversation-cache-assume-pass"]})
+        self.assertEqual(got, ["--pack", "p"])
+        self.assertIn("the engine starts without it", out.getvalue())
+        verifier = FakeVerifier(Pending(True))
+        self.call(verifier, args=self.args() + ["--conversation-cache-assume-pass"])
+        argv = verifier.calls[2][1]
+        self.assertNotIn("--engine-arg=--conversation-cache-assume-pass", argv)
 
     def test_a_refused_command_line_is_reported_and_the_start_goes_on(self):
         # SystemExit is not an Exception: uncaught, the parser's refusal ended the whole start before the engine was

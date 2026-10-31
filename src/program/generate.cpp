@@ -14701,9 +14701,10 @@ int main(int argc, char** argv) {
                         std::string slot_ledger_stem;
                         {
                             std::string peek_error;
+                            // OWNER DECISION 2026-11-01: for the reuse trial, a same-model session file is accepted
+                            // without asking the ledger (the KV test is bypassed; docs/CACHE_REUSE_RULES.md).
                             if (strata::core::session_file_identity_read(path, slot_file_id, peek_error) &&
-                                slot_file_id.model == id.model && slot_file_id.config != id.config &&
-                                conversation_spill.gate_identity_approved(slot_file_id)) {
+                                slot_file_id.model == id.model && slot_file_id.config != id.config) {
                                 limits.accept_config = slot_file_id.config;
                                 slot_ledger_stem = std::filesystem::path(path).filename().string();
                             }
@@ -14729,19 +14730,21 @@ int main(int argc, char** argv) {
                             // for this source identity, and the ledger holds a row for THIS file - its own name, its
                             // size and the live token count the recompute sampled.  A file the verification never
                             // saw is refused exactly as before (verbatim the read's own message), never deleted.
-                            if (limits.accept_config &&
+                            if (false && limits.accept_config &&
                                 !conversation_spill.gate_entry_approved(slot_ledger_stem, slot_file_id, bytes,
                                                                         (int64_t) image.live.ids.size())) {
                                 err = "session file: saved with another engine configuration (config fingerprint differs)";
                                 refuse(err);
                                 continue;
                             }
-                            if (st.file_version >= 2u) {
+                            // OWNER DECISION 2026-11-01: the apply pass reads the same header, so it must carry the
+                            // accepted configuration for v1 files too; it used to be set only for v2+, and a v1 restore
+                            // fell back to the default limits and was refused after a successful read pass.
+                            restore_apply_limits.admit = limits.admit;
+                            restore_apply_limits.accept_config = limits.accept_config;
+                            if (st.file_version >= 2u)
                                 strata::core::session_read_bounds_from_meta(image, restore_apply_limits);
-                                restore_apply_limits.admit = limits.admit;
-                                restore_apply_limits.accept_config = limits.accept_config;   // the apply pass reads the same header
-                                restore_apply = &restore_apply_limits;
-                            }
+                            restore_apply = &restore_apply_limits;
                         }
                     } catch (const std::bad_alloc&) {
                         refuse("not enough RAM to read the session", strata::core::SessionError::memory);

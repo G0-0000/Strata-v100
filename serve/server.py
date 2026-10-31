@@ -32,6 +32,7 @@ import collections
 import base64
 import hashlib
 import hmac
+import importlib.util
 import codecs
 import ctypes
 import json
@@ -3255,6 +3256,119 @@ def engine_args(cfg: dict) -> list[str]:
     return learned_profile_args(cfg, args)
 
 
+def _cache_verify_module():
+    """tools/cache_verify.py, loaded by path: the SAME verifier the operator runs by hand (docs/CACHE_REUSE_RULES.md
+    R3/R4 - one tool, one ledger, one verification, not a second copy of it).  None when this install has no tools
+    directory (the terminal package carries serve/ only)."""
+    path = Path(__file__).resolve().parents[1] / "tools" / "cache_verify.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("strata_cache_verify", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    # registered before it runs: a dataclass resolves its own module while its class body executes
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        # anything the module raises while it is being loaded (a SyntaxError in a half-copied file, a name it does
+        # not define, a missing library): a verifier that cannot be loaded must not stop the server (R4/R2 - the
+        # gate stays fail-closed, the files stay on disk, and the start says so below)
+        sys.modules.pop(spec.name, None)
+        return None
+    return module
+
+
+def slot_save_dir_of(a, cfg: dict) -> str | None:
+    """The slot directory this start uses (--slot-save-path, else the config's slot_save_path), or None.
+    ValueError/OSError as slot_save_dir raises them: the caller reports or ignores them, as it does today."""
+    if getattr(a, "slot_save_path", None):
+        return slot_save_dir(a.slot_save_path)
+    if cfg.get("slot_save_path"):
+        return slot_save_dir(cfg["slot_save_path"], cfg.get("cwd"))
+    return None
+
+
+def cache_gate_verify(exe: str, args: list[str], slots: list[str], env: dict | None = None,
+                      cwd: str | None = None) -> None:
+    """R1/R2/R4 of docs/CACHE_REUSE_RULES.md: with the recompute gate on, the PROGRAM verifies the cache before the
+    engine starts - the engine needs the GPU the verification run's engine is about to take (the same one, load the
+    model, recompute one sample, exit).  Same tool and same ledger as the slot/disk-cache files themselves, so a
+    verified entry is indexed and a failure is only REPORTED: no file is moved, renamed or deleted, and the engine
+    starts either way, refusing what was not approved exactly as it did before.
+
+    env and cwd are the ones the serving engine itself is started with (child_env(cfg, ...) and cfg["cwd"]): the
+    verification engine must see the same GPU, the same kernel switches and the same library path, or the K/V it
+    recomputes differ from the cached file's and a good file is refused (R1).
+
+    Nothing to verify (no cache file this model could use, every one approved, or this identity's own): nothing runs,
+    nothing is printed, and the start is exactly the start without the gate.  A scan the tool REFUSED (an unreadable
+    slot directory) is said once on stderr: it verified nothing, and silence would read as "checked"."""
+    if "--conversation-cache-disk-recompute-gate" not in args:
+        return                                     # the gate is off: no ledger is read or written here
+    spill = None
+    for at, arg in enumerate(args):                # --conversation-cache-spill-dir DIR (or =DIR)
+        if arg == "--conversation-cache-spill-dir" and at + 1 < len(args):
+            spill = args[at + 1]
+        elif arg.startswith("--conversation-cache-spill-dir="):
+            spill = arg.split("=", 1)[1]
+    if not spill:
+        return                                     # the engine turns the gate off without a spill directory
+    cache_dir = Path(spill).expanduser()
+    if not cache_dir.is_dir():
+        return                                     # nothing cached yet: nothing to verify
+    module = _cache_verify_module()
+    if module is None:
+        print("[strata] the disk cache's recompute gate is on, but tools/cache_verify.py is not in this install: the "
+              "files of another engine configuration stay unindexed (no file is deleted)", file=sys.stderr, flush=True)
+        return
+    try:
+        build = module.probe_engine_build(exe, env=env)
+        pending = module.pending_verification(cache_dir, [Path(s) for s in slots], build)
+    except Exception as exc:                       # a check that cannot run must never stop the server
+        print(f"[strata] recompute gate: cannot check the cache ({exc}); starting the engine anyway", file=sys.stderr,
+              flush=True)
+        return
+    if not pending.verify:
+        if getattr(pending, "refused", False):
+            print(f"[strata] recompute gate: the cache could not be scanned ({pending.detail}); nothing was "
+                  "verified and no file is deleted", file=sys.stderr, flush=True)
+        return
+    print(f"[strata] recompute gate: {pending.detail}; running the verification before the engine starts",
+          flush=True)
+    argv = ["--cache-dir", str(cache_dir), "--engine", exe, "--engine-build", build]
+    for slot in slots:
+        argv += ["--slot-dir", slot]
+    for arg in args:
+        if arg == "--conversation-cache-disk-recompute-gate":
+            continue                               # a --serve option; the verification run does not serve
+        # one token, --engine-arg=ARG: given as the next token, a flag-shaped value (the engine's own --kv,
+        # --max-context 131072, ...) is what argparse calls a missing argument and refuses with SystemExit(2)
+        argv.append(f"--engine-arg={arg}")
+    try:
+        # the verification engine runs as the serving engine does: the same environment (GPU selection, the
+        # config's kernel switches, the library path) and the same working directory (R1)
+        status = module.run(module.build_parser().parse_args(argv), env=env, cwd=cwd)
+    except SystemExit as exc:
+        # argparse refused the command line, and SystemExit is not an Exception: uncaught it ended the whole start.
+        # R1/R2 (docs/CACHE_REUSE_RULES.md): a verification that cannot run approves nothing, deletes nothing and
+        # judges nothing - the engine below refuses these files exactly as it does without the gate.  Report and go.
+        print(f"[strata] recompute gate: the verification could not run (the tool refused its command line, status "
+              f"{exc.code}); nothing is approved or deleted and the engine will refuse these files, as before; "
+              "starting the engine anyway", file=sys.stderr, flush=True)
+        return
+    except Exception as exc:                       # the same rule: report, never stop the start
+        print(f"[strata] recompute gate: the verification could not run ({exc}); starting the engine anyway",
+              file=sys.stderr, flush=True)
+        return
+    if status == 0:
+        print("[strata] recompute gate: the cache is verified for this engine build", flush=True)
+    else:
+        print(f"[strata] recompute gate: the verification did not pass (status {status}); the files stay on disk and "
+              "the engine will refuse them, as before", file=sys.stderr, flush=True)
+
+
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
 
 
@@ -4515,6 +4629,11 @@ class Service:
             print(f"[strata] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
         try:
+            # R4 (docs/CACHE_REUSE_RULES.md): a reload does NOT run the recompute gate - cache_gate_verify runs once
+            # per start, before the engine first takes the GPU.  A cache file of another configuration that arrived
+            # since then stays unindexed (fail-closed: it is never deleted and never read) until the next start
+            # verifies it.  A verification engine here would load the model a second time inside the request that
+            # waits for this load, which is the owner's call, not this function's.
             self.engine.restart()
         except Exception as e:
             if vision_started:
@@ -9008,6 +9127,19 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         elif split:
             engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
         else:
+            # R4 (docs/CACHE_REUSE_RULES.md): the recompute runs here, before the engine takes the GPU.  A replicas
+            # or layer-split start keeps today's behaviour: that verification run would use one card's geometry and
+            # approve files for an identity the served engine does not have.
+            slots: list[str] = []
+            try:
+                slot_dir = slot_save_dir_of(a, cfg)
+            except (ValueError, OSError):
+                slot_dir = None                    # the start reports an unusable slot path below, as it does today
+            if slot_dir:
+                slots = [slot_dir]
+            # the verification engine gets this engine's own environment and working directory, so the K/V it
+            # recomputes are the ones the engine below would write (R1)
+            cache_gate_verify(exe, engine_args(cfg) + (effort_end or []), slots, env=env, cwd=cfg.get("cwd"))
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
@@ -9141,8 +9273,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     # to the config's "cwd" (the engine's folder) when it has one.  Either way the engine gets an absolute path.
     if a.slot_save_path or cfg.get("slot_save_path"):
         try:
-            svc.slot_save_path = slot_save_dir(a.slot_save_path) if a.slot_save_path else \
-                slot_save_dir(cfg["slot_save_path"], cfg.get("cwd"))
+            svc.slot_save_path = slot_save_dir_of(a, cfg)     # the same directory the recompute gate checked
         except (ValueError, OSError) as e:
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "

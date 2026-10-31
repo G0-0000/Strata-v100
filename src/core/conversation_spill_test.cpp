@@ -105,6 +105,39 @@ bool buffers_equal(const ConversationBuffer& a, const ConversationBuffer& b) {
     });
     return same && at == a.size();
 }
+
+// --conversation-cache-origin-split: write an origin tag into a sidecar the cache wrote, so a test can hand the
+// reader an entry that no write path produces.  v1 gains the last-use stamp and the tag (it becomes v3), v2 gains the
+// tag, v3's tag is replaced; the trailing digest is recomputed either way.
+bool stamp_sidecar_origin(const fs::path& meta, ConversationOrigin origin) {
+    std::ifstream in(meta, std::ios::binary);
+    std::string payload((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (payload.size() < 4 + 8 + 8 + 8) return false;
+    payload.resize(payload.size() - 8);   // without the trailing digest
+    uint64_t version = 0;
+    std::memcpy(&version, payload.data() + 4, sizeof version);
+    const uint64_t tag = (uint64_t) origin;
+    if (version == 1) {
+        const uint64_t last_used = 0;   // every v3 sidecar carries the stamp
+        payload.append(reinterpret_cast<const char*>(&last_used), sizeof last_used);
+        payload.append(reinterpret_cast<const char*>(&tag), sizeof tag);
+    } else if (version == 2) {
+        payload.append(reinterpret_cast<const char*>(&tag), sizeof tag);
+    } else if (version == 3) {
+        std::memcpy(&payload[payload.size() - sizeof tag], &tag, sizeof tag);
+    } else {
+        return false;
+    }
+    version = 3;
+    std::memcpy(&payload[4], &version, sizeof version);
+    SessionHasher h(0);
+    h.update(payload.data(), payload.size());
+    const uint64_t digest = h.digest();
+    std::ofstream out(meta, std::ios::binary | std::ios::trunc);
+    out.write(payload.data(), (std::streamsize) payload.size());
+    out.write(reinterpret_cast<const char*>(&digest), sizeof digest);
+    return bool(out);
+}
 } // namespace
 
 int main() {
@@ -2245,6 +2278,330 @@ int main() {
             fs::remove(ledger);
         }
         fs::remove_all(gdir);
+    }
+
+    {   // --conversation-cache-origin-split: the disk cache takes ordinary conversations only, and a refused write
+        // leaves every existing copy and the client's own .bin exactly as they were.  The origin tag rides in a v3
+        // sidecar: an ORDINARY conversation's sidecar keeps the exact bytes a build without the flag writes.
+        const std::string stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        const fs::path odir = fs::temp_directory_path() / ("strata_spill_origin_" + stamp);
+        fs::remove_all(odir);
+        auto read_all = [](const fs::path& p) {
+            std::ifstream in(p, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        };
+        auto meta_of = [](const std::string& session) {
+            fs::path p(session);
+            p.replace_extension();
+            return fs::path(p.string() + ".meta");
+        };
+        auto sidecar_version = [&](const fs::path& meta) {
+            const std::string b = read_all(meta);
+            uint64_t v = 0;
+            if (b.size() >= 12) std::memcpy(&v, b.data() + 4, sizeof v);
+            return v;
+        };
+
+        ConversationSpillCache plain_cache;
+        check(plain_cache.open(odir, id, 1ull << 30, error), "origin: open");
+        SavedConversation kept = sample(1000);
+        check(plain_cache.spill(kept, error), "origin: spill an ordinary conversation");
+        check(plain_cache.size() == 1, "origin: one ordinary entry");
+        const std::string kept_path = plain_cache.newest_path();
+        const std::string kept_sidecar = read_all(meta_of(kept_path));
+        const std::string kept_session = read_all(kept_path);
+        const fs::path client_file = odir / "client-conversation.bin";
+        {
+            std::ofstream out(client_file, std::ios::binary);
+            out << "the client's own session file";
+        }
+        const std::string client_bytes = read_all(client_file);
+
+        // the same conversation, now a session-file one: the write is refused before anything is written, the copy the
+        // write would have superseded stays, and the client's file is not touched
+        SavedConversation session_copy = sample(1000);
+        session_copy.origin = ConversationOrigin::session_file;
+        error.clear();
+        check(!plain_cache.spill(session_copy, error), "origin: a session-file conversation is never spilled");
+        check(error.find("session-file") != std::string::npos, "origin: the refusal says why");
+        check(plain_cache.size() == 1 && plain_cache.newest_path() == kept_path,
+              "origin: it leaves the existing (superseded) copy indexed and adds no file");
+        check(read_all(kept_path) == kept_session && read_all(meta_of(kept_path)) == kept_sidecar,
+              "origin: that copy is byte for byte as it was - a guarded skip drops nothing");
+        check(read_all(client_file) == client_bytes, "origin: the client's session file is untouched");
+
+        // the SAVE hook's call: the .bin is written (outside this cache) and the conversation's older spill copies are
+        // dropped by its live ids - "only the .bin remains" - while another conversation's file stays
+        SavedConversation older = sample(700);
+        check(plain_cache.spill(older, error), "origin: a second conversation to drop from the cache");
+        const std::string older_path = plain_cache.newest_path();
+        check(plain_cache.size() == 2, "origin: two conversations on disk");
+        check(plain_cache.drop_superseded(older.live.ids, older.live.imgs, older.checkpoints, older.cvec) == 1 &&
+                  plain_cache.size() == 1 && plain_cache.newest_path() == kept_path && !fs::exists(older_path),
+              "origin: a SAVE drops this conversation's copy and keeps the other one");
+
+        // a streamed write takes the same guard, before a stem is reserved
+        ConversationSpillWrite write_target;
+        SavedConversation streamed_copy = sample(600);
+        streamed_copy.origin = ConversationOrigin::session_file;
+        check(!plain_cache.reserve_streamed(streamed_copy, write_target, error) && !write_target.valid &&
+                  plain_cache.size() == 1,
+              "origin: a streamed session-file write is refused before a file is reserved");
+
+        // the streamed writer refuses the same conversation on its own, so a caller that reserved elsewhere cannot
+        // write one either: nothing is written and the cache is as it was
+        SavedConversation streamed_meta = streamed_copy;
+        streamed_meta.kv.clear();
+        size_t streamed_bytes = 7;
+        check(!plain_cache.spill_streamed(streamed_meta, sources_of(streamed_copy), streamed_bytes, error) &&
+                  streamed_bytes == 0 && plain_cache.size() == 1 && plain_cache.newest_path() == kept_path,
+              "origin: the streamed writer refuses a session-file conversation itself, writing nothing");
+        check(error.find("session-file") != std::string::npos, "origin: the streamed refusal says why");
+
+        // the tag on disk: v3 for a tagged conversation, and not one byte of change for an ordinary one (G)
+        const fs::path offdir = fs::temp_directory_path() / ("strata_spill_origin_off_" + stamp);
+        const fs::path ondir = fs::temp_directory_path() / ("strata_spill_origin_on_" + stamp);
+        fs::remove_all(offdir);
+        fs::remove_all(ondir);
+        ConversationSpillCache flag_off;
+        check(flag_off.open(offdir, id, 1ull << 30, error), "origin: open with the flag off");
+        SavedConversation ordinary_off = sample(700);
+        check(flag_off.spill(ordinary_off, error), "origin: flag off, an ordinary conversation");
+        check(sidecar_version(meta_of(flag_off.newest_path())) == 1,
+              "origin: flag off, the v1 sidecar of today");
+
+        ConversationSpillCache flag_on;
+        check(flag_on.open(ondir, id, 1ull << 30, error, false, {}, true),
+              "origin: open with --conversation-cache-origin-split");
+        SavedConversation ordinary_on = sample(700);
+        check(flag_on.spill(ordinary_on, error), "origin: flag on, the same ordinary conversation");
+        check(sidecar_version(meta_of(flag_on.newest_path())) == 1 &&
+                  read_all(meta_of(flag_on.newest_path())) == read_all(meta_of(flag_off.newest_path())),
+              "origin: an ordinary conversation's sidecar is byte-identical with the flag on and off");
+
+        SavedConversation tagged = sample(700);
+        tagged.live.ids.push_back(4242);   // a different conversation, so it is a new entry rather than a supersede
+        tagged.checkpoints.clear();
+        tagged.origin = ConversationOrigin::disk_restore;
+        check(flag_on.spill(tagged, error), "origin: flag on, a disk-restored conversation");
+        const std::string tagged_path = flag_on.newest_path();
+        check(sidecar_version(meta_of(tagged_path)) == 3, "origin: a tagged sidecar is the v3 form");
+        ConversationSpillCache reopened;
+        check(reopened.open(ondir, id, 1ull << 30, error, false, {}, true), "origin: reopen with the flag on");
+        const size_t tagged_index = reopened.find(tagged_path);
+        check(tagged_index < reopened.size() && reopened.entry_origin(tagged_index) == ConversationOrigin::disk_restore,
+              "origin: the tag survives a restart");
+        SavedConversation restored_tagged;
+        check(reopened.load(tagged_path, restored_tagged, {}, error) &&
+                  restored_tagged.origin == ConversationOrigin::disk_restore,
+              "origin: a disk restore comes back tagged disk_restore (ordinary to the spill policy)");
+        ConversationSpillCache plain_reader;   // a build without the flag reads the v3 sidecar as its own
+        check(plain_reader.open(ondir, id, 1ull << 30, error) && plain_reader.find(tagged_path) < plain_reader.size() &&
+                  plain_reader.entry_origin(plain_reader.find(tagged_path)) == ConversationOrigin::disk_restore,
+              "origin: a build without the flag still reads a tagged sidecar");
+
+        // a sidecar naming a session-file conversation (no write path writes one) is removed when the directory opens:
+        // its .bin is that conversation's copy, the spill cache holds ordinary conversations only
+        check(stamp_sidecar_origin(meta_of(tagged_path), ConversationOrigin::session_file),
+              "origin: craft a v3 session-file sidecar");
+        ConversationSpillCache cleaned;
+        check(cleaned.open(ondir, id, 1ull << 30, error, false, {}, true),
+              "origin: reopen a directory holding a session-file copy");
+        check(cleaned.find(tagged_path) == cleaned.size(), "origin: it is not indexed");
+        check(!fs::exists(tagged_path) && !fs::exists(meta_of(tagged_path)),
+              "origin: its files are removed (only ordinary conversations live there)");
+
+        // --conversation-cache-disk-delta: the delta entry points refuse a session-file conversation too, and an
+        // ordinary conversation's v2 sidecar is the file a build without the flag writes (version 2, no tag)
+        const fs::path ddir_off = fs::temp_directory_path() / ("strata_spill_origin_delta_off_" + stamp);
+        const fs::path ddir_on = fs::temp_directory_path() / ("strata_spill_origin_delta_on_" + stamp);
+        fs::remove_all(ddir_off);
+        fs::remove_all(ddir_on);
+        auto meta_only = [](SavedConversation img) { img.kv.clear(); return img; };
+        SavedConversation dbase = sample(1500);
+        SavedConversation dgrow = dbase;
+        // the ids continue the sample's (1000 + i): a checkpoint generator keeps matching them
+        for (int i = 0; i < 300; ++i) dgrow.live.ids.push_back(int32_t(2500 + i));
+        dgrow.checkpoints.push_back(checkpoint(1800, 8));
+
+        ConversationSpillCache delta_off;
+        size_t written = 0, appended = 0;
+        check(delta_off.open(ddir_off, id, 1ull << 30, error, true), "origin delta: open with the flag off");
+        check(delta_off.spill_streamed(meta_only(dbase), sources_of(dbase, 0), written, error),
+              "origin delta: the base with the flag off");
+        const size_t off_index = delta_off.find(delta_off.newest_path());
+        check(delta_off.spill_delta(off_index, meta_only(dgrow), sources_of(dgrow, 1024),
+                                    (int64_t) dgrow.live.ids.size(), appended, error),
+              "origin delta: the append with the flag off");
+        const std::string off_sidecar = read_all(meta_of(delta_off.newest_path()));
+
+        ConversationSpillCache delta_on;
+        check(delta_on.open(ddir_on, id, 1ull << 30, error, true, {}, true), "origin delta: open with the flag on");
+        check(delta_on.spill_streamed(meta_only(dbase), sources_of(dbase, 0), written, error),
+              "origin delta: the base with the flag on");
+        const size_t on_index = delta_on.find(delta_on.newest_path());
+        check(delta_on.spill_delta(on_index, meta_only(dgrow), sources_of(dgrow, 1024),
+                                   (int64_t) dgrow.live.ids.size(), appended, error),
+              "origin delta: the append with the flag on");
+        const std::string on_sidecar = read_all(meta_of(delta_on.newest_path()));
+        // a v2 sidecar ends with the last-use stamp and the digest over it: both are a clock's, so pin them and the
+        // rest of the file (version, layout, the absence of an origin tag) must be byte for byte the same
+        auto pinned_tail = [](std::string b) {
+            if (b.size() >= 16) std::memset(&b[b.size() - 16], 0, 16);
+            return b;
+        };
+        check(sidecar_version(meta_of(delta_off.newest_path())) == 2, "origin delta: flag off writes the v2 sidecar");
+        check(sidecar_version(meta_of(delta_on.newest_path())) == 2,
+              "origin delta: an ordinary conversation keeps v2 with the flag on (never v3)");
+        check(off_sidecar.size() == on_sidecar.size() && pinned_tail(off_sidecar) == pinned_tail(on_sidecar),
+              "origin delta: those v2 bytes are identical with the flag on and off (only the stamp and its digest differ)");
+
+        // the delta writer refuses a session-file conversation itself: no record is appended, and the base and its
+        // sidecar stay exactly as they were
+        const std::string on_base = read_all(delta_on.newest_path());
+        const std::string on_meta = read_all(meta_of(delta_on.newest_path()));
+        SavedConversation session_grow = meta_only(dgrow);
+        session_grow.origin = ConversationOrigin::session_file;
+        size_t refused_bytes = 7;
+        error.clear();
+        check(!delta_on.spill_delta(on_index, session_grow, sources_of(dgrow, 1024),
+                                    (int64_t) dgrow.live.ids.size(), refused_bytes, error) &&
+                  refused_bytes == 0 && error.find("session-file") != std::string::npos,
+              "origin delta: the delta writer refuses a session-file conversation itself");
+        check(read_all(delta_on.newest_path()) == on_base && read_all(meta_of(delta_on.newest_path())) == on_meta,
+              "origin delta: that refusal appends nothing and leaves the chain as it was");
+
+        // an entry that keeps the tag (open() deletes a session-file sidecar whose files it can remove, so the only
+        // indexed one is a retained entry) has no delta chain either
+        const std::string held_path = delta_on.newest_path();
+        fs::remove(held_path);
+        fs::create_directories(fs::path(held_path));   // a .sess that remove_group cannot remove: the entry is kept
+        {
+            std::ofstream keep(fs::path(held_path) / "keep", std::ios::binary);
+            keep << "not removable";
+        }
+        check(stamp_sidecar_origin(meta_of(held_path), ConversationOrigin::session_file),
+              "origin delta: craft a v3 session-file sidecar over a retained entry");
+        ConversationSpillCache held;
+        check(held.open(ddir_on, id, 1ull << 30, error, true, {}, true), "origin delta: reopen the retained entry");
+        check(held.size() == 1 && held.entry_origin(0) == ConversationOrigin::session_file,
+              "origin delta: the retained entry is indexed and carries its tag");
+        ConversationSpillDeltaWrite held_target;
+        error.clear();
+        check(!held.reserve_delta(0, held_target, error) && !held_target.valid &&
+                  error.find("session-file") != std::string::npos,
+              "origin delta: reserve_delta refuses a session-file entry");
+        fs::remove_all(ddir_off);
+        fs::remove_all(ddir_on);
+        fs::remove_all(odir);
+        fs::remove_all(offdir);
+        fs::remove_all(ondir);
+    }
+
+    // ---- The SLOT RESTORE path's use of the SAME ledger (docs/CACHE_REUSE_RULES.md R3: a session file and a spill
+    // file follow one rule, one ledger and one verification; only the directory and the name differ).  The engine's
+    // slot path (generate.cpp, before and after session_file_read_streamed) asks exactly these two queries, so this
+    // block pins the decision it makes: a .bin of another engine configuration is read when the ledger approves its
+    // identity AND holds a row for that file's own name, size and live token count; another model is never approved,
+    // and an unapproved file keeps the read's own refusal.
+    {
+        const std::string stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        const fs::path sdir = fs::temp_directory_path() / ("strata_slot_gate_" + stamp);    // the slots directory
+        const fs::path ldir = fs::temp_directory_path() / ("strata_slot_ledger_" + stamp);  // the spill directory
+        fs::remove_all(sdir);
+        fs::remove_all(ldir);
+        fs::create_directories(sdir);
+        const SessionFileIdentity legacy{id.model, id.config ^ 0x0f0f0f0f0f0f0f0full};
+        const SessionFileIdentity other_model{id.model ^ 0x10, id.config};
+        SavedConversation bin = sample(300);
+        const fs::path slot = sdir / "chat-1.bin";
+        size_t written = 0;
+        check(session_file_write(slot.string(), bin, legacy, written, error), "slot gate: write a legacy-config .bin");
+        check(written > 0 && fs::file_size(slot) == written, "slot gate: the file is the one that was written");
+        SessionFileIdentity seen{};
+        check(session_file_identity_read(slot.string(), seen, error) && seen.model == legacy.model &&
+                  seen.config == legacy.config,
+              "slot gate: the header peek names the stored identity");
+        {   // the peek reads the same header whatever the payload layout: a K/V-first v3 file too
+            SessionWriteOptions v3;
+            v3.layout_v3 = true;
+            const fs::path v3_slot = sdir / "chat-v3.bin";
+            size_t v3_bytes = 0;
+            check(session_file_write(v3_slot.string(), bin, legacy, v3_bytes, error, v3),
+                  "slot gate: write a legacy-config v3 .bin");
+            SessionFileIdentity v3_seen{};
+            SessionStatus v3_st;
+            check(session_file_identity_read(v3_slot.string(), v3_seen, error, &v3_st) &&
+                      v3_seen.model == legacy.model && v3_seen.config == legacy.config && v3_st.file_version == 3u,
+                  "slot gate: the header peek names the identity of a v3 file too");
+        }
+
+        ConversationSpillGateOptions gate;
+        gate.enabled = true;
+        gate.engine_build = "test-build";
+        const std::string slot_stem = slot.filename().string();
+        std::vector<ConversationSpillGateBatch> batches;
+        std::vector<ConversationSpillGateEntry> rows;
+        auto read_slot = [&](const SessionFileIdentity& who, uint64_t accept, SavedConversation& out, std::string& why) {
+            SessionReadLimits limits;
+            limits.accept_config = accept;
+            size_t bytes = 0;
+            return session_file_read(slot.string(), who, out, bytes, why, limits);
+        };
+        ConversationSpillCache cache;
+        check(cache.open(ldir, id, 1ull << 30, error, false, gate), "slot gate: open the ledger's directory");
+        check(!cache.gate_identity_approved(legacy), "slot gate: an empty ledger approves no identity");
+        SavedConversation got;
+        check(!read_slot(id, 0, got, error) && error.find("another engine configuration") != std::string::npos,
+              "slot gate: without an approval the read refuses the stored configuration");
+        check(!read_slot(other_model, legacy.config, got, error) &&
+                  error.find("another model") != std::string::npos,
+              "slot gate: an accepted configuration never accepts another model");
+
+        ConversationSpillGateBatch batch;
+        batch.id = "b1";
+        batch.source = legacy;
+        batch.target = id;
+        batch.engine_build = "test-build";
+        batch.sample = slot_stem;
+        batch.passed = true;
+        batch.verified_ms = 1700000000000ull;
+        // a batch alone approves the IDENTITY, not this file: it carries no row for the .bin
+        check(session_spill_gate_write(ldir, {batch}, {}, error), "slot gate: write the batch without a row");
+        ConversationSpillCache id_only;
+        check(id_only.open(ldir, id, 1ull << 30, error, false, gate) && id_only.gate_identity_approved(legacy),
+              "slot gate: the batch approves the source identity");
+        check(!id_only.gate_entry_approved(slot_stem, legacy, written, (int64_t) bin.live.ids.size()),
+              "slot gate: without a row the file itself is not approved");
+
+        ConversationSpillGateEntry row{slot_stem, "b1", written, (int64_t) bin.live.ids.size(), 1700000000000ull};
+        check(session_spill_gate_write(ldir, {batch}, {row}, error), "slot gate: write the file's own row");
+        ConversationSpillCache approved;
+        check(approved.open(ldir, id, 1ull << 30, error, false, gate), "slot gate: reopen with the row");
+        check(approved.gate_identity_approved(legacy) &&
+                  approved.gate_entry_approved(slot_stem, legacy, written, (int64_t) bin.live.ids.size()),
+              "slot gate: the row approves this file under its own name");
+        SavedConversation back;
+        check(read_slot(id, legacy.config, back, error) && back.live.ids == bin.live.ids &&
+                  back.checkpoints.size() == bin.checkpoints.size(),
+              "slot gate: the approved file reads with its own configuration");
+        // the row is bound to exactly this name, size and token count: nothing else is approved by it
+        check(!approved.gate_entry_approved("chat-2.bin", legacy, written, (int64_t) bin.live.ids.size()),
+              "slot gate: another file name is not approved");
+        check(!approved.gate_entry_approved("strata-conv-7", legacy, written, (int64_t) bin.live.ids.size()),
+              "slot gate: a spill stem of the same size and length is not this file");
+        check(!approved.gate_entry_approved(slot_stem, legacy, written + 1, (int64_t) bin.live.ids.size()),
+              "slot gate: a stale file size is not approved");
+        check(!approved.gate_entry_approved(slot_stem, legacy, written, (int64_t) bin.live.ids.size() + 1),
+              "slot gate: a stale token count is not approved");
+        check(!approved.gate_entry_approved(slot_stem, other_model, written, (int64_t) bin.live.ids.size()),
+              "slot gate: another model is never approved");
+        // the gate is the switch: off, the same ledger is neither read nor consulted
+        ConversationSpillCache off;
+        check(off.open(ldir, id, 1ull << 30, error) && !off.gate_identity_approved(legacy),
+              "slot gate: with the gate off the ledger approves nothing");
+        fs::remove_all(sdir);
+        fs::remove_all(ldir);
     }
 
     std::printf("conversation_spill_test: %d checks passed\n", checks);

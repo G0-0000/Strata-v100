@@ -2258,14 +2258,16 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
 }
 
 namespace {
-// The header every read checks first: magic, version, fields, size and both fingerprints, leaving `payload` and
-// the format `version` (1 or 2) set.
-bool header_ok(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, uint64_t accept_config,
-               uint32_t& version, uint64_t& payload, std::string& error) {
+// The header's own fields and checks - magic, version, fields, checksum, and the identity it carries - without
+// comparing that identity with this engine's or the size with the file's.  Every read checks them first, and the
+// recompute gate's peek (session_file_identity_read) reads the stored identity out of the same check.
+bool header_fields(const uint8_t* h, SessionFileIdentity& stored, uint32_t& version, uint64_t& payload,
+                   std::string& error) {
     uint32_t hsize = 0;
-    uint64_t model = 0, config = 0, r0 = 0, r1 = 0, hh = 0;
+    uint64_t r0 = 0, r1 = 0, hh = 0;
     std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
-    std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+    std::memcpy(&stored.model, h + 16, 8); std::memcpy(&stored.config, h + 24, 8);
+    std::memcpy(&payload, h + 32, 8);
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
@@ -2274,18 +2276,32 @@ bool header_ok(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, u
         return false;
     }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
-    if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
+    return true;
+}
+
+// The size the verified header implies: the header, its payload and the trailer, exactly the file's own size.
+bool header_size_ok(uint64_t size, uint64_t payload, std::string& error) {
+    if (size >= kHeader + kTrailer && size - kHeader - kTrailer == payload) return true;
+    error = "session file: size " + std::to_string(size) + " does not match the header (" +
+            std::to_string(kHeader + payload + kTrailer) + ")";
+    return false;
+}
+
+// The header every read checks first: the fields above, then both fingerprints and the size.
+bool header_ok(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, uint64_t accept_config,
+               uint32_t& version, uint64_t& payload, std::string& error) {
+    SessionFileIdentity stored{};
+    if (!header_fields(h, stored, version, payload, error)) return false;
+    if (stored.model != id.model) {
+        error = "session file: saved with another model (model fingerprint differs)";
+        return false;
+    }
     // the opt-in accepted config (a gate-approved cache entry): the model still has to match
-    if (config != id.config && !(accept_config && config == accept_config)) {
+    if (stored.config != id.config && !(accept_config && stored.config == accept_config)) {
         error = "session file: saved with another engine configuration (config fingerprint differs)";
         return false;
     }
-    if (payload > size || size - kHeader - kTrailer != payload) {
-        error = "session file: size " + std::to_string(size) + " does not match the header (" +
-                std::to_string(kHeader + payload + kTrailer) + ")";
-        return false;
-    }
-    return true;
+    return header_size_ok(size, payload, error);
 }
 
 // A read's prologue: open the file by its name (never what a symbolic link there points to), bound its size, and
@@ -3116,7 +3132,53 @@ bool digest_impl(const std::string& path, const SessionFileIdentity& id, Session
     st.error = SessionError::none;
     return true;
 }
+
+// The header checks of a read, without its identity comparison: the disk cache's recompute gate asks the ledger
+// about a file it would otherwise refuse for its stored configuration (docs/CACHE_REUSE_RULES.md R3).
+bool identity_impl(const std::string& path, SessionFileIdentity& id, std::string& error, SessionStatus& st) {
+    RawFile raw;
+    uint64_t size = 0;
+    if (!raw.open_session(path, size)) {
+        st.error = raw.refused() ? SessionError::invalid : raw.kind();
+        error = "session file: " + path + ": " + raw.error();
+        return false;
+    }
+    if (size < kHeader + kTrailer) {
+        error = "session file: size " + std::to_string(size) + " is below the minimum";
+        return false;
+    }
+    FileSource source(raw);
+    if (!source.ok()) { st.error = SessionError::memory; error = "session file: " + source.error(); return false; }
+    uint8_t h[kHeader];
+    if (!source.read(h, kHeader)) {
+        st.error = source.kind();
+        error = "session file: header read error: " + source.error();
+        return false;
+    }
+    uint32_t version = 0;
+    uint64_t payload = 0;
+    if (!header_fields(h, id, version, payload, error)) return false;
+    if (!header_size_ok(size, payload, error)) return false;
+    st.file_version = version;
+    st.error = SessionError::none;
+    return true;
+}
 } // namespace
+
+bool session_file_identity_read(const std::string& path, SessionFileIdentity& id, std::string& error,
+                                SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = identity_impl(path, id, error, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
 
 bool session_file_digest(const std::string& path, const SessionFileIdentity& id, SessionFileDigest& out,
                          std::string& error, SessionStatus* status) {

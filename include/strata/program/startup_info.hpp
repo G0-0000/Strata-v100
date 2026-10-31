@@ -32,6 +32,7 @@ struct ConversationCacheInfoFields {
     bool disk_delta = false;      // conversation_cache_disk_delta
     double similarity = 0.0;      // conversation_cache_similarity
     int64_t n_min = 0;            // conversation_cache_n_min
+    bool origin_split = false;    // conversation_cache_origin_split (opt-in; the field appears only when it is on)
     int64_t tail_role_token = -1; // tail_role_token
     bool vram_elastic = false;    // vram_elastic
 };
@@ -61,6 +62,9 @@ inline std::string conversation_cache_info_fields(const ConversationCacheInfoFie
     if (f.disk_tier_on || f.min_read_tokens == 0)
         s += " tail_role_token=" + std::to_string(f.tail_role_token) +
              " vram_elastic=" + std::to_string(f.vram_elastic ? 1 : 0);
+    // Opt-in, so the default line keeps the exact bytes it had: the field is appended (never inserted) when the
+    // flag is on, whichever form of the line this is.
+    if (f.origin_split) s += " conversation_cache_origin_split=1";
     return s;
 }
 

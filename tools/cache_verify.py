@@ -1,30 +1,45 @@
 #!/usr/bin/env python3
-"""Offline verifier for the opt-in disk-cache recompute gate (.strata-cache-gate).
+"""Verifier for the opt-in disk-cache recompute gate (.strata-cache-gate).
 
 A spill directory keeps a session file whose sidecar names ANOTHER engine configuration, but never indexes it.
 With the gate on (ConversationSpillGateOptions in include/strata/core/conversation_spill.hpp), the engine
 indexes such a file only when this directory's ledger names it and its batch passed for exactly
-(source model+config -> this model+config+this engine build).  This tool writes that ledger:
+(source model+config -> this model+config+this engine build).  This tool writes that ledger.
 
-  1. scan --cache-dir for <stem>.sess + <stem>.meta pairs, decode the sidecar (v1/v2) and group the files of
-     this model by source (model, config); a foreign MODEL is never approved, a same-identity file needs no gate;
-  2. for each group pick the smallest eligible base .sess (no images, no delta chain, decodable token ids) and
-     recompute exactly its prompt with the CURRENT engine:
+A SESSION FILE kept by the slot API (--slot-save-path, a .bin the client wrote) is the same case on the same
+terms: one ledger, one read rule, one verification, only the directory and the name differ (R3 of
+docs/CACHE_REUSE_RULES.md).  A .bin has no sidecar: its identity and token count come from its own header, and
+its ledger stem is its whole file name, extension included, while a spill stem carries none: the two names differ
+unless a client saves a conversation under a name without an extension (the slot API writes the name as given),
+and even then a row approves only a file whose bytes, live token count and source identity all match.
+
+  1. scan --cache-dir for <stem>.sess + <stem>.meta pairs (decode the sidecar, v1/v2/v3) and every --slot-dir for
+     STRSESS .bin files (the 64-byte header, then the geometry prefix and the live token ids - for a K/V-first v3
+     file those follow its K/V directory), and group the files by source (model, config); a foreign MODEL is never
+     approved, a same-identity file needs no gate;
+  2. for each group pick the smallest eligible file (no images, no delta chain, decodable token ids) and recompute
+     exactly its prompt with the CURRENT engine:
          <engine> [config args] --tokens-file IDS --max-new 1 --greedy --session-out FRESH
-  3. compare the format-independent digests (strata-session-digest) of the old base file and the fresh export:
-     K/V always; the token digest (and the state digest) only when the old sidecar holds no checkpoint, because
-     a fresh export is live-only and its digests then cover exactly the same thing; an RHT-coded state is lossy
-     and is never compared;
-  4. on a pass, write a batch line plus an entry row for every eligible file of that source (exact stem, base
-     bytes and live token count: the engine rechecks all three); on a fail or an unreadable run, write the batch
-     (when its target identity is known) and no rows; keep every unrelated valid batch and entry of an existing
-     ledger; a malformed ledger starts empty (fail closed).
+  3. compare the format-independent digests (strata-session-digest) of the old file and the fresh export:
+     K/V always; the token digest (and the state digest) only when the old file is live-only (no checkpoint),
+     because a fresh export is live-only and its digests then cover exactly the same thing; an RHT-coded state is
+     lossy and is never compared;
+  4. on a pass, write a batch line plus an entry row for every eligible file of that source (exact stem, bytes and
+     live token count: the engine rechecks all three); on a fail or an unreadable run, write the batch (when its
+     target identity is known) and no rows; keep every unrelated valid batch and entry of an existing ledger; a
+     malformed ledger starts empty (fail closed).  A run that learns this engine's identity also leaves ONE
+     identity batch (source == target, no rows) so the next start sees that this build verified and needs no
+     second run (R4).
 
-The ledger is written atomically (temporary beside it, fsync, rename).  Cache files are only ever read: this tool
-never deletes, renames or quarantines them.
+The ledger is written atomically (temporary beside it, fsync, rename).  Cache and slot files are only ever read:
+this tool never deletes, renames or quarantines them.
 
-OFFLINE ONLY.  It starts a second engine against the same GPU: stop the server first (strata launch --stop, or
-systemctl --user stop strata).  There is no online mode.
+The server runs this tool itself before it starts the engine (R4: the program verifies, not an operator; see
+pending_verification() and serve/server.py).  It hands the verification engine the environment and the working
+directory the serving engine itself starts with (run(env=..., cwd=...)); R1: an engine started in another
+environment - another GPU, other kernel switches, other library paths - recomputes other K/V and would refuse a
+file that is good.  Run it by hand only while the server is stopped - it starts a second engine against the same
+GPU - or with --dry-run, which starts nothing.
 
   python3 tools/cache_verify.py --cache-dir DIR --engine PATH --digest-tool PATH \
       --engine-config CONFIG.json --target-model 0x... --target-config 0x... [--engine-build BUILD] \
@@ -63,9 +78,23 @@ MAX_GATE_BYTES = 4 << 20            # the engine's kMaxGateLedgerBytes
 MAX_SIDECAR_BYTES = 64 << 20        # far above a 128k-token conversation; a corrupt header cannot make us allocate
 MAX_SIDECAR_CHECKPOINTS = 256       # the engine's kMaxSidecarEntries
 SIDECAR_MAGIC = b"SCSM"
-SIDECAR_VERSION_MIN, SIDECAR_VERSION_MAX = 1, 2
+# The session file (conversation_file.cpp): a 64-byte header, the payload the header sizes, and a 16-byte trailer.
+# A slot .bin is read here only far enough for its identity and its live token ids.
+SESSION_MAGIC = b"STRSESS\x01"
+SESSION_HEADER = 64
+SESSION_TRAILER = 16
+SESSION_VERSIONS = (1, 2, 3)
+# The sidecar's versions (conversation_spill.cpp): 1 has the ids and the checkpoint chain, 2 adds the persisted
+# last-use stamp (kMetaVersionStamped), 3 adds the conversation's origin (kMetaVersionOrigin, written when
+# --conversation-cache-origin-split is on and the conversation is tagged).  A version 3 file of ANOTHER
+# configuration is pending exactly as a v1/v2 one is: the engine holds it "not indexed until the recompute gate
+# approves" it, so refusing to read v3 here would leave it unverifiable for ever (R1, docs/CACHE_REUSE_RULES.md).
+SIDECAR_VERSION_MIN, SIDECAR_VERSION_MAX = 1, 3
+ORIGIN_MAX = 2                       # ConversationOrigin::disk_restore: the highest origin the engine writes
 INT32_MAX = (1 << 31) - 1
 U64_MASK = (1 << 64) - 1
+MAX_SESSION_TOKENS = INT32_MAX      # the engine's token ids are int32
+MAX_SESSION_KV_LAYERS = 4096        # a corrupt count cannot make the walk run long
 
 # Arguments the verification run owns; a config or passthrough copy would fight them.
 OWNS_ARGS = ("--serve", "--tokens-file", "--tokens", "--max-new", "--session-out")
@@ -182,7 +211,8 @@ def session_hash64(data: bytes, seed: int = 0) -> int:
 
 # ---------------------------------------------------------------------------------------------------------------------
 # The spill sidecar (conversation_spill.cpp: MetaWriter/MetaReader): magic, version, identity, cvec, live token ids,
-# image keys, checkpoint lengths, [v2 last-use stamp], and a trailing SessionHasher(0) of everything before it.
+# image keys, checkpoint lengths, [v2 last-use stamp], [v3 conversation origin], and a trailing SessionHasher(0) of
+# everything before it.
 @dataclass(frozen=True)
 class Identity:
     model: int
@@ -202,6 +232,7 @@ class Sidecar:
     images: tuple[tuple[int, int], ...]      # (start, hash)
     checkpoints: tuple[int, ...]
     last_used: int = 0                      # 0 for a v1 sidecar (unknown age)
+    origin: int = 0                         # a v3 sidecar's ConversationOrigin; 0 (ordinary) for v1/v2
 
     @property
     def identity(self) -> Identity:
@@ -274,6 +305,11 @@ def parse_sidecar(data: bytes) -> Sidecar:
         if length == 0 or length > len(ids):
             raise SidecarError("sidecar is not a valid prefix chain")
     last_used = reader.u64() if version >= 2 else 0
+    origin = 0
+    if version >= 3:
+        origin = reader.u64()
+        if origin > ORIGIN_MAX:
+            raise SidecarError("invalid conversation origin in sidecar")
     hasher = SessionHasher(0)
     hasher.update(data[:reader.consumed])
     if reader.consumed + 8 != len(data):
@@ -283,7 +319,7 @@ def parse_sidecar(data: bytes) -> Sidecar:
         raise SidecarError("sidecar checksum mismatch")
     if not ids:
         raise SidecarError("sidecar has no tokens")
-    return Sidecar(version, model, config, bool(cvec), ids, tuple(images), checkpoints, last_used)
+    return Sidecar(version, model, config, bool(cvec), ids, tuple(images), checkpoints, last_used, origin)
 
 
 def read_sidecar(path: Path) -> Sidecar:
@@ -528,6 +564,7 @@ def write_ledger(directory: Path, batches: Sequence[GateBatch], entries: Sequenc
 # Scanning and grouping.
 @dataclass
 class CacheFile:
+    """One spill entry: a .sess base file and the .meta sidecar that names what it holds."""
     stem: str
     sess: Path
     meta: Path
@@ -536,9 +573,145 @@ class CacheFile:
     skip: str = ""
 
     @property
+    def path(self) -> Path:
+        return self.sess
+
+    @property
     def source(self) -> Identity:
         assert self.sidecar is not None
         return self.sidecar.identity
+
+    @property
+    def ids(self) -> tuple[int, ...]:
+        assert self.sidecar is not None
+        return self.sidecar.ids
+
+    @property
+    def last_used(self) -> int:
+        return self.sidecar.last_used if self.sidecar is not None else 0
+
+    @property
+    def has_checkpoints(self) -> bool:
+        return bool(self.sidecar.checkpoints) if self.sidecar is not None else True
+
+
+class SlotError(Exception):
+    """A slot file whose header or token ids cannot be read: the file is skipped."""
+
+
+@dataclass
+class SlotFile:
+    """One session file of a --slot-dir (a .bin the slot API wrote): identity and token count from its header.
+
+    Same face as CacheFile, so the scan, the sampling, the recompute and the ledger rows are the same code.
+    Its ledger stem is the whole file name, extension included; a spill stem carries none, so the two differ unless
+    a client saved under a name without an extension - and a row still approves only a file of the same size, live
+    token count and source identity.
+    """
+    stem: str
+    path: Path
+    bytes: int = 0
+    version: int = 0
+    identity: Identity | None = None
+    token_ids: tuple[int, ...] = ()
+    skip: str = ""
+
+    @property
+    def source(self) -> Identity:
+        assert self.identity is not None
+        return self.identity
+
+    @property
+    def ids(self) -> tuple[int, ...]:
+        return self.token_ids
+
+    @property
+    def last_used(self) -> int:
+        return 0                     # a .bin carries no last-use stamp (the engine only logs it)
+
+    @property
+    def has_checkpoints(self) -> bool:
+        # A .bin usually holds the deepest checkpoint, and the count of them follows the state arrays this tool
+        # does not decode: the K/V digest is then the comparison (a fresh export is live-only).
+        return True
+
+
+def read_session_identity(path: Path) -> tuple[Identity, int, int]:
+    """The identity a session file's 64-byte header carries, with its version and the payload size it names.
+
+    The same checks a read makes of the header (conversation_file.cpp, header_fields/header_size_ok): magic,
+    version, fields, checksum and the size the header implies.  Never an authorisation - a read checks again.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise SlotError(f"cannot inspect the session file: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise SlotError("the session file is not a regular file")
+    size = info.st_size
+    if size < SESSION_HEADER + SESSION_TRAILER:
+        raise SlotError("the session file is smaller than its header and trailer")
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(SESSION_HEADER)
+    except OSError as exc:
+        raise SlotError(f"cannot read the session file: {exc}") from exc
+    if len(header) != SESSION_HEADER or header[:8] != SESSION_MAGIC:
+        raise SlotError("not a Strata session file (magic)")
+    version, header_size = struct.unpack_from("<II", header, 8)
+    model, config, payload = struct.unpack_from("<QQQ", header, 16)
+    reserved0, reserved1, checksum = struct.unpack_from("<QQQ", header, 40)
+    if checksum != session_hash64(header[:56], 0):
+        raise SlotError("session file header checksum mismatch")
+    if version not in SESSION_VERSIONS:
+        raise SlotError(f"unsupported session file version {version}")
+    if header_size != SESSION_HEADER or reserved0 or reserved1:
+        raise SlotError("session file header has invalid fields")
+    if size != SESSION_HEADER + payload + SESSION_TRAILER:
+        raise SlotError("session file size does not match its header")
+    return Identity(model, config), version, payload
+
+
+def read_session_tokens(path: Path, version: int, ids_at: int) -> tuple[int, ...]:
+    """The live checkpoint's token ids: the first section of the state part of a v1/v2 file, which for a K/V-first
+    v3 file follows its K/V directory (count, then per layer seven int64 and five length-prefixed buffers)."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(ids_at)
+            if version == 3:
+                raw = handle.read(8)
+                if len(raw) != 8:
+                    raise SlotError("truncated session file (K/V layer count)")
+                (layers,) = struct.unpack("<Q", raw)
+                if layers > MAX_SESSION_KV_LAYERS:
+                    raise SlotError("session file names more K/V layers than this tool accepts")
+                for _ in range(layers):
+                    if len(handle.read(7 * 8)) != 7 * 8:
+                        raise SlotError("truncated session file (K/V layer header)")
+                    for _ in range(5):                      # k, v, k_scale, v_scale, pooled
+                        raw = handle.read(8)
+                        if len(raw) != 8:
+                            raise SlotError("truncated session file (K/V part size)")
+                        (part,) = struct.unpack("<Q", raw)
+                        handle.seek(part, os.SEEK_CUR)   # a part past the end fails the next read as truncated
+            raw = handle.read(8)
+            if len(raw) != 8:
+                raise SlotError("truncated session file (token count)")
+            (count,) = struct.unpack("<Q", raw)
+            if count == 0 or count > MAX_SESSION_TOKENS:
+                raise SlotError("session file has no usable live token count")
+            raw = handle.read(4 * count)
+    except OSError as exc:
+        raise SlotError(f"cannot read the session file: {exc}") from exc
+    if len(raw) != 4 * count:
+        raise SlotError("truncated session file (token ids)")
+    return struct.unpack(f"<{count}i", raw)
+
+
+def _session_ids_at(version: int) -> int:
+    """Where the live checkpoint's ids start: after the header and the geometry prefix (18 int64, the layer range
+    and the cvec flag); a v3 file's K/V directory sits between them and the state."""
+    return SESSION_HEADER + 18 * 8 + 3 * 8
 
 
 def _regular_size(path: Path) -> int | None:
@@ -595,16 +768,59 @@ def scan_cache_dir(directory: Path) -> list[CacheFile]:
     return files
 
 
-def group_by_source(files: Sequence[CacheFile]) -> dict[Identity, list[CacheFile]]:
-    groups: dict[Identity, list[CacheFile]] = {}
+def scan_slot_dir(directory: Path) -> list[SlotFile]:
+    """Every STRSESS .bin of a slot directory, with the identity and the live token ids its header leads to.
+
+    A slot directory may hold anything the client named (the API writes DIR/NAME as given), so each regular .bin
+    is tried and one that is not a session file, or whose header or ids do not parse, is skipped with the reason.
+    The file is never read whole: the header, the geometry prefix and - for a v3 file - the K/V directory.
+
+    Only `.bin` files are candidates: that is the name the slot API's clients use, and a session file kept under
+    another name is simply not verified - it stays refused by a read, as before, and is never deleted.
+    """
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError as exc:
+        raise Refused(f"cannot read the slot directory: {exc}") from exc
+    files: list[SlotFile] = []
+    for name in names:
+        if not name.endswith(".bin"):
+            continue
+        path = directory / name
+        item = SlotFile(name, path)
+        files.append(item)
+        size = _regular_size(path)
+        if size is None:
+            item.skip = "the slot file is missing or not a regular file"
+            continue
+        item.bytes = size
+        if not _token_ok(name):
+            item.skip = "the file name carries whitespace (cannot be written to the ledger)"
+            continue
+        try:
+            name.encode("utf-8")
+        except UnicodeEncodeError:
+            item.skip = "the file name is not valid UTF-8 (cannot be written to the ledger)"
+            continue
+        try:
+            item.identity, item.version, _payload = read_session_identity(path)
+            item.token_ids = read_session_tokens(path, item.version, _session_ids_at(item.version))
+        except SlotError as exc:
+            item.skip = str(exc)
+            continue
+    return files
+
+
+def group_by_source(files: Sequence[CacheFile | SlotFile]) -> dict[Identity, list[CacheFile | SlotFile]]:
+    groups: dict[Identity, list[CacheFile | SlotFile]] = {}
     for item in files:
-        if item.skip or item.sidecar is None:
+        if item.skip or (isinstance(item, CacheFile) and item.sidecar is None):
             continue
         groups.setdefault(item.source, []).append(item)
     return groups
 
 
-def choose_sample(files: Sequence[CacheFile]) -> CacheFile:
+def choose_sample(files: Sequence[CacheFile | SlotFile]) -> CacheFile | SlotFile:
     return min(files, key=lambda f: (f.bytes, f.stem))
 
 
@@ -696,7 +912,11 @@ def engine_command(engine: str, config_args: Sequence[str], extra_args: Sequence
 
 
 def run_generate(engine: str, config_args: Sequence[str], extra_args: Sequence[str], ids: Sequence[int],
-                 ids_path: Path, out_path: Path, cwd: Path | None, timeout: float) -> FreshRun:
+                 ids_path: Path, out_path: Path, cwd: Path | None, timeout: float,
+                 env: dict | None = None) -> FreshRun:
+    """Recompute the sample with the engine.  cwd and env are the serving engine's own (serve/server.py child_env
+    and cfg["cwd"]): the same model on another card, or with other kernel switches, writes other K/V, and the
+    comparison below would refuse a file that is good (R1, docs/CACHE_REUSE_RULES.md).  None keeps this process's."""
     ids_path.write_text(" ".join(str(t) for t in ids) + "\n", encoding="ascii")
     try:
         out_path.unlink()
@@ -705,7 +925,7 @@ def run_generate(engine: str, config_args: Sequence[str], extra_args: Sequence[s
     command = engine_command(engine, config_args, extra_args, ids_path, out_path)
     try:
         proc = subprocess.run(command, cwd=str(cwd) if cwd else None, capture_output=True, text=True,
-                              timeout=timeout, errors="replace")
+                              timeout=timeout, errors="replace", env=env)
     except subprocess.TimeoutExpired as exc:
         raise VerifyError("engine_timeout", f"the engine did not finish within {timeout:g} s") from exc
     except OSError as exc:
@@ -729,10 +949,13 @@ def run_generate(engine: str, config_args: Sequence[str], extra_args: Sequence[s
     return FreshRun(distinct[0], counts[0])
 
 
-def probe_engine_build(engine: str, timeout: float = 60.0) -> str:
+def probe_engine_build(engine: str, timeout: float = 60.0, env: dict | None = None) -> str:
+    """`<engine> --version`: the build in the batches' tuple.  env is the engine's own environment, as for
+    run_generate: the binary the server starts finds its libraries the way that engine does, not the way this
+    process happens to (a missing library here would leave the gate silently unverified)."""
     try:
         proc = subprocess.run([engine, "--version"], capture_output=True, text=True, timeout=timeout,
-                              errors="replace")
+                              errors="replace", env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Refused(f"cannot read the engine build: {exc}") from exc
     match = re.search(r"^strata (\S+)$", proc.stdout or "", re.MULTILINE)
@@ -746,7 +969,7 @@ def probe_engine_build(engine: str, timeout: float = 60.0) -> str:
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Comparison.
-def compare_digests(old: Digest, fresh: Digest, old_sidecar: Sidecar) -> str:
+def compare_digests(old: Digest, fresh: Digest, old_has_checkpoints: bool) -> str:
     """Why the two digests differ, or "" when the sample passed.
 
     K/V always.  The fresh export holds the live state and nothing else, so the token and state digests are only
@@ -754,7 +977,7 @@ def compare_digests(old: Digest, fresh: Digest, old_sidecar: Sidecar) -> str:
     """
     if old.kv != fresh.kv:
         return "kv_mismatch"
-    if not old_sidecar.checkpoints:
+    if not old_has_checkpoints:
         if old.tokens != fresh.tokens:
             return "tokens_mismatch"
         if old.state_exact and fresh.state_exact and old.state != fresh.state:
@@ -800,6 +1023,101 @@ def merge_ledger(existing_batches: Sequence[GateBatch], existing_entries: Sequen
     return batches, entries
 
 
+def with_identity_batch(batches: Sequence[GateBatch], target: Identity, build: str,
+                        sample: str) -> list[GateBatch]:
+    """The ledger with ONE identity batch for `target` on this build, replacing any older one.
+
+    Its source and target are the same identity, so it approves nothing: the engine asks about a batch only for a
+    file of ANOTHER configuration, and an approval also needs an entry row, which this batch never has.  What it
+    records is that this build's identity has been established here - which is how the next start tells "the
+    ledger is current, there is nothing to verify" from "this build has never verified anything", without loading
+    the engine a second time (R4: the program verifies, not an operator).
+    """
+    kept = [b for b in batches if b.source != b.target]
+    kept.append(GateBatch(batch_id(target), target, target, build, sample if _token_ok(sample) else "-", True,
+                          int(time.time() * 1000)))
+    return kept
+
+
+@dataclass(frozen=True)
+class Pending:
+    """What a start has to verify before it may serve (the gate is on)."""
+    verify: bool
+    detail: str
+    target: Identity | None = None
+    sources: tuple[tuple[Identity, int], ...] = ()   # the sources a run would verify, with their file counts
+    refused: bool = False     # the scan itself failed: nothing was read, so nothing is verified (the caller says so)
+
+
+def current_identity(batches: Sequence[GateBatch], build: str) -> Identity | None:
+    """This build's identity as the ledger recorded it, or None when it never did.
+
+    Every batch's target is the identity the run recomputed FOR (the fresh export's own header), so any batch of
+    this build names it; a run with nothing to verify records it with an identity batch instead (see
+    with_identity_batch).  A failed batch names it too: the identity is known, its source is simply not approved.
+    """
+    for batch in batches:
+        if batch.engine_build == build:
+            return batch.target
+    return None
+
+
+def _group_newest_ms(group: Sequence[CacheFile | SlotFile]) -> int:
+    """When the newest file of the group was written, in milliseconds: a verification older than that describes a
+    file that has changed since, so the group is checked again."""
+    newest = 0
+    for item in group:
+        try:
+            newest = max(newest, int(item.path.stat().st_mtime * 1000))
+        except OSError:
+            continue
+    return newest
+
+
+def pending_verification(cache_dir: Path, slot_dirs: Sequence[Path], build: str) -> Pending:
+    """Does a start have to run the verification before it serves, and for what?
+
+    A cache file of ANOTHER configuration of this model is a candidate for the recompute (R1/R2).  It is pending
+    when this build has no passed batch for it.  With no file this model could use, or when every one of them is
+    approved, or when the only files are this identity's own, nothing runs and the start is unchanged.  A missing
+    or malformed ledger is not an error here: it approves nothing, so the run starts a fresh one (fail closed).
+    """
+    files: list[CacheFile | SlotFile] = []
+    try:
+        files.extend(scan_cache_dir(cache_dir))
+    except Refused as exc:
+        return Pending(False, str(exc), refused=True)
+    for slot_dir in slot_dirs:
+        try:
+            files.extend(scan_slot_dir(slot_dir))
+        except Refused as exc:
+            return Pending(False, str(exc), refused=True)
+    groups = group_by_source(files)
+    if not groups:
+        return Pending(False, "no cache or slot file this model could use")
+    try:
+        batches, _entries = read_ledger(cache_dir)
+    except LedgerError:
+        batches = []
+    target = current_identity(batches, build)
+    if target is None:
+        return Pending(True, f"no verification is recorded for engine build {build}",
+                       None, tuple(sorted((s, len(g)) for s, g in groups.items())))
+    settled = set()
+    for source, group in groups.items():
+        newest = _group_newest_ms(group)
+        if any(b.target == target and b.engine_build == build and b.source == source and b.verified_ms >= newest
+               for b in batches):
+            settled.add(source)      # checked for this build, and nothing in this group changed since
+    pending = tuple(sorted((source, len(group)) for source, group in groups.items()
+                           if source.model == target.model and source.config != target.config
+                           and source not in settled))
+    if not pending:
+        return Pending(False, "every cache file of this model is checked or this identity's own", target)
+    return Pending(True, f"{sum(n for _s, n in pending)} file(s) of another configuration await the recompute",
+                   target, pending)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Command line.
 def split_engine_args(argv: Sequence[str]) -> tuple[list[str], list[str]]:
@@ -822,13 +1140,19 @@ def _fingerprint_arg(text: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cache_verify.py",
-        description="Offline verification for the opt-in disk-cache recompute gate (.strata-cache-gate). "
-                    "STOP THE SERVER FIRST: this starts a second engine against the same GPU. It never deletes, "
-                    "renames or quarantines cache files.",
+        description="Verification for the opt-in disk-cache recompute gate (.strata-cache-gate), for the spill "
+                    "directory and any --slot-dir: one ledger, one read rule, one verification. The server runs "
+                    "this itself before it starts the engine; run it by hand only while the server is stopped (it "
+                    "starts a second engine against the same GPU) or with --dry-run. It never deletes, renames or "
+                    "quarantines cache files.",
         epilog="A batch passes when the recomputed sample's K/V digest equals the cached file's and the fresh "
                "session holds exactly the sample's tokens and identity. The ledger is written atomically; an "
                "unrelated valid batch or entry is preserved, and a malformed ledger starts empty (fail closed).")
-    parser.add_argument("--cache-dir", required=True, type=Path, help="the spill directory to verify")
+    parser.add_argument("--cache-dir", required=True, type=Path,
+                        help="the spill directory to verify; its ledger (.strata-cache-gate) is read and written")
+    parser.add_argument("--slot-dir", action="append", default=[], type=Path, metavar="DIR",
+                        help="a slot directory (--slot-save-path) whose session files follow the same ledger and the "
+                             "same verification; repeatable.  A .bin's ledger stem is its file name")
     parser.add_argument("--engine", required=True, help="the strata executable that will recompute the sample")
     parser.add_argument("--digest-tool", help="strata-session-digest (default: beside --engine, then PATH)")
     parser.add_argument("--engine-build", help="the engine build in the batch tuple (default: --engine --version)")
@@ -903,6 +1227,18 @@ def _result_line(result: BatchResult) -> str:
     return text
 
 
+def run(options: argparse.Namespace, passthrough: Sequence[str] = (), *, env: dict | None = None,
+        cwd: Path | str | None = None) -> int:
+    """The one entry point: `main` parses the command line into `options` and calls this; the server builds the
+    same Namespace from the facts it starts with (the engine, its arguments, the spill directory and the slot
+    directory) and calls this too, so the operator's tool and the program's own verification are one code path (R4).
+    env and cwd are the environment and the working directory the SERVING engine itself starts with
+    (serve/server.py child_env and cfg["cwd"]); the verification engine must run in exactly them (R1), because the
+    K/V it recomputes are compared with the cached file's.  None keeps this process's own.
+    Returns the tool's exit status: 0 passed or nothing to do, 1 a batch failed, 2 usage, 3 refused."""
+    return _run(options, list(passthrough), env, cwd)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     options, passthrough = split_engine_args(argv)
@@ -912,7 +1248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SystemExit as exc:
         return int(exc.code or 0)
     try:
-        return _run(args, passthrough)
+        return run(args, passthrough)
     except UsageError as exc:
         print(f"cache_verify: {exc}", file=sys.stderr)
         return 2
@@ -921,7 +1257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 3
 
 
-def _run(args, passthrough: list[str]) -> int:
+def _run(args, passthrough: list[str], engine_env: dict | None = None, engine_cwd: Path | str | None = None) -> int:
     if (args.target_model is None) != (args.target_config is None):
         raise UsageError("--target-model and --target-config go together")
     if args.timeout <= 0:
@@ -936,32 +1272,54 @@ def _run(args, passthrough: list[str]) -> int:
     if not cache_dir.is_dir():
         raise Refused(f"not a directory: {cache_dir}")
     cache_dir = cache_dir.resolve()
+    slot_dirs: list[Path] = []
+    for given in args.slot_dir:
+        slot_dir = given.expanduser()
+        if not slot_dir.is_dir():
+            raise Refused(f"not a directory: {slot_dir}")
+        slot_dir = slot_dir.resolve()
+        if slot_dir == cache_dir:
+            raise UsageError("--slot-dir and --cache-dir must differ: the ledger lives in the spill directory")
+        slot_dirs.append(slot_dir)
     engine = resolve_executable(args.engine, "the engine")
     digest_tool = args.digest_tool or _default_digest_tool(engine)
     if digest_tool:
         digest_tool = resolve_executable(digest_tool, "the digest tool")
     elif not args.dry_run:
         raise Refused("strata-session-digest not found beside the engine or on PATH; pass --digest-tool")
-    build = args.engine_build or probe_engine_build(engine)
+    build = args.engine_build or probe_engine_build(engine, env=engine_env)
     if not _token_ok(build):
         raise UsageError("--engine-build contains whitespace")
-    cwd = config_cwd
+    # The config's own cwd, else the serving engine's (run(cwd=...)); the engine is started in it, so a relative
+    # model or pack path in its arguments names the same file the serving engine names (R1).
+    cwd = config_cwd if config_cwd is not None else (Path(engine_cwd).expanduser() if engine_cwd else None)
     if cwd is not None and not cwd.is_dir():
-        raise Refused(f"the engine config's cwd is not a directory: {cwd}")
+        raise Refused(f"the engine's working directory is not a directory: {cwd}")
 
     target = Identity(args.target_model, args.target_config) if args.target_model is not None else None
+
+    def inside_a_scanned_dir(path: Path) -> bool:
+        if path == cache_dir or cache_dir in path.parents:
+            return True
+        return any(path == d or d in path.parents for d in slot_dirs)
+
     if args.work_dir is not None:
         work_dir = args.work_dir.expanduser().resolve()
-        if work_dir == cache_dir or cache_dir in work_dir.parents:
-            raise UsageError("--work-dir must be outside the cache directory")
+        if inside_a_scanned_dir(work_dir):
+            raise UsageError("--work-dir must be outside the cache and slot directories")
 
     files = scan_cache_dir(cache_dir)
-    eligible = [f for f in files if not f.skip]
+    everything: list[CacheFile | SlotFile] = list(files)
+    for slot_dir in slot_dirs:
+        scanned = scan_slot_dir(slot_dir)
+        everything.extend(scanned)
+        print(f"cache_verify: {slot_dir}: {len(scanned)} .bin files")
+    eligible = [f for f in everything if not f.skip]
     groups = group_by_source(eligible)
-    print(f"cache_verify: {cache_dir}: {len(files)} .sess files, {len(eligible)} eligible, "
-          f"{len(files) - len(eligible)} skipped, {len(groups)} source groups")
+    print(f"cache_verify: {cache_dir}: {len(files)} .sess files, {len(everything)} files in all, "
+          f"{len(eligible)} eligible, {len(everything) - len(eligible)} skipped, {len(groups)} source groups")
     if args.verbose:
-        for item in files:
+        for item in everything:
             if item.skip:
                 print(f"  skip {item.stem}: {item.skip}")
 
@@ -969,7 +1327,7 @@ def _run(args, passthrough: list[str]) -> int:
     if args.work_dir is None:
         work = tempfile.TemporaryDirectory(prefix="strata-cache-gate-")
         work_dir = Path(work.name).resolve()
-        if work_dir == cache_dir or cache_dir in work_dir.parents:
+        if inside_a_scanned_dir(work_dir):
             work.cleanup()
             raise UsageError("the temporary folder is inside the cache directory; pass --work-dir")
     else:
@@ -979,6 +1337,7 @@ def _run(args, passthrough: list[str]) -> int:
             raise Refused(f"cannot create --work-dir: {exc}") from exc
 
     results: list[BatchResult] = []
+    identity_sample = "-"     # the file the identity batch names: the smallest one of this engine's own identity
     try:
         for source in sorted(groups, key=lambda i: (i.model, i.config)):
             group = groups[source]
@@ -987,17 +1346,18 @@ def _run(args, passthrough: list[str]) -> int:
                 print(_result_line(results[-1]))
                 continue
             if target is not None and source.config == target.config:
+                identity_sample = choose_sample(group).stem
                 results.append(BatchResult(source, "skip", detail="same identity; the gate is not needed"))
                 print(_result_line(results[-1]))
                 continue
             sample = choose_sample(group)
             if args.dry_run:
                 target_text = f" -> {target}" if target is not None else " -> (identity from the fresh export)"
-                print(f"plan {source}{target_text}: sample={sample.stem} tokens={len(sample.sidecar.ids)} "
+                print(f"plan {source}{target_text}: sample={sample.stem} tokens={len(sample.ids)} "
                       f"bytes={sample.bytes} files={len(group)} build={build}")
                 continue
             result = _verify_group(args, engine, config_args, extra_args, cwd, digest_tool, build, work_dir,
-                                   source, group, sample, target)
+                                   source, group, sample, target, engine_env)
             if result.batch is not None:
                 if target is None:
                     target = result.batch.target
@@ -1006,6 +1366,7 @@ def _run(args, passthrough: list[str]) -> int:
             if target is not None and source.model != target.model and result.status != "skip":
                 result = BatchResult(source, "skip", detail="another model; a foreign model is never approved")
             elif target is not None and source.config == target.config and result.status != "skip":
+                identity_sample = sample.stem
                 result = BatchResult(source, "skip", detail="same identity; the gate is not needed")
             results.append(result)
             print(_result_line(result))
@@ -1018,7 +1379,12 @@ def _run(args, passthrough: list[str]) -> int:
         return 0
 
     processed = [r for r in results if r.status != "skip"]
-    if not processed:
+    # The startup never states this engine's identity, so a run that LEARNED it records it (with_identity_batch):
+    # without that record the next start could not tell "the ledger is current" from "this build never verified
+    # anything" and would load the engine again (R4).  A run that was told the identity, or one that learned
+    # nothing, leaves the ledger exactly as it was when it verified nothing.
+    record_identity = target is not None and args.target_model is None
+    if not processed and not record_identity:
         print("cache_verify: nothing to verify; the ledger is unchanged")
         return 0
 
@@ -1028,6 +1394,14 @@ def _run(args, passthrough: list[str]) -> int:
         print(f"cache_verify: warning: ignoring the existing ledger ({exc}); writing a fresh one", file=sys.stderr)
         existing_batches, existing_entries = [], []
     batches, entries = merge_ledger(existing_batches, existing_entries, results)
+    if current_identity(batches, build) is not None:
+        record_identity = False      # the batches this run wrote already name this build's identity
+    if not processed and not record_identity:
+        print("cache_verify: nothing to verify; the ledger is unchanged")
+        return 0
+    if record_identity:
+        batches = with_identity_batch(batches, target, build, identity_sample)
+        print("cache_verify: recorded this engine build's identity in the ledger")
     write_ledger(cache_dir, batches, entries)
 
     passed = sum(1 for r in results if r.status == "pass")
@@ -1039,16 +1413,17 @@ def _run(args, passthrough: list[str]) -> int:
 
 
 def _verify_group(args, engine: str, config_args: list[str], extra_args: list[str], cwd: Path | None,
-                  digest_tool: str, build: str, work_dir: Path, source: Identity, group: list[CacheFile],
-                  sample: CacheFile, known_target: Identity | None) -> BatchResult:
-    assert sample.sidecar is not None
-    ids = list(sample.sidecar.ids)
+                  digest_tool: str, build: str, work_dir: Path, source: Identity,
+                  group: list[CacheFile | SlotFile], sample: CacheFile | SlotFile,
+                  known_target: Identity | None, engine_env: dict | None = None) -> BatchResult:
+    ids = list(sample.ids)
     ids_path = work_dir / f"{sample.stem}.ids"
     out_path = work_dir / f"{sample.stem}.fresh.sess"
     started = int(time.time() * 1000)
     try:
         try:
-            fresh = run_generate(engine, config_args, extra_args, ids, ids_path, out_path, cwd, args.timeout)
+            fresh = run_generate(engine, config_args, extra_args, ids, ids_path, out_path, cwd, args.timeout,
+                                 engine_env)
         except VerifyError as exc:
             return _failed(source, sample.stem, build, started, exc, known_target)
         if known_target is None and fresh.identity.model != source.model:
@@ -1059,14 +1434,14 @@ def _verify_group(args, engine: str, config_args: list[str], extra_args: list[st
                                        f"the fresh export is model 0x{fresh.identity.model:016x}, "
                                        f"the source model is 0x{source.model:016x}"), None)
         try:
-            old_digest = run_digest(digest_tool, sample.sess, source, args.timeout)
+            old_digest = run_digest(digest_tool, sample.path, source, args.timeout)
             fresh_digest = run_digest(digest_tool, out_path, fresh.identity, args.timeout)
         except VerifyError as exc:
             return _failed(source, sample.stem, build, started, exc, fresh.identity)
-        reason = compare_digests(old_digest, fresh_digest, sample.sidecar)
+        reason = compare_digests(old_digest, fresh_digest, sample.has_checkpoints)
         if reason:
             return _failed(source, sample.stem, build, started, VerifyError(reason), fresh.identity)
-        entries = [GateEntry(item.stem, batch_id(source), item.bytes, len(item.sidecar.ids), item.sidecar.last_used)
+        entries = [GateEntry(item.stem, batch_id(source), item.bytes, len(item.ids), item.last_used)
                    for item in group]
         batch = GateBatch(batch_id(source), source, fresh.identity, build, sample.stem, True, started)
         return BatchResult(source, "pass", batch, entries)

@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 #include <vector>
 
 using namespace strata::core;
@@ -765,6 +767,37 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+    }
+    {   // --conversation-cache-origin-split: a parked conversation carries where its cache came from, and the disk
+        // tier's rule is one function: only an ordinary conversation (a disk restore included) may be spilled.
+        check(std::strcmp(conversation_origin_name(ConversationOrigin::ordinary), "ordinary") == 0 &&
+              std::strcmp(conversation_origin_name(ConversationOrigin::session_file), "session_file") == 0 &&
+              std::strcmp(conversation_origin_name(ConversationOrigin::disk_restore), "disk_restore") == 0,
+              "every origin has its log name");
+        check(conversation_origin_spills(ConversationOrigin::ordinary) &&
+              conversation_origin_spills(ConversationOrigin::disk_restore) &&
+              !conversation_origin_spills(ConversationOrigin::session_file),
+              "only a session-file conversation is kept out of the disk cache");
+        check(image({1, 2, 3}).origin == ConversationOrigin::ordinary, "an untagged image is ordinary");
+
+        ConversationCache cache(1 << 22, 4);
+        auto from_disk = image({1, 2, 3});
+        from_disk.origin = ConversationOrigin::disk_restore;
+        check(cache.put(std::move(from_disk)), "park a disk-restored conversation");
+        const ConversationMatch m = cache.best(std::vector<int32_t>{1, 2, 3, 4}, {}, true);
+        check(m.tokens == 3, "the tag does not change matching");
+        const SavedConversation* parked = cache.find(m.serial);
+        check(parked != nullptr && parked->origin == ConversationOrigin::disk_restore,
+              "a parked entry keeps the origin it was parked with");
+        check(cache.take(m.index).origin == ConversationOrigin::disk_restore, "and hands the tag back with the image");
+
+        auto session = image({5, 6, 7});
+        session.origin = ConversationOrigin::session_file;
+        check(cache.put(std::move(session)), "a session-file conversation may still be kept in RAM (reused, not spilled)");
+        const SavedConversation* kept = cache.find(cache.best(std::vector<int32_t>{5, 6, 7, 8}, {}, true).serial);
+        check(kept != nullptr && !conversation_origin_spills(kept->origin) &&
+              std::string(conversation_origin_name(kept->origin)) == "session_file",
+              "its entry is tagged, so the disk tier refuses it whenever the RAM cache lets it go");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

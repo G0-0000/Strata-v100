@@ -879,9 +879,19 @@ struct Options {
     /// --conversation-cache-disk-recompute-gate: read the spill directory's recompute ledger (.strata-cache-gate,
     /// conversation_spill.hpp) and index a same-model file saved under another engine configuration when a passing
     /// record names it for this identity and engine build; such an entry is read with its own config accepted and is
-    /// never appended to (a save writes a new file).  Default off: the ledger is not read and a foreign-config entry
-    /// stays kept, unindexed and unbudgeted, as before.
+    /// never appended to (a save writes a new file).  The SAME ledger governs a slot session file saved under another
+    /// configuration (the RESTORE path asks the same two queries), and the serving startup runs the verification
+    /// itself before the engine takes the GPU - docs/CACHE_REUSE_RULES.md R1-R4: the version changes, the KV test
+    /// runs, what passes is indexed and only a failure is reported; nothing is judged or deleted before it has run.
+    /// Default off: the ledger is not read and a foreign-config entry stays kept, unindexed and unbudgeted, as before.
     bool conversation_cache_disk_recompute_gate = false;
+    /// --conversation-cache-origin-split: a conversation the client RESTORED from its own /slots session file, or
+    /// SAVEd to one, stays a SESSION-FILE conversation - the engine reuses it while the next request continues it
+    /// and, when it cannot, drops its in-memory cache: no spill write, and never a touch of the client's .bin.  The
+    /// disk spill cache then holds ordinary conversations only, and a SAVE removes the conversation's older disk
+    /// copies.  Default off: every conversation is spilled on eviction as before, and the spill files' bytes do not
+    /// change (an origin tag is written only for a tagged conversation).
+    bool conversation_cache_origin_split = false;
     int64_t conversation_cache_disk_mib = 8192;   // the spill directory's limit (0 = off)
     double conversation_cache_similarity = 0.0;   // least LCP/new-prompt fraction a disk hit may offer (range [0,1))
     int64_t conversation_cache_n_min = 0;         // least common-prefix tokens a disk hit may offer
@@ -1079,8 +1089,14 @@ void usage() {
                   "  --conversation-cache-disk-recompute-gate  --serve: also read the spill directory's recompute\n"
                   "                       ledger (.strata-cache-gate) and index a same-model file saved under another\n"
                   "                       engine configuration when a passing record covers it for this build; such an\n"
-                  "                       entry is read with its own config accepted and is never appended to (default\n"
-                  "                       off: the ledger is not read and the file stays kept and unindexed)\n"
+                  "                       entry is read with its own config accepted and is never appended to.  The same\n"
+                  "                       ledger covers the slot session files, and the server runs the recompute before\n"
+                  "                       it starts this engine (default off: the ledger is not read and the file stays\n"
+                  "                       kept and unindexed)\n"
+                 "  --conversation-cache-origin-split  --serve: a conversation a client saved to, or restored from,\n"
+                 "                       its own /slots session file is never spilled to the disk cache and its file is\n"
+                 "                       never touched; the conversation is reused while the next request continues it\n"
+                 "                       and dropped otherwise (default off: every conversation spills as before)\n"
                  "  --conversation-cache-disk-mib N  --serve: the spill directory's limit (default 8192; 0 = off)\n"
                  "  --conversation-cache-similarity F  --serve: least common-prefix fraction a disk hit may offer\n"
                  "                       (default 0 = any; range [0,1))\n"
@@ -3345,6 +3361,7 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-disk-state-codec-rht") o.conversation_cache_disk_state_codec_rht = true;
         else if (a == "--conversation-cache-disk-background-state") o.conversation_cache_disk_background_state = true;
         else if (a == "--conversation-cache-disk-recompute-gate") o.conversation_cache_disk_recompute_gate = true;
+        else if (a == "--conversation-cache-origin-split") o.conversation_cache_origin_split = true;
         else if (a == "--conversation-cache-disk-delta-percent") {
             const std::string value = next("--conversation-cache-disk-delta-percent");
             int64_t number = 0;
@@ -10723,6 +10740,14 @@ int main(int argc, char** argv) {
         ConvIds live{strata::core::vma_class::session_active};
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        // --conversation-cache-origin-split (opt-in): where the conversation `live` holds came from.  A conversation
+        // the client SAVEd to its own /slots session file, or RESTOREd from one, is session_file: the engine keeps it
+        // while requests continue it and otherwise drops it - never spilling it to the disk cache, never writing or
+        // deleting that file.  Everything else is ordinary; a restore from the disk cache is tagged disk_restore and
+        // spills again like an ordinary one.  Untagged means ordinary, and with the flag off nothing ever tags one.
+        strata::core::ConversationOrigin live_origin = strata::core::ConversationOrigin::ordinary;
+        std::string live_origin_slot;     // the session file it came from or went to (diagnostics only)
+        int64_t live_origin_tokens = 0;   // its length when that file was written or read (the conversation it holds)
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
         // #3465: the non-finite logits came in a window that reads the PROMPT's tail (the last few tokens, read through
@@ -10790,7 +10815,7 @@ int main(int argc, char** argv) {
                 if (gate.enabled) gate.engine_build = STRATA_VERSION;
                 if (!conversation_spill.open(o.conversation_cache_spill_dir, spill_identity,
                         (uint64_t) o.conversation_cache_disk_mib * 1024 * 1024, spill_error,
-                        o.conversation_cache_disk_delta, gate)) {
+                        o.conversation_cache_disk_delta, gate, o.conversation_cache_origin_split)) {
                     std::fprintf(stderr, "strata serve: conversation cache: disk tier disabled (%s)\n", spill_error.c_str());
                 } else if (conversation_spill.enabled()) {
                     std::fprintf(stderr, "strata serve: conversation cache: spill dir ready (%zu conversations, %llu MiB, "
@@ -10814,6 +10839,15 @@ int main(int argc, char** argv) {
         }
         auto spill_evicted = [&](const strata::core::SavedConversation& evicted) {
             if (!conversation_spill.enabled()) return;
+            // --conversation-cache-origin-split: the disk cache takes ordinary conversations only.  A session-file
+            // conversation's .bin is its copy, so an entry tagged session_file is dropped here instead (the guard is
+            // the spill cache's too; this line says which conversation went and why).
+            if (!strata::core::conversation_origin_spills(evicted.origin)) {
+                std::fprintf(stderr, "strata serve: conversation cache: dropped %zu tokens of a session-file "
+                             "conversation (origin=%s) instead of spilling it\n", evicted.live.ids.size(),
+                             strata::core::conversation_origin_name(evicted.origin));
+                return;
+            }
             try {
                 std::string spill_error;
                 if (conversation_spill.spill(evicted, spill_error)) {
@@ -11061,6 +11095,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: disk save skipped (%s)\n", e.c_str());
                     return;
                 }
+                // --conversation-cache-origin-split: the tag the live conversation holds rides with its sidecar, so a
+                // conversation read back from the disk cache is tagged disk_restore on disk too and a plain one stays
+                // untagged (with the flag off nothing is written and nothing is tagged).
+                meta.origin = live_origin;
                 size_t bytes = 0;
                 bool delta_written = false;
                 std::string kept;
@@ -11327,12 +11365,17 @@ int main(int argc, char** argv) {
             const strata::core::QsaState* draft_last;     ///< ... with the last stage's image (a split: the drafter's GPU)
             bool with_reuse;                              ///< the retained K/V describes this source (the main session's)
             std::string what;                             ///< the log's words after the token count ("", " from slot 1")
+            strata::core::ConversationOrigin origin = strata::core::ConversationOrigin::ordinary;   ///< the parked image's
+                                                          ///< tag (--conversation-cache-origin-split; a slot's is ordinary)
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         // STRATA_PARK_ASYNC: set by the request around its park - the live checkpoints it drops right after (they move
         // into the parked image instead of being copied); a background allocation then refills STRATA_CKPT_POOL
         std::function<bool(const ConvCheckpoint&)> park_drops;
+        // --conversation-cache-origin-split: the one line saying why a session-file conversation is not reused by
+        // this request (the prompt lives in the request's scope, so the caller sets it there; empty: nothing to say).
+        std::function<void()> origin_note_drop;
         std::future<void> pool_refill;
         // STRATA_CKPT_POOL_READY=N (with STRATA_CKPT_POOL): the pool holds N checkpoints whose vectors already have the
         // session's sizes (the ones conversation_checkpoint_save resizes to, so a pooled one is never resized) with their
@@ -11562,12 +11605,19 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     return true;
                 }
+                // --conversation-cache-origin-split: the parked image keeps the tag of the conversation it was
+                // captured from, so the disk cache never takes a session-file one (spill_evicted refuses it there).
+                image.origin = src.origin;
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                if (!strata::core::conversation_origin_spills(src.origin))
+                    std::fprintf(stderr, "strata serve: conversation cache: that conversation is a session-file one "
+                                 "(origin=%s): the disk cache never takes it\n",
+                                 strata::core::conversation_origin_name(src.origin));
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
@@ -11575,7 +11625,24 @@ int main(int argc, char** argv) {
             }
             return true;
         };
-        auto park_current_body = [&](size_t held) -> bool {
+        // `continuing`: this request goes on from the live conversation's own state or one of its checkpoints (the
+        // caller passes it where nothing else is restored in its place).
+        auto park_current_body = [&](size_t held, bool continuing) -> bool {
+            // --conversation-cache-origin-split: a session-file conversation is the client's - its .bin holds it.  The
+            // disk cache never takes it (not at a switch, not at shutdown), and a request that does not go on from it
+            // drops the in-memory cache instead of parking it: no spill write, no drop of its older disk copies, and
+            // its file is neither overwritten nor deleted.  A request that DOES go on from it keeps it, parked in RAM
+            // as before and tagged, so the disk tier still never sees it (spill_evicted refuses a session_file entry).
+            if (!strata::core::conversation_origin_spills(live_origin) && (disk_only || !continuing)) {
+                if (origin_note_drop) origin_note_drop();
+                std::fprintf(stderr, "strata serve: conversation cache: a session-file conversation (%zu tokens, "
+                             "%lld when its file was written, origin=%s) is %s; the session file %s is left as it is\n",
+                             live.size(), (long long) live_origin_tokens,
+                             strata::core::conversation_origin_name(live_origin),
+                             continuing ? "not written to the disk cache" : "dropped, not spilled",
+                             live_origin_slot.empty() ? "(none recorded)" : live_origin_slot.c_str());
+                return true;
+            }
             if (disk_only) {
                 // --conversation-cache-min-tokens gates the disk tier too, not only the RAM cache below: a short
                 // conversation is not worth a whole session file, and the oldest-first budget eviction would push
@@ -11594,15 +11661,15 @@ int main(int argc, char** argv) {
             const size_t n_st = stages.size();
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
-                           use_mtp && !mtp_first && n_st > 0 ? &mtp.kv_state() : nullptr, true, ""};
+                           use_mtp && !mtp_first && n_st > 0 ? &mtp.kv_state() : nullptr, true, "", live_origin};
             for (auto& st : stages) src.stage_sessions.push_back(&st->ss);
             return park_source(src, held);
         };
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
         // ending the server
-        auto park_current = [&](size_t held) -> bool {
+        auto park_current = [&](size_t held, bool continuing = false) -> bool {
             disk_finish_background();
-            try { return park_current_body(held); }
+            try { return park_current_body(held, continuing); }
             catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
                 return true;
@@ -13129,6 +13196,7 @@ int main(int argc, char** argv) {
                  .disk_delta = o.conversation_cache_disk_delta,
                  .similarity = o.conversation_cache_similarity,
                  .n_min = o.conversation_cache_n_min,
+                 .origin_split = o.conversation_cache_origin_split,
                  .tail_role_token = (int64_t) o.tail_role_token,
                  .vram_elastic = xcache.segmented()});
             std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
@@ -14565,6 +14633,26 @@ int main(int argc, char** argv) {
                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
                         continue;
                     }
+                    if (o.conversation_cache_origin_split) {
+                        // --conversation-cache-origin-split: the file the client just wrote is this conversation's
+                        // copy from now on, so the cache's copies of it go - the parked ones and the spilled ones -
+                        // and only the .bin remains.  The conversation stays a session-file one for its next turns.
+                        live_origin = strata::core::ConversationOrigin::session_file;
+                        live_origin_slot = path;
+                        live_origin_tokens = (int64_t) live.size();
+                        try {
+                            const size_t parked_dropped =
+                                conversations.drop_superseded(live, live_imgs, checks, cvec_cached);
+                            const size_t disk_dropped =
+                                conversation_spill.drop_superseded(live, live_imgs, checks, cvec_cached);
+                            std::fprintf(stderr, "strata serve: session saved to %s: origin=session_file; dropped %zu "
+                                         "parked and %zu spill cop%s of this conversation\n", path.c_str(),
+                                         parked_dropped, disk_dropped, parked_dropped + disk_dropped == 1 ? "y" : "ies");
+                        } catch (const std::exception& e) {
+                            std::fprintf(stderr, "strata serve: session saved to %s: origin=session_file, but not every "
+                                         "older copy could be dropped (%s)\n", path.c_str(), e.what());
+                        }
+                    }
                     std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
                                  "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
                                  path.c_str(), ms(), capture_ms);
@@ -14603,6 +14691,23 @@ int main(int argc, char** argv) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
+                        // Owner's rule (docs/CACHE_REUSE_RULES.md R3): a session file and a spill file follow ONE
+                        // rule, one ledger and one verification, differing only in directory and name.  A .bin saved
+                        // under another engine configuration asks the disk cache's recompute ledger, with the SAME
+                        // two queries a spill entry is indexed with and this file's own name as its ledger stem.  The
+                        // model must match: a foreign model is never approved.  Without the gate, or without an
+                        // approval, nothing here changes and the read below refuses the file as it always has.
+                        strata::core::SessionFileIdentity slot_file_id{};
+                        std::string slot_ledger_stem;
+                        {
+                            std::string peek_error;
+                            if (strata::core::session_file_identity_read(path, slot_file_id, peek_error) &&
+                                slot_file_id.model == id.model && slot_file_id.config != id.config &&
+                                conversation_spill.gate_identity_approved(slot_file_id)) {
+                                limits.accept_config = slot_file_id.config;
+                                slot_ledger_stem = std::filesystem::path(path).filename().string();
+                            }
+                        }
                         strata::core::SessionStatus st;
                         // S2/S3: this load restores the file straight INTO the active session - get_payload
                         // first-touches every checkpoint vector, then the handover below MOVES them into `checks`
@@ -14620,9 +14725,21 @@ int main(int argc, char** argv) {
                                 refuse(err, st.error);
                                 continue;
                             }
+                            // An accepted configuration is a two-part approval, as for a spill entry: the batch passed
+                            // for this source identity, and the ledger holds a row for THIS file - its own name, its
+                            // size and the live token count the recompute sampled.  A file the verification never
+                            // saw is refused exactly as before (verbatim the read's own message), never deleted.
+                            if (limits.accept_config &&
+                                !conversation_spill.gate_entry_approved(slot_ledger_stem, slot_file_id, bytes,
+                                                                        (int64_t) image.live.ids.size())) {
+                                err = "session file: saved with another engine configuration (config fingerprint differs)";
+                                refuse(err);
+                                continue;
+                            }
                             if (st.file_version >= 2u) {
                                 strata::core::session_read_bounds_from_meta(image, restore_apply_limits);
                                 restore_apply_limits.admit = limits.admit;
+                                restore_apply_limits.accept_config = limits.accept_config;   // the apply pass reads the same header
                                 restore_apply = &restore_apply_limits;
                             }
                         }
@@ -14714,6 +14831,16 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
+                    if (o.conversation_cache_origin_split) {
+                        // --conversation-cache-origin-split: this conversation belongs to the file it came from.  The
+                        // engine reuses it while requests go on from it, and drops it - never spilling it, never
+                        // writing or deleting that file - when one does not.
+                        live_origin = strata::core::ConversationOrigin::session_file;
+                        live_origin_slot = path;
+                        live_origin_tokens = (int64_t) live.size();
+                        std::fprintf(stderr, "strata serve: session restored from %s: origin=session_file (the engine "
+                                     "will not spill this conversation; the file is left as it is)\n", path.c_str());
+                    }
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
                         const size_t n_parked = conversations.clear();
@@ -15591,6 +15718,51 @@ int main(int argc, char** argv) {
                     return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                 };
             }
+            // --conversation-cache-origin-split: this request goes on from the live conversation itself (its state or
+            // one of its checkpoints) - nothing it restores replaces it - so a session-file conversation is reused
+            // and parked, not dropped.
+            const bool origin_continuing = resume > 0 && !incoming && !borrow && !disk_incoming && slot_source < 0;
+            // --conversation-cache-origin-split: why a session-file conversation is not reused.  Without a line of its
+            // own a client's rewritten history reads as an unexplained 0 reuse in the log.
+            origin_note_drop = nullptr;
+            struct OriginNoteReset {
+                std::function<void()>& f;
+                ~OriginNoteReset() { f = nullptr; }
+            } origin_note_reset{origin_note_drop};
+            if (o.conversation_cache_origin_split && !origin_continuing &&
+                !strata::core::conversation_origin_spills(live_origin)) {
+                const int64_t saved_tokens = live_origin_tokens;
+                const std::string saved_file = live_origin_slot;
+                origin_note_drop = [&, saved_tokens, saved_file] {
+                    int64_t lcp = 0;
+                    const int64_t m = std::min<int64_t>((int64_t) live.size(), (int64_t) ids.size());
+                    while (lcp < m && (int32_t) live[(size_t) lcp] == (int32_t) ids[(size_t) lcp]) ++lcp;
+                    // This engine holds no tokenizer (see the top of this file): the ids either side of the divergence
+                    // are what the server's log can decode.
+                    auto window = [](const auto& seq, int64_t at, std::string& out) {
+                        const int64_t to = std::min<int64_t>((int64_t) seq.size(), at + 4);
+                        for (int64_t i = std::max<int64_t>(0, at - 4); i < to; ++i) {
+                            if (!out.empty()) out += ',';
+                            out += std::to_string((long long) seq[(size_t) i]);
+                        }
+                    };
+                    std::string left, right;
+                    window(live, lcp, left);
+                    window(ids, lcp, right);
+                    // The common prefix can run to the end of the shorter sequence: then one is a prefix of the other
+                    // and no token differs, which the line says instead of naming a divergence that is not there.
+                    const char* where = lcp < m ? "they differ there"
+                                                : "one is a prefix of the other, so no token differs";
+                    std::fprintf(stderr, "strata serve: conversation cache: a session-file conversation (%lld tokens "
+                                 "now, %lld when its file %s was written, origin=%s) is not reused by this prompt "
+                                 "(%lld tokens): the longest common prefix is %lld tokens (%s; tokens %s | %s); it is "
+                                 "dropped, not spilled\n", (long long) live.size(),
+                                 (long long) saved_tokens,
+                                 saved_file.empty() ? "(unknown)" : saved_file.c_str(),
+                                 strata::core::conversation_origin_name(live_origin), (long long) ids.size(),
+                                 (long long) lcp, where, left.c_str(), right.c_str());
+                };
+            }
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
@@ -15625,10 +15797,18 @@ int main(int argc, char** argv) {
                 // disk-only: a sibling of a pinned prefix is another conversation (a coding agent's new session), so the
                 // one it leaves is saved like any switch
                 if ((!from_live || incoming || disk_incoming || slot_source >= 0) && (!pin_sibling || disk_only) &&
-                    park_worth && !park_current(incoming ? incoming->bytes() : 0)) {
+                    park_worth && !park_current(incoming ? incoming->bytes() : 0, origin_continuing)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+            }
+            // --conversation-cache-origin-split: the outgoing conversation has been parked or dropped, so the cache this
+            // request builds is ordinary - a session-file one only stays so when the request goes on from it (the
+            // restores below tag what they bring back: a disk hit disk_restore, a parked one its own tag).
+            if (!origin_continuing) {
+                live_origin = strata::core::ConversationOrigin::ordinary;
+                live_origin_slot.clear();
+                live_origin_tokens = 0;
             }
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
@@ -15713,6 +15893,11 @@ int main(int argc, char** argv) {
                     live_imgs.clear();
                     resume = slot_tokens;
                     from_live = true;
+                    // --conversation-cache-origin-split: a batch slot's conversation is an ordinary one (session files
+                    // and --batch do not mix), so the cache this request builds from it is ordinary too.
+                    live_origin = strata::core::ConversationOrigin::ordinary;
+                    live_origin_slot.clear();
+                    live_origin_tokens = 0;
                     std::fprintf(stderr, "strata batch: slot %d gave back %lld tokens of this conversation (%s) in "
                                  "%.1f ms\n", slot_source, (long long) slot_tokens,
                                  slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
@@ -15864,6 +16049,11 @@ int main(int argc, char** argv) {
                         cvec_cached = disk_meta.cvec;
                         resume = disk_in_tokens;
                         from_live = disk_in_live;
+                        // --conversation-cache-origin-split: the state came back from the disk cache, which is what
+                        // the tag says; the conversation itself is ordinary and spills again like any other.
+                        live_origin = strata::core::ConversationOrigin::disk_restore;
+                        live_origin_slot.clear();
+                        live_origin_tokens = 0;
                         applied = true;
                         disk_applied = true;
                         // --conversation-cache-disk-delta: this live conversation can append to the chain it came from
@@ -15911,6 +16101,12 @@ int main(int argc, char** argv) {
                 cvec_cached = donor->cvec;
                 resume = parked.tokens;
                 from_live = false;
+                // --conversation-cache-origin-split: this session now holds the donor's prefix, so the cache it builds
+                // follows the donor's tag - ordinary, disk_restore, or session_file (a session-file conversation does
+                // park, tagged, when a request goes on from one of its checkpoints; the disk cache refuses it there).
+                live_origin = donor->origin;
+                live_origin_slot.clear();
+                live_origin_tokens = 0;
                 conversations.count_borrow();
                 std::fprintf(stderr, "strata serve: conversation cache: borrowed %lld tokens from a parked "
                              "conversation, which stays parked, in %.1f ms; parked=%zu bytes=%zu borrowed=%zu\n",
@@ -15988,6 +16184,11 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
                 from_live = parked.live;
+                // --conversation-cache-origin-split: the cache that comes back keeps the tag it was parked with
+                // (ordinary, or disk_restore for an image that was read from the disk cache).
+                live_origin = incoming->origin;
+                live_origin_slot.clear();
+                live_origin_tokens = 0;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
@@ -16008,6 +16209,11 @@ int main(int argc, char** argv) {
                 live_ok = false;
                 checks.clear();
                 cvec_cached = want_cvec;
+                // --conversation-cache-origin-split: the state this request would have gone on from is not usable
+                // under this control vector; it reads its prompt from scratch, which is ordinary.
+                live_origin = strata::core::ConversationOrigin::ordinary;
+                live_origin_slot.clear();
+                live_origin_tokens = 0;
             }
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
@@ -18938,14 +19144,22 @@ int main(int argc, char** argv) {
         if (conversation_spill.enabled() && disk_only) {   // the live conversation goes to disk, flushed
             // QUIT joins and publishes an earlier task even when the live state is below the save threshold.
             disk_finish_background();
-            // the --conversation-cache-min-tokens gate the switch path takes applies here too
-            if (conversations.wants((int64_t) live.size()))
+            // --conversation-cache-origin-split: a session-file conversation's .bin is its copy, so the disk cache
+            // takes nothing of it at shutdown either.
+            if (!strata::core::conversation_origin_spills(live_origin)) {
+                std::fprintf(stderr, "strata serve: conversation cache: a session-file conversation (origin=%s) is not "
+                             "saved to the disk cache at shutdown; its file %s is left as it is\n",
+                             strata::core::conversation_origin_name(live_origin),
+                             live_origin_slot.empty() ? "(none recorded)" : live_origin_slot.c_str());
+            } else if (conversations.wants((int64_t) live.size())) {
+                // the --conversation-cache-min-tokens gate the switch path takes applies here too
                 disk_save_live(true, "shutdown");
-            else
+            } else {
                 std::fprintf(stderr, "strata serve: conversation cache: skip disk save (%zu tokens, below the %lld "
                                      "minimum; disk=%zu MiB in %zu files)\n",
                              live.size(), (long long) o.conversation_cache_min_tokens,
                              (size_t) (conversation_spill.bytes() >> 20), conversation_spill.size());
+            }
         } else if (conversation_spill.enabled()) {   // the parked conversations go to disk, so a restart finds them
             if (!park_current(0))
                 std::fprintf(stderr, "strata serve: conversation cache: the final active conversation was not captured (%s)\n",

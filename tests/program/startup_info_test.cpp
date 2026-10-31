@@ -124,6 +124,16 @@ int main() {
         CHECK(s.find("  ") == std::string::npos);
     }
 
+    // --conversation-cache-origin-split (opt-in): the field is APPENDED, so the flag-off segment above keeps the bytes
+    // it had, and both variants carry the flag at the end when it is on
+    ConversationCacheInfoFields on_spill = c;
+    on_spill.origin_split = true;
+    CHECK(conversation_cache_info_fields(on_spill) == read_spill + " conversation_cache_origin_split=1");
+    ConversationCacheInfoFields on_no_spill = a;
+    on_no_spill.origin_split = true;
+    CHECK(conversation_cache_info_fields(on_no_spill) == pre_no_spill + " conversation_cache_origin_split=1");
+    CHECK(conversation_cache_info_fields(c).find("conversation_cache_origin_split") == std::string::npos);
+
     // the similarity keeps its three decimals whatever the value
     ConversationCacheInfoFields e = b;
     e.similarity = 0.5;

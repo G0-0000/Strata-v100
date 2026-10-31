@@ -382,6 +382,16 @@ struct SessionFileDigest {
 bool session_file_digest(const std::string& path, const SessionFileIdentity& id, SessionFileDigest& out,
                          std::string& error, SessionStatus* status = nullptr);
 
+// ---- The identity a session file's HEADER carries, read without its payload: what the disk cache's recompute gate
+// asks its ledger about BEFORE a read that would otherwise refuse the file for its stored configuration (R3 of
+// docs/CACHE_REUSE_RULES.md: a session file and a spill file follow one rule, one ledger and one verification).  The
+// same checks a read makes of the header (magic, version, fields, checksum and the size the header implies), leaving
+// only the identity comparison and the payload to the read - and this never authorizes a read: the read checks the
+// identity again.  False (outputs untouched, `error` set) for a missing file, a link, a non-regular file, one
+// shorter than a header, or a header with a bad magic, version, field or checksum.
+bool session_file_identity_read(const std::string& path, SessionFileIdentity& id, std::string& error,
+                                SessionStatus* status = nullptr);
+
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).

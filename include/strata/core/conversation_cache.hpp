@@ -260,9 +260,35 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
     return true;
 }
 
+/// Where a conversation's cache came from (--conversation-cache-origin-split): a conversation a client RESTORED
+/// from its own /slots session file, or SAVEd to one, is the client's - the engine reuses that file's conversation
+/// while the next request continues it and otherwise DROPS its in-memory cache, never writing it to the disk spill
+/// cache and never touching the .bin.  Every other cache is ordinary: it is spilled on eviction as before.  A
+/// conversation restored from the disk spill cache is ordinary for that policy too; its tag only says where the
+/// state came from.  No tag means ordinary.
+enum class ConversationOrigin { ordinary, session_file, disk_restore };
+
+inline const char* conversation_origin_name(ConversationOrigin origin) {
+    switch (origin) {
+    case ConversationOrigin::session_file: return "session_file";
+    case ConversationOrigin::disk_restore: return "disk_restore";
+    case ConversationOrigin::ordinary: break;
+    }
+    return "ordinary";
+}
+
+/// Whether the disk spill cache may hold this conversation: only an ordinary one may (a session-file copy is the
+/// client's file, and a second copy on disk would be one the engine cannot keep in step with it).
+inline bool conversation_origin_spills(ConversationOrigin origin) {
+    return origin != ConversationOrigin::session_file;
+}
+
 struct SavedConversation {
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
+    // --conversation-cache-origin-split: where this image came from, for the eviction policy above.  Run-time only
+    // (never part of the session file's format) and ordinary unless something tagged it.
+    ConversationOrigin origin = ConversationOrigin::ordinary;
     // The session's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.
     int64_t layer_lo = 0, layer_hi = 0;
     ConversationCheckpoint live;

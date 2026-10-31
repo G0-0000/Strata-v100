@@ -9,6 +9,7 @@ import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,7 +24,7 @@ NEW_CONFIG = 0xD88978F614302157
 
 
 def sidecar_bytes(version=2, model=MODEL, config=OLD_CONFIG, ids=(1, 2, 3), images=(), checkpoints=(2,),
-                  last_used=1793037175538, corrupt=False):
+                  last_used=1793037175538, origin=0, corrupt=False):
     body = b"SCSM" + struct.pack("<QQQQQ", version, model, config, 1, len(ids))
     for token in ids:
         body += struct.pack("<q", token)
@@ -35,6 +36,8 @@ def sidecar_bytes(version=2, model=MODEL, config=OLD_CONFIG, ids=(1, 2, 3), imag
         body += struct.pack("<Q", length)
     if version >= 2:
         body += struct.pack("<Q", last_used)
+    if version >= 3:
+        body += struct.pack("<Q", origin)
     data = body + struct.pack("<Q", CV.session_hash64(body, 0))
     if corrupt:
         data = data[:-1] + bytes([data[-1] ^ 0xFF])
@@ -110,9 +113,22 @@ class Sidecar(TempDir):
         with self.assertRaises(CV.SidecarError):
             CV.parse_sidecar(b"XCSM" + sidecar_bytes()[4:])
 
+    def test_v3_carries_the_conversation_origin(self):
+        # the engine writes v3 when --conversation-cache-origin-split is on and the conversation is tagged
+        # (conversation_spill.cpp kMetaVersionOrigin): same parser, one more u64 after the last-use stamp
+        parsed = CV.parse_sidecar(sidecar_bytes(version=3, origin=1))
+        self.assertEqual((parsed.version, parsed.origin, parsed.last_used), (3, 1, 1793037175538))
+        self.assertEqual((parsed.model, parsed.config, parsed.ids), (MODEL, OLD_CONFIG, (1, 2, 3)))
+        self.assertEqual(CV.parse_sidecar(sidecar_bytes(version=3, origin=2)).origin, 2)   # disk_restore
+        self.assertEqual(CV.parse_sidecar(sidecar_bytes(version=3)).origin, 0)             # ordinary
+
+    def test_a_v3_origin_past_the_engines_range_is_refused(self):
+        with self.assertRaises(CV.SidecarError):
+            CV.parse_sidecar(sidecar_bytes(version=3, origin=3))     # ConversationOrigin::disk_restore is the last
+
     def test_unsupported_version_is_refused(self):
         with self.assertRaises(CV.SidecarError):
-            CV.parse_sidecar(sidecar_bytes(version=3))
+            CV.parse_sidecar(sidecar_bytes(version=4))
 
     def test_invalid_chains_are_refused(self):
         with self.assertRaises(CV.SidecarError):
@@ -154,6 +170,16 @@ class Scan(TempDir):
         self.assertEqual({f.stem for f in legacy}, {"strata-conv-a", "strata-conv-b", "strata-conv-v1"})
         self.assertEqual(len(CV.group_by_source(eligible)), 2)
 
+    def test_a_v3_sidecar_is_scanned_like_the_others(self):
+        # --conversation-cache-origin-split writes a v3 sidecar for a tagged conversation (kMetaVersionOrigin), and
+        # the engine still holds such a file of another configuration "not indexed until the recompute gate
+        # approves" it: a scan that skipped v3 would leave it unverifiable for ever (R1, docs/CACHE_REUSE_RULES.md)
+        self.cache_file("strata-conv-v3", 42, version=3)
+        files = CV.scan_cache_dir(self.root)
+        self.assertEqual([f.skip for f in files], [""])
+        self.assertEqual(files[0].sidecar.version, 3)
+        self.assertEqual(CV.group_by_source(files)[CV.Identity(MODEL, OLD_CONFIG)][0].stem, "strata-conv-v3")
+
     def test_a_stem_that_is_not_utf8_is_skipped(self):
         # os.listdir surfaces undecodable name bytes as lone surrogates; the ledger is UTF-8, so such a file can
         # never be named in one and must be skipped rather than crash the write in format_ledger.
@@ -169,30 +195,26 @@ class Scan(TempDir):
 
 
 class Comparison(unittest.TestCase):
-    def sidecar(self, checkpoints=(2,), exact=True):
-        return CV.Sidecar(2, MODEL, OLD_CONFIG, True, (1, 2, 3), (), checkpoints, 0)
-
+    # compare_digests takes whether the OLD file carries a checkpoint (a spill sidecar's, or - for a .bin, which
+    # this tool does not decode that far - always True): only a live-only old file compares tokens and state.
     def test_equal_digests_pass(self):
-        self.assertEqual(CV.compare_digests(digest(), digest(), self.sidecar(checkpoints=())), "")
+        self.assertEqual(CV.compare_digests(digest(), digest(), False), "")
 
     def test_kv_always_counts(self):
-        self.assertEqual(CV.compare_digests(digest(), digest(kv=9), self.sidecar()), "kv_mismatch")
+        self.assertEqual(CV.compare_digests(digest(), digest(kv=9), True), "kv_mismatch")
 
     def test_live_only_token_mismatch_fails(self):
-        self.assertEqual(CV.compare_digests(digest(), digest(tokens=9), self.sidecar(checkpoints=())),
-                         "tokens_mismatch")
+        self.assertEqual(CV.compare_digests(digest(), digest(tokens=9), False), "tokens_mismatch")
 
     def test_live_only_state_mismatch_fails(self):
-        self.assertEqual(CV.compare_digests(digest(), digest(state=9), self.sidecar(checkpoints=())),
-                         "state_mismatch")
+        self.assertEqual(CV.compare_digests(digest(), digest(state=9), False), "state_mismatch")
 
     def test_rht_state_is_not_compared(self):
-        self.assertEqual(CV.compare_digests(digest(), digest(state=9, exact=False), self.sidecar(checkpoints=())),
-                         "")
+        self.assertEqual(CV.compare_digests(digest(), digest(state=9, exact=False), False), "")
 
     def test_a_checkpoint_bearing_file_compares_kv_only(self):
         # a fresh --session-out export holds no checkpoint, so its token/state digests are not comparable
-        self.assertEqual(CV.compare_digests(digest(), digest(tokens=9, state=9), self.sidecar()), "")
+        self.assertEqual(CV.compare_digests(digest(), digest(tokens=9, state=9), True), "")
 
 
 class DigestParsing(unittest.TestCase):
@@ -365,7 +387,7 @@ class CommandLine(TempDir):
         (self.cache / "strata-conv-b.sess").write_bytes(b"b" * 50)
         (self.cache / "strata-conv-b.meta").write_bytes(
             sidecar_bytes(ids=(1, 2, 3), checkpoints=(), last_used=22))
-        def generate(engine, config_args, extra_args, ids, ids_path, out_path, cwd, timeout):
+        def generate(engine, config_args, extra_args, ids, ids_path, out_path, cwd, timeout, env=None):
             self.assertEqual(list(ids), [1, 2, 3])           # the smallest file is the sample
             return CV.FreshRun(CV.Identity(MODEL, NEW_CONFIG), len(ids))
         def digest_run(tool, path, identity, timeout):
@@ -425,6 +447,60 @@ class CommandLine(TempDir):
                                        lambda *a: digest())
         self.assertEqual(code, 0)
         probe.assert_called_once()
+
+    def test_the_engine_runs_in_the_serving_engines_environment_and_cwd(self):
+        # R1 (docs/CACHE_REUSE_RULES.md): the server hands run() the environment and the working directory its own
+        # engine starts with (serve/server.py: child_env, cfg["cwd"]).  An engine in another environment - another
+        # card, other kernel switches, another library path - recomputes other K/V and would refuse a good file.
+        (self.cache / "strata-conv-a.sess").write_bytes(b"a" * 50)
+        (self.cache / "strata-conv-a.meta").write_bytes(sidecar_bytes(checkpoints=()))
+        cwd = self.root / "engine-cwd"
+        cwd.mkdir()
+        child_env = dict(os.environ, STRATA_PF_WMMA="0", LD_LIBRARY_PATH="/opt/engine/lib")
+        seen = {}
+        def generate(engine, config_args, extra_args, ids, ids_path, out_path, the_cwd, timeout, engine_env=None):
+            seen["cwd"], seen["env"] = the_cwd, engine_env
+            return CV.FreshRun(CV.Identity(MODEL, NEW_CONFIG), 3)
+        options = CV.build_parser().parse_args(self.base_args())
+        with mock.patch.object(CV, "run_generate", side_effect=generate), \
+                mock.patch.object(CV, "run_digest", side_effect=lambda *a: digest()):
+            self.assertEqual(CV.run(options, env=child_env, cwd=cwd), 0)
+        self.assertEqual(seen["cwd"], cwd)
+        self.assertEqual(seen["env"]["STRATA_PF_WMMA"], "0")
+        self.assertEqual(seen["env"]["LD_LIBRARY_PATH"], "/opt/engine/lib")
+
+    def test_the_build_probe_runs_in_the_engines_environment(self):
+        # the binary the server starts finds its libraries the way that engine does, not the way this process does
+        child_env = {"LD_LIBRARY_PATH": "/opt/engine/lib"}
+        with mock.patch.object(CV.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="strata 0.1.52.20\n", stderr="")
+            self.assertEqual(CV.probe_engine_build("/opt/engine/strata", env=child_env), "0.1.52.20")
+        self.assertEqual(run.call_args[1]["env"], child_env)
+
+    def test_flag_shaped_engine_arguments_reach_the_engine_command_line(self):
+        # serve/server.py passes the serving engine's own flags: "--engine-arg --kv" is two tokens and argparse
+        # refuses a flag-shaped value ("expected one argument", SystemExit 2, which is no Exception).  The equals
+        # form carries them, and they reach the engine's own command line unchanged and in order.
+        (self.cache / "strata-conv-a.sess").write_bytes(b"a" * 50)
+        (self.cache / "strata-conv-a.meta").write_bytes(sidecar_bytes(checkpoints=()))
+        argv = self.base_args() + ["--engine-arg=--conversation-cache-disk-only", "--engine-arg=--kv",
+                                   "--engine-arg=--max-context", "--engine-arg=131072"]
+        commands = []
+
+        def fake_run(command, **_kwargs):
+            Path(command[command.index("--session-out") + 1]).write_bytes(b"x" * 10)
+            commands.append(list(command))
+            return mock.Mock(returncode=0, stderr="",
+                             stdout=f"(model {MODEL:016x}, config {NEW_CONFIG:016x})\n--session-out: wrote 3 tokens\n")
+        with mock.patch.object(CV.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(CV, "run_digest", side_effect=lambda *a: digest()), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = CV.main(argv)
+        self.assertEqual(code, 0)
+        work = Path(self.work).resolve()
+        self.assertEqual(commands, [[str(self.engine), "--conversation-cache-disk-only", "--kv", "--max-context",
+                                     "131072", "--tokens-file", str(work / "strata-conv-a.ids"), "--max-new", "1",
+                                     "--greedy", "--session-out", str(work / "strata-conv-a.fresh.sess")]])
 
     def test_serve_in_the_passthrough_is_a_usage_error(self):
         code = CV.main(self.base_args() + ["--", "--serve"])
@@ -550,7 +626,7 @@ class CommandLine(TempDir):
         (self.cache / "strata-conv-a.sess").write_bytes(b"a" * 50)
         (self.cache / "strata-conv-a.meta").write_bytes(sidecar_bytes(checkpoints=()))
         seen = {}
-        def generate(engine, config_args, extra_args, ids, ids_path, out_path, cwd, timeout):
+        def generate(engine, config_args, extra_args, ids, ids_path, out_path, cwd, timeout, env=None):
             seen["args"] = config_args
             return CV.FreshRun(CV.Identity(MODEL, NEW_CONFIG), 3)
         code, _, text = self.run_main(self.base_args() + ["--engine-config", str(config)], generate,
@@ -560,5 +636,296 @@ class CommandLine(TempDir):
         self.assertNotIn("SECRET", text)
 
 
+def session_bytes(version=2, model=MODEL, config=OLD_CONFIG, ids=(11, 12, 13), layers=0,
+                  part_sizes=(4, 0, 0, 0, 0)):
+    """A session file a slot directory would hold (conversation_file.cpp): the 64-byte header with its checksum, the
+    geometry prefix, for v3 the K/V directory, then the live checkpoint's token ids.  The payload past the ids is
+    never read by this tool, so it is left empty and the header is sized to match."""
+    geo = struct.pack("<18q", *[100 + i for i in range(18)]) + struct.pack("<qq", 0, 48) + struct.pack("<Q", 0)
+    kv = b""
+    if version == 3:
+        kv += struct.pack("<Q", layers)
+        for _ in range(layers):
+            kv += struct.pack("<7q", 2, 1024, 2, 256, 64, 9, 128)
+            for size in part_sizes:
+                kv += struct.pack("<Q", size) + bytes(size)
+    body = struct.pack("<Q", len(ids)) + struct.pack(f"<{len(ids)}i", *ids)
+    payload = geo + kv + body
+    header = bytearray(64)
+    header[0:8] = CV.SESSION_MAGIC
+    struct.pack_into("<II", header, 8, version, CV.SESSION_HEADER)
+    struct.pack_into("<QQQ", header, 16, model, config, len(payload))
+    struct.pack_into("<QQ", header, 40, 0, 0)
+    struct.pack_into("<Q", header, 56, CV.session_hash64(bytes(header[:56]), 0))
+    return bytes(header) + payload + b"\x00" * CV.SESSION_TRAILER
+
+
+class SlotScan(TempDir):
+    """A --slot-dir: a .bin has no sidecar, so its identity and token count come from its own header."""
+
+    def write(self, name, **kwargs):
+        path = self.root / name
+        path.write_bytes(session_bytes(**kwargs))
+        return path
+
+    def test_identity_and_ids_come_from_the_header(self):
+        path = self.write("chat-1.bin", ids=(11, 12, 13))
+        files = CV.scan_slot_dir(self.root)
+        self.assertEqual([f.stem for f in files], ["chat-1.bin"])
+        self.assertEqual(files[0].skip, "")
+        self.assertEqual(files[0].source, CV.Identity(MODEL, OLD_CONFIG))
+        self.assertEqual(files[0].ids, (11, 12, 13))
+        self.assertEqual(files[0].bytes, path.stat().st_size)
+        self.assertEqual(files[0].path, path)
+        self.assertEqual(files[0].last_used, 0)
+        # a .bin usually holds the deepest checkpoint, and the count is not in the header: K/V only
+        self.assertTrue(files[0].has_checkpoints)
+
+    def test_a_v3_file_reads_its_ids_after_the_kv_directory(self):
+        self.write("chat-v3.bin", version=3, ids=(21, 22), layers=2, part_sizes=(4, 5, 6, 0, 0))
+        files = CV.scan_slot_dir(self.root)
+        self.assertEqual(files[0].skip, "", files[0].skip)
+        self.assertEqual(files[0].source, CV.Identity(MODEL, OLD_CONFIG))
+        self.assertEqual(files[0].ids, (21, 22))
+
+    def test_a_file_that_is_not_a_session_file_is_skipped(self):
+        (self.root / "notes.bin").write_bytes(b"not a session file, just a name that ends in .bin" * 4)
+        (self.root / "readme.txt").write_text("not scanned at all")
+        files = CV.scan_slot_dir(self.root)
+        self.assertEqual([f.stem for f in files], ["notes.bin"])
+        self.assertIn("magic", files[0].skip)
+
+    def test_a_bad_header_or_size_is_skipped(self):
+        good = bytearray(session_bytes())
+        corrupt = bytearray(good)
+        corrupt[20] ^= 0xFF                       # the model fingerprint, under the header's checksum
+        (self.root / "corrupt.bin").write_bytes(bytes(corrupt))
+        (self.root / "short.bin").write_bytes(bytes(good[:40]))
+        grown = session_bytes()
+        (self.root / "grown.bin").write_bytes(grown + b"x")   # the header no longer sizes the file
+        skipped = {f.stem: f.skip for f in CV.scan_slot_dir(self.root)}
+        self.assertIn("checksum", skipped["corrupt.bin"])
+        self.assertIn("smaller than its header", skipped["short.bin"])
+        self.assertIn("does not match its header", skipped["grown.bin"])
+
+    def test_a_name_that_cannot_go_in_the_ledger_is_skipped(self):
+        (self.root / "chat 1.bin").write_bytes(session_bytes())
+        files = CV.scan_slot_dir(self.root)
+        self.assertIn("whitespace", files[0].skip)
+
+    def test_slot_and_spill_files_group_together(self):
+        self.write("chat-1.bin", ids=(11, 12))
+        (self.root / "strata-conv-1.sess").write_bytes(b"x" * 20)
+        (self.root / "strata-conv-1.meta").write_bytes(sidecar_bytes(config=OLD_CONFIG, ids=(1, 2), checkpoints=()))
+        everything = CV.scan_cache_dir(self.root) + CV.scan_slot_dir(self.root)
+        groups = CV.group_by_source([f for f in everything if not f.skip])
+        self.assertEqual({f.stem for f in groups[CV.Identity(MODEL, OLD_CONFIG)]},
+                         {"chat-1.bin", "strata-conv-1"})
+
+
+class Pending(TempDir):
+    """pending_verification: does a start have to run the verification, and for which sources?"""
+
+    BUILD = "0.1.52.20"
+
+    def slots(self):
+        directory = self.root / "slots"
+        directory.mkdir(exist_ok=True)
+        return directory
+
+    def write_slot(self, name, config=OLD_CONFIG, model=MODEL):
+        (self.slots() / name).write_bytes(session_bytes(model=model, config=config))
+
+    def identity_batch(self, target=CV.Identity(MODEL, NEW_CONFIG), build=None):
+        return CV.GateBatch(CV.batch_id(target), target, target, build or self.BUILD, "-", True,
+                            int(time.time() * 1000))
+
+    def test_nothing_at_all_runs_nothing(self):
+        pending = CV.pending_verification(self.root, [self.slots()], self.BUILD)
+        self.assertFalse(pending.verify)
+        self.assertEqual(pending.sources, ())
+
+    def test_a_v3_file_of_another_config_is_pending_too(self):
+        (self.root / "strata-conv-1.sess").write_bytes(b"x" * 20)
+        (self.root / "strata-conv-1.meta").write_bytes(sidecar_bytes(version=3, origin=1, checkpoints=()))
+        pending = CV.pending_verification(self.root, [], self.BUILD)
+        self.assertTrue(pending.verify)
+        self.assertEqual(pending.sources, ((CV.Identity(MODEL, OLD_CONFIG), 1),))
+
+    def test_a_cache_directory_that_cannot_be_read_is_a_refusal_not_a_pass(self):
+        pending = CV.pending_verification(self.root / "gone", [], self.BUILD)
+        self.assertFalse(pending.verify)
+        self.assertTrue(pending.refused)                   # the start says so; silence would read as "checked"
+        self.assertIn("cannot read the cache directory", pending.detail)
+
+    def test_a_file_of_another_config_is_pending_until_the_ledger_names_this_build(self):
+        self.write_slot("chat-1.bin")
+        pending = CV.pending_verification(self.root, [self.slots()], self.BUILD)
+        self.assertTrue(pending.verify)
+        self.assertIsNone(pending.target)
+        self.assertEqual(pending.sources, ((CV.Identity(MODEL, OLD_CONFIG), 1),))
+
+    def test_a_ledger_of_another_build_proves_nothing(self):
+        self.write_slot("chat-1.bin")
+        CV.write_ledger(self.root, [self.identity_batch(build="0.1.51")], [])
+        pending = CV.pending_verification(self.root, [self.slots()], self.BUILD)
+        self.assertTrue(pending.verify)
+        self.assertIsNone(pending.target)
+
+    def test_the_identity_batch_alone_leaves_the_other_config_pending(self):
+        self.write_slot("chat-1.bin")
+        CV.write_ledger(self.root, [self.identity_batch()], [])
+        pending = CV.pending_verification(self.root, [self.slots()], self.BUILD)
+        self.assertTrue(pending.verify)
+        self.assertEqual(pending.target, CV.Identity(MODEL, NEW_CONFIG))
+
+    def test_a_passed_batch_settles_its_source(self):
+        self.write_slot("chat-1.bin")
+        batch = CV.GateBatch("b1", CV.Identity(MODEL, OLD_CONFIG), CV.Identity(MODEL, NEW_CONFIG), self.BUILD,
+                             "chat-1.bin", True, int(time.time() * 1000) + 1000)
+        CV.write_ledger(self.root, [batch], [CV.GateEntry("chat-1.bin", "b1", 1, 3, 0)])
+        self.assertFalse(CV.pending_verification(self.root, [self.slots()], self.BUILD).verify)
+
+    def test_a_failed_batch_settles_it_too_and_a_changed_file_does_not(self):
+        path = self.slots() / "chat-1.bin"
+        self.write_slot("chat-1.bin")
+        failed = CV.GateBatch("b1", CV.Identity(MODEL, OLD_CONFIG), CV.Identity(MODEL, NEW_CONFIG), self.BUILD,
+                              "chat-1.bin", False, int(time.time() * 1000) + 1000, "kv_mismatch")
+        CV.write_ledger(self.root, [failed], [])
+        self.assertFalse(CV.pending_verification(self.root, [self.slots()], self.BUILD).verify)
+        # a file rewritten after the run is not the file that was checked: the group is verified again
+        os.utime(path, (time.time() + 10, time.time() + 10))
+        pending = CV.pending_verification(self.root, [self.slots()], self.BUILD)
+        self.assertTrue(pending.verify)
+        self.assertEqual(pending.sources, ((CV.Identity(MODEL, OLD_CONFIG), 1),))
+
+    def test_a_foreign_model_is_never_pending(self):
+        self.write_slot("chat-1.bin", model=MODEL ^ 1)
+        CV.write_ledger(self.root, [self.identity_batch()], [])
+        self.assertFalse(CV.pending_verification(self.root, [self.slots()], self.BUILD).verify)
+
+    def test_this_identitys_own_files_need_no_gate(self):
+        self.write_slot("chat-1.bin", config=NEW_CONFIG)
+        CV.write_ledger(self.root, [self.identity_batch()], [])
+        self.assertFalse(CV.pending_verification(self.root, [self.slots()], self.BUILD).verify)
+
+    def test_a_malformed_ledger_is_not_an_error(self):
+        self.write_slot("chat-1.bin")
+        (self.root / CV.GATE_NAME).write_bytes(b"strata-cache-gate 1\ngarbage\n")
+        pending = CV.pending_verification(self.root, [self.slots()], self.BUILD)
+        self.assertTrue(pending.verify)          # approves nothing, so the run starts a fresh ledger
+
+
+class IdentityBatch(unittest.TestCase):
+    def test_it_replaces_older_ones_and_leaves_the_others(self):
+        target = CV.Identity(MODEL, NEW_CONFIG)
+        old = CV.GateBatch("bold", CV.Identity(7, 8), CV.Identity(7, 8), "0.1.51", "-", True, 1)
+        foreign = CV.GateBatch("bf", CV.Identity(MODEL, OLD_CONFIG), target, "0.1.52.20", "s", True, 2)
+        batches = CV.with_identity_batch([old, foreign], target, "0.1.52.20", "chat-1.bin")
+        self.assertEqual({b.id for b in batches}, {"bf", CV.batch_id(target)})
+        identity = [b for b in batches if b.source == b.target]
+        self.assertEqual(len(identity), 1)
+        self.assertEqual((identity[0].target, identity[0].engine_build, identity[0].sample),
+                         (target, "0.1.52.20", "chat-1.bin"))
+        self.assertTrue(identity[0].passed)
+        self.assertEqual(CV.current_identity(batches, "0.1.52.20"), target)
+        self.assertIsNone(CV.current_identity([old], "0.1.52.20"))
+
+
+class SlotCommandLine(TempDir):
+    """The tool against a slot directory: the same ledger, rows keyed by the .bin's own name."""
+
+    def setUp(self):
+        super().setUp()
+        self.engine = self.root / "engine"
+        self.engine.write_text("#!/bin/sh\n")
+        self.engine.chmod(0o755)
+        self.digest_tool = self.root / "digest"
+        self.digest_tool.write_text("#!/bin/sh\n")
+        self.digest_tool.chmod(0o755)
+        self.cache = self.root / "cache"
+        self.cache.mkdir()
+        self.slots = self.root / "slots"
+        self.slots.mkdir()
+        self.work = self.root / "work"
+        patcher = mock.patch.object(CV, "resolve_executable", side_effect=lambda value, what: value)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def args(self, *extra):
+        return ["--cache-dir", str(self.cache), "--slot-dir", str(self.slots), "--engine", str(self.engine),
+                "--digest-tool", str(self.digest_tool), "--engine-build", "0.1.52.20", "--work-dir", str(self.work),
+                *extra]
+
+    def run_main(self, argv, generate, digest_run):
+        out = io.StringIO()
+        with mock.patch.object(CV, "run_generate", side_effect=generate) as gen, \
+                mock.patch.object(CV, "run_digest", side_effect=digest_run), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = CV.main(argv)
+        return code, gen, out.getvalue()
+
+    def test_a_slot_file_is_sampled_and_written_under_its_own_name(self):
+        path = self.slots / "chat-1.bin"
+        path.write_bytes(session_bytes(ids=(11, 12, 13)))
+        def generate(engine, config_args, extra_args, ids, ids_path, out_path, cwd, timeout, env=None):
+            self.assertEqual(list(ids), [11, 12, 13])
+            return CV.FreshRun(CV.Identity(MODEL, NEW_CONFIG), len(ids))
+        code, gen, text = self.run_main(self.args(), generate, lambda *a: digest())
+        self.assertEqual(code, 0, text)
+        self.assertEqual(gen.call_count, 1)
+        batches, entries = CV.read_ledger(self.cache)
+        self.assertEqual(len(batches), 1)                     # a learned identity that verified needs no marker
+        self.assertEqual(batches[0].source, CV.Identity(MODEL, OLD_CONFIG))
+        self.assertEqual(batches[0].target, CV.Identity(MODEL, NEW_CONFIG))
+        self.assertEqual(batches[0].sample, "chat-1.bin")
+        self.assertEqual([(e.stem, e.file_bytes, e.tokens) for e in entries],
+                         [("chat-1.bin", path.stat().st_size, 3)])
+
+    def test_the_stem_is_the_whole_file_name_extension_included(self):
+        path = self.slots / "strata-conv-1.bin"               # the same base name a spill entry would have
+        path.write_bytes(session_bytes(ids=(11, 12)))
+        code, _, text = self.run_main(self.args(), lambda *a: CV.FreshRun(CV.Identity(MODEL, NEW_CONFIG), 2),
+                                      lambda *a: digest())
+        self.assertEqual(code, 0, text)
+        _, entries = CV.read_ledger(self.cache)
+        self.assertEqual([e.stem for e in entries], ["strata-conv-1.bin"])
+
+    def test_a_run_that_learned_the_identity_and_verified_nothing_records_it(self):
+        # every file is this engine's own: no batch is written, so the ledger has to record the identity instead,
+        # or the next start would load the engine again to learn it
+        (self.slots / "chat-1.bin").write_bytes(session_bytes(ids=(11, 12), config=NEW_CONFIG))
+        code, gen, text = self.run_main(self.args(), lambda *a: CV.FreshRun(CV.Identity(MODEL, NEW_CONFIG), 2),
+                                        lambda *a: digest())
+        self.assertEqual(code, 0, text)
+        self.assertEqual(gen.call_count, 1)                    # the identity is learned from one export
+        batches, _ = CV.read_ledger(self.cache)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual((batches[0].source, batches[0].target), (CV.Identity(MODEL, NEW_CONFIG),
+                                                                 CV.Identity(MODEL, NEW_CONFIG)))
+        self.assertEqual(CV.current_identity(batches, "0.1.52.20"), CV.Identity(MODEL, NEW_CONFIG))
+        # and with that record a start sees there is nothing to verify, so it starts no engine at all
+        self.assertFalse(CV.pending_verification(self.cache, [self.slots], "0.1.52.20").verify)
+
+    def test_a_slot_dir_that_is_the_cache_dir_is_a_usage_error(self):
+        argv = ["--cache-dir", str(self.cache), "--slot-dir", str(self.cache), "--engine", str(self.engine)]
+        self.assertEqual(CV.main(argv), 2)
+
+    def test_work_dir_inside_a_slot_dir_is_a_usage_error(self):
+        argv = self.args()
+        argv[argv.index("--work-dir") + 1] = str(self.slots / "work")
+        self.assertEqual(CV.main(argv), 2)
+
+    def test_dry_run_starts_nothing_and_writes_nothing(self):
+        (self.slots / "chat-1.bin").write_bytes(session_bytes(ids=(11, 12)))
+        code, gen, text = self.run_main(self.args("--target-model", hex(MODEL), "--target-config", hex(NEW_CONFIG),
+                                                  "--dry-run"), mock.Mock(), lambda *a: digest())
+        self.assertEqual(code, 0, text)
+        self.assertEqual(gen.call_count, 0)
+        self.assertIn("sample=chat-1.bin", text)
+        self.assertFalse((self.cache / CV.GATE_NAME).exists())
+
+
 if __name__ == "__main__":
     unittest.main()
+

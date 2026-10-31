@@ -117,7 +117,10 @@ public:
     // Opens (creating if needed) the spill directory and indexes conversations already in it. Left-over write
     // temporaries and incomplete owned groups are cleaned when possible; a partial cleanup is retained only as an
     // ineligible accounting entry. Files whose sidecar names another model/config identity are KEPT: never deleted,
-    // not indexed, outside the disk budget; open() logs a warning with their count and bytes - remove them manually.
+    // not indexed, outside the disk budget; open() logs a warning with their count and bytes.  With the gate on the
+    // warning splits in two (R1/R2 of docs/CACHE_REUSE_RULES.md): a file of another model, which the ledger never
+    // approves, and one of another configuration of this model, which is reported without any advice to delete it
+    // because the startup's recompute verifies it first (gate_identity_approved / gate_entry_approved).
     // delta_chains (--conversation-cache-disk-delta) selects what NEW files look like: with it, saves stamp their
     // sidecar v2 (last-use stamp) and the budget evicts least-recently-used; without it (the default) new sidecars
     // stay baseline v1 and first-spilled eviction runs. Both modes read v1/v2 sidecars; a valid chain is retained and
@@ -128,8 +131,16 @@ public:
     // approves nothing and leaves the rest of the cache unaffected; its reason is kept for gate_error().  A
     // gate-approved entry is READ-ONLY: reserve_delta (and so spill_delta) refuses it, since an appended record would
     // hold this cache's bytes after a file of the other configuration - such a conversation is written as a new file.
+    // origin_split (--conversation-cache-origin-split, opt-in, default off): a session-file conversation is refused
+    // by every write entry point (spill, spill_streamed, reserve_streamed, spill_delta, reserve_delta, each guarding
+    // itself) and a sidecar that names one is removed when the directory is opened.  The sidecar format is unchanged
+    // unless a tagged (non-ordinary) conversation is written: v1/v2 stay exactly as they were, and the tag goes in a v3
+    // sidecar.  This build reads v3 with the flag on or off, so a switch of the flag keeps the files; a build older
+    // than v3 (one that reads only v1/v2) fails to parse a v3 sidecar and deletes it, so going back to such a build
+    // loses the tagged copies on disk (their conversations are then read from their own .bin, or computed again).
     bool open(const std::filesystem::path& directory, SessionFileIdentity identity, uint64_t budget_bytes,
-              std::string& error, bool delta_chains = false, const ConversationSpillGateOptions& gate = {});
+              std::string& error, bool delta_chains = false, const ConversationSpillGateOptions& gate = {},
+              bool origin_split = false);
     bool enabled() const { return enabled_; }
     size_t size() const { return entries_.size(); }
     uint64_t bytes() const { return bytes_; }
@@ -140,6 +151,20 @@ public:
     size_t gate_batch_count() const { return gate_batches_.size(); }
     size_t gate_approved_count() const;
     const std::string& gate_error() const { return gate_error_; }
+    // The gate's two queries, for a spill entry AND for a session file the slot RESTORE path reads out of its own
+    // directory: one ledger and one rule for both (docs/CACHE_REUSE_RULES.md R3 - the same read, the same ledger, the
+    // same verification; only the directory and the name differ).  `stem` is the file's own name in that directory,
+    // extension included ("chat-1.bin"); a spill's stem carries none ("strata-conv-34"), so the two names differ
+    // unless a client saved a conversation under a name without an extension (the slot API writes the name as
+    // given) - and a row approves only a file of the same size, live token count and source identity.
+    // Neither ever approves a foreign MODEL.
+    // identity-level: a passing batch for exactly this source identity -> this cache's identity and engine build.
+    // False when the gate is off or the ledger approved nothing.
+    bool gate_identity_approved(const SessionFileIdentity& source) const;
+    // entry-level: a ledger row for this stem whose batch also passes (identity + build), and the row's size and
+    // token count match the file's (which stay authoritative).
+    bool gate_entry_approved(const std::string& stem, const SessionFileIdentity& source, uint64_t file_bytes,
+                             int64_t tokens) const;
 
     // The best resume this directory offers for the prompt, from the sidecars only (no K/V read). similarity and
     // n_min filter weak hits exactly as the RAM cache's best() does.
@@ -233,6 +258,9 @@ public:
     void touch(const std::string& path);
     // The entry's persisted last-use stamp in milliseconds since the epoch (0: a v1 sidecar, unknown age).
     uint64_t entry_last_used(size_t index) const;
+    // The origin tag its sidecar carries (--conversation-cache-origin-split): ordinary for an untagged (v1/v2) entry
+    // and for an unknown index.
+    ConversationOrigin entry_origin(size_t index) const;
     // A prefix entry holding exactly these tokens (and images) is on disk already.
     bool has_prefix(const ConversationIds& ids, const std::vector<ConversationImageKey>& images, bool cvec) const;
     size_t prefix_count() const;
@@ -261,6 +289,8 @@ private:
         bool cvec = true;
         ConversationCheckpoint live_meta;    // ids + imgs only; no running state
         std::vector<size_t> checkpoint_lengths;
+        // --conversation-cache-origin-split: the tag its v3 sidecar carries (ordinary for every v1/v2 sidecar)
+        ConversationOrigin origin = ConversationOrigin::ordinary;
         bool prefix = false;                 // a persistent root entry (named strata-conv-prefix-N)
         bool has_chain = false;              // a log/manifest exists or this entry has published a chain
         bool complete = true;                // false while owned files are partial/unusable; retained for accounting
@@ -277,13 +307,6 @@ private:
     // a false result retains an incomplete, ineligible entry with exact remaining ownership charges for retry.
     bool remove_group(Entry& entry, uint64_t& removed, std::vector<std::string>& left);
     std::filesystem::path next_stem(bool prefix = false);
-    // The gate's identity-level approval: a passed batch for exactly this source identity -> this cache's identity
-    // and the configured engine build.  False when the gate is off or the ledger approved nothing.
-    bool gate_identity_approved(const SessionFileIdentity& source) const;
-    // The gate's entry-level approval: a ledger row for this stem whose batch also passes (identity + build), and
-    // the row's size and token count match the file and sidecar (which stay authoritative).
-    bool gate_entry_approved(const std::string& stem, const SessionFileIdentity& source, uint64_t file_bytes,
-                             int64_t tokens) const;
     bool index_written(const std::filesystem::path& stem, uint64_t file_bytes, const SavedConversation& meta,
                        std::string& error, bool prefix = false);
     bool read_sidecar(const std::filesystem::path& meta, Entry& entry, bool& other_identity,
@@ -306,6 +329,8 @@ private:
     std::vector<Entry> entries_;   // index order only; the budget evicts by Entry::last_used (least recent first)
                                    // when delta_chains is on, else first-spilled first (the baseline policy)
     bool delta_ = false;           // --conversation-cache-disk-delta: v2 sidecars, LRU eviction, chain appends
+    bool origin_split_ = false;    // --conversation-cache-origin-split: a session-file conversation is never spilled,
+                                   // and a non-ordinary tag is written in a v3 sidecar (see open)
     bool gate_ = false;            // the opt-in recompute gate: the ledger below may approve foreign-config entries
     std::string gate_engine_build_;
     std::vector<ConversationSpillGateBatch> gate_batches_;

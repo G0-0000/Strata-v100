@@ -37,7 +37,13 @@ namespace strata::core {
 namespace {
 
 constexpr char kMetaMagic[4] = {'S', 'C', 'S', 'M'};   // Strata conversation-spill metadata
-constexpr uint32_t kMetaVersion = 2;                   // v1 (read for compatibility) has no last_used field
+// v1 (read for compatibility) has no last_used field; v2 adds it; v3 is v2 plus the conversation's origin tag (so
+// it always carries the stamp too), and is written only for a tagged (non-ordinary) conversation with
+// --conversation-cache-origin-split on, so a build without the flag writes the same bytes it always did.  A reader
+// of any version accepts every older one.
+constexpr uint32_t kMetaVersionStamped = 2;
+constexpr uint32_t kMetaVersionOrigin = 3;
+constexpr uint32_t kMetaVersion = kMetaVersionOrigin;
 constexpr uint32_t kMetaVersionMin = 1;
 constexpr size_t kMaxSidecarEntries = 256;
 
@@ -266,7 +272,7 @@ bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Ent
         version < kMetaVersionMin || version > kMetaVersion || !r.u64(model) || !r.u64(config)) {
         error = "unknown spill sidecar magic or version"; return false;
     }
-    stamped = version >= kMetaVersion;   // the v2 sidecar carries the persisted last-use stamp
+    stamped = version >= kMetaVersionStamped;   // the v2 sidecar carries the persisted last-use stamp
     entry.source_identity = {model, config};
     const bool foreign_config = config != identity_.config;
     // Another MODEL is never approved.  Another CONFIGURATION is parsed only when the gate's ledger holds a passed
@@ -293,7 +299,17 @@ bool ConversationSpillCache::read_sidecar(const std::filesystem::path& meta, Ent
     entry.checkpoint_lengths.reserve((size_t) n);
     for (uint64_t i = 0; i < n; ++i) { uint64_t len = 0; if (!r.u64(len)) { error = "truncated sidecar checkpoints"; return false; } entry.checkpoint_lengths.push_back((size_t) len); }
     entry.last_used = 0;   // a v1 sidecar predates the stamp: the unknown age sorts as the oldest
-    if (version >= 2 && !r.u64(entry.last_used)) { error = "truncated sidecar last-use stamp"; return false; }
+    entry.origin = ConversationOrigin::ordinary;   // (v1/v2: untagged) --conversation-cache-origin-split
+    if (version >= kMetaVersionStamped && !r.u64(entry.last_used)) {
+        error = "truncated sidecar last-use stamp"; return false;
+    }
+    if (version >= kMetaVersionOrigin) {
+        uint64_t origin = 0;
+        if (!r.u64(origin) || origin > (uint64_t) ConversationOrigin::disk_restore) {
+            error = "invalid conversation origin in sidecar"; return false;
+        }
+        entry.origin = (ConversationOrigin) origin;
+    }
     if (!r.finish()) { error = "spill sidecar checksum or length mismatch"; return false; }
     if (!valid_meta_chain(entry.live_meta, entry.checkpoint_lengths)) { error = "spill sidecar is not a valid prefix chain"; return false; }
     if (foreign_config) {
@@ -318,8 +334,13 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
         // and stamping this cache's model/config would forge the file's identity on the next open (touch() rewrites
         // the sidecar on every hit), letting it be read after a restart without the ledger.  A new entry has
         // source_identity = identity_ (index_written), so its bytes are unchanged.
+        // --conversation-cache-origin-split: only a TAGGED conversation gets the v3 sidecar (the origin after the
+        // last-use stamp); every ordinary file keeps the exact bytes a build without the flag writes.
+        const bool tag_origin = origin_split_ && entry.origin != ConversationOrigin::ordinary;
+        const uint64_t version = tag_origin ? kMetaVersionOrigin
+                                            : (with_last_used ? kMetaVersionStamped : kMetaVersionMin);
         if (!w.raw(kMetaMagic, 4) ||
-            !w.u64(with_last_used ? kMetaVersion : kMetaVersionMin) || !w.u64(entry.source_identity.model) ||
+            !w.u64(version) || !w.u64(entry.source_identity.model) ||
             !w.u64(entry.source_identity.config) || !w.u64(entry.cvec ? 1 : 0) || !w.u64(entry.live_meta.ids.size())) {
             error = "cannot write spill sidecar"; return false;
         }
@@ -328,7 +349,9 @@ bool ConversationSpillCache::write_sidecar(const std::filesystem::path& meta, co
         for (const auto& k : entry.live_meta.imgs) if (!w.i64(k.start) || !w.u64(k.hash)) { error = "cannot write spill sidecar images"; return false; }
         if (!w.u64(entry.checkpoint_lengths.size())) { error = "cannot write spill sidecar"; return false; }
         for (size_t len : entry.checkpoint_lengths) if (!w.u64(len)) { error = "cannot write spill sidecar checkpoints"; return false; }
-        if (with_last_used && !w.u64(entry.last_used)) { error = "cannot write spill sidecar last-use stamp"; return false; }
+        const bool write_stamp = tag_origin || with_last_used;
+        if (write_stamp && !w.u64(entry.last_used)) { error = "cannot write spill sidecar last-use stamp"; return false; }
+        if (tag_origin && !w.u64((uint64_t) entry.origin)) { error = "cannot write spill sidecar origin"; return false; }
         if (!w.finish()) { error = "cannot finish spill sidecar"; return false; }
     }
     const std::string bytes = payload.str();
@@ -572,7 +595,7 @@ bool session_spill_gate_approves(const std::vector<ConversationSpillGateBatch>& 
 
 bool ConversationSpillCache::open(const std::filesystem::path& directory, SessionFileIdentity identity,
                                   uint64_t budget_bytes, std::string& error, bool delta_chains,
-                                  const ConversationSpillGateOptions& gate) {
+                                  const ConversationSpillGateOptions& gate, bool origin_split) {
     enabled_ = false;
     stale_files_wiped_ = 0;
     disk_evictions_ = 0;
@@ -580,6 +603,7 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
     bytes_ = 0;
     pinned_path_.clear();
     delta_ = delta_chains;
+    origin_split_ = origin_split;
     gate_ = gate.enabled;
     gate_engine_build_ = gate.engine_build;
     gate_batches_.clear();
@@ -636,8 +660,13 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
         if (ec) { error = "cannot scan spill directory " + directory_.string(); return false; }
         std::sort(metas.begin(), metas.end());
         size_t stale = stale_files_wiped_;
-        size_t foreign = 0;
+        size_t foreign = 0;              // another MODEL: never approved, with or without the gate
         uint64_t foreign_bytes = 0;
+        // The gate is on: same model, another CONFIGURATION, not approved by the ledger (yet).  R2 of
+        // docs/CACHE_REUSE_RULES.md keeps these out of the refusal until the recompute has run, so they are counted
+        // apart and reported without any advice to delete them.  Never used with the gate off.
+        size_t unverified = 0;
+        uint64_t unverified_bytes = 0;
         auto initialize_unparsed_entry = [&](Entry& entry, const PathInfo& meta_info) {
             const PathInfo session = inspect_path_nofollow(entry.session_path());
             const PathInfo dlog = inspect_path_nofollow(entry.delta_path());
@@ -677,14 +706,27 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
                 if (other_identity) {
                     // A foreign identity is kept, not indexed and outside this identity's budget. Count only regular
                     // files without following links so the warning never attributes an external target to this cache.
-                    ++foreign;
+                    // With the gate on, a same-model/other-config file is not a foreign identity to be removed: it
+                    // is a candidate for the startup's recompute (R1/R2), so it gets its own count and no advice.
+                    const bool another_config = gate_ && entry.source_identity.model == identity_.model;
+                    ++(another_config ? unverified : foreign);
                     for (const auto& path : {entry.session_path(), meta.string(), entry.delta_path(), entry.chain_path()}) {
                         const PathInfo info = inspect_path_nofollow(path);
-                        if (info.regular) foreign_bytes += info.bytes;
+                        if (info.regular) (another_config ? unverified_bytes : foreign_bytes) += info.bytes;
                     }
                     continue;
                 }
                 initialize_unparsed_entry(entry, meta_info);
+                clean_or_retain(entry);
+                continue;
+            }
+            // --conversation-cache-origin-split: this directory holds ordinary conversations only.  A sidecar that
+            // names a session-file conversation (written by no build's ordinary path, but the rule is the rule) is
+            // removed here, its data with it: the client's .bin is that conversation's copy.
+            if (entry.origin == ConversationOrigin::session_file) {
+                initialize_unparsed_entry(entry, meta_info);
+                std::fprintf(stderr, "strata serve: conversation cache: removing the spill copy of a session-file "
+                                     "conversation: %s\n", entry.stem.string().c_str());
                 clean_or_retain(entry);
                 continue;
             }
@@ -778,13 +820,28 @@ bool ConversationSpillCache::open(const std::filesystem::path& directory, Sessio
             entry.has_chain = dlog.exists || chain.exists;
             clean_or_retain(entry);
         }
-        if (foreign > 0)
-            std::fprintf(stderr, "strata serve: conversation cache: WARNING: %zu spill file(s) (~%llu MiB) belong to "
-                                 "another model/config identity: kept on disk, not indexed and outside the disk "
-                                 "budget; remove them manually, e.g.\n"
-                                 "  rm -f %s/strata-conv-*.sess %s/strata-conv-*.meta\n",
-                         foreign, (unsigned long long) (foreign_bytes >> 20),
-                         directory_.string().c_str(), directory_.string().c_str());
+        if (foreign > 0) {
+            // The gate is off: this line and its advice are exactly what a build without the gate prints.  The gate
+            // is on: another model is never approved, so there is no verification to wait for - and R2 forbids
+            // suggesting a deletion, so the line names the facts only.
+            if (gate_)
+                std::fprintf(stderr, "strata serve: conversation cache: WARNING: %zu spill file(s) (~%llu MiB) belong "
+                                     "to another model: kept on disk, not indexed and outside the disk budget; a "
+                                     "foreign model is never approved\n",
+                             foreign, (unsigned long long) (foreign_bytes >> 20));
+            else
+                std::fprintf(stderr, "strata serve: conversation cache: WARNING: %zu spill file(s) (~%llu MiB) belong to "
+                                     "another model/config identity: kept on disk, not indexed and outside the disk "
+                                     "budget; remove them manually, e.g.\n"
+                                     "  rm -f %s/strata-conv-*.sess %s/strata-conv-*.meta\n",
+                             foreign, (unsigned long long) (foreign_bytes >> 20),
+                             directory_.string().c_str(), directory_.string().c_str());
+        }
+        if (unverified > 0)
+            std::fprintf(stderr, "strata serve: conversation cache: %zu spill file(s) (~%llu MiB) are of another "
+                                 "engine configuration of this model: kept on disk and not indexed until the recompute "
+                                 "gate approves them\n",
+                         unverified, (unsigned long long) (unverified_bytes >> 20));
         enabled_ = true;
         enforce_budget();
         stale_files_wiped_ = stale;
@@ -843,7 +900,12 @@ bool ConversationSpillCache::load(const std::string& path, SavedConversation& im
     SessionReadLimits accepted = limits;
     const SessionFileIdentity source = entries_[index].source_identity;
     if (source.config != identity_.config) accepted.accept_config = source.config;
-    return session_file_read(path, identity_, image, bytes, error, accepted, status);
+    if (!session_file_read(path, identity_, image, bytes, error, accepted, status)) return false;
+    // --conversation-cache-origin-split: where this conversation's state came from, for the log and the eviction
+    // policy (a disk restore is ordinary: it spills again like any other).
+    image.origin = entries_[index].origin == ConversationOrigin::ordinary ? ConversationOrigin::disk_restore
+                                                                         : entries_[index].origin;
+    return true;
 }
 
 std::filesystem::path ConversationSpillCache::next_stem(bool prefix) {
@@ -869,6 +931,7 @@ bool ConversationSpillCache::index_written(const std::filesystem::path& stem, ui
     entry.last_used = delta_ ? now_ms() : 0;   // a save is the newest use; delta-off writes the baseline v1 sidecar,
                                                // which carries no stamp, so the entry stays at the unknown age
     entry.prefix = prefix;
+    entry.origin = meta.origin;   // --conversation-cache-origin-split (ordinary unless something tagged it)
     entry.cvec = meta.cvec;
     entry.live_meta.ids = meta.live.ids;
     entry.live_meta.imgs = meta.live.imgs;
@@ -898,6 +961,11 @@ bool ConversationSpillCache::index_written(const std::filesystem::path& stem, ui
 
 bool ConversationSpillCache::spill(const SavedConversation& image, std::string& error) {
     if (!enabled_) return false;
+    // --conversation-cache-origin-split: a session-file conversation's .bin is its copy; nothing is written, and (the
+    // check is first) no existing entry is touched.
+    if (!conversation_origin_spills(image.origin)) {
+        error = "a session-file conversation is never spilled"; return false;
+    }
     if (image.live.ids.empty() || !image.stage_images.empty()) { error = "spill needs a single-GPU conversation"; return false; }
     std::error_code ec;
     const std::filesystem::path stem = next_stem();
@@ -917,6 +985,9 @@ bool ConversationSpillCache::reserve_streamed(const SavedConversation& meta, Con
                                               std::string& error, bool prefix) {
     target = {};
     if (!enabled_) return false;
+    if (!conversation_origin_spills(meta.origin)) {
+        error = "a session-file conversation is never spilled"; return false;
+    }
     if (meta.live.ids.empty() || !meta.stage_images.empty() || !meta.kv.empty()) {
         error = "a streamed spill needs a single-GPU conversation without a host K/V image"; return false;
     }
@@ -942,6 +1013,11 @@ bool ConversationSpillCache::spill_streamed(const SavedConversation& meta, const
                                             bool state_ref, bool state_codec_rht, SessionWriteTimings* timings,
                                             bool layout_v3) {
     bytes = 0;
+    // --conversation-cache-origin-split: the guard is here as well as in reserve_streamed, so no caller added later
+    // can write a session-file conversation's state to the disk (its .bin is that conversation's copy).
+    if (!conversation_origin_spills(meta.origin)) {
+        error = "a session-file conversation is never spilled"; return false;
+    }
     ConversationSpillWrite target;
     if (!reserve_streamed(meta, target, error, prefix)) return false;
     std::error_code ec;
@@ -1256,6 +1332,9 @@ bool ConversationSpillCache::reserve_delta(size_t index, ConversationSpillDeltaW
     if (!delta_) { error = "delta chains are off"; return false; }
     Entry& entry = entries_[index];
     if (entry.prefix) { error = "a prefix entry has no delta chain"; return false; }
+    if (!conversation_origin_spills(entry.origin)) {
+        error = "a session-file conversation has no delta chain"; return false;
+    }
     // An entry of another engine configuration is a gate-approved READ-ONLY file: its K/V was computed under that
     // config and a record appended here would carry this config's bytes behind them, so the chain would no longer be
     // the one the ledger approved.  Such a conversation is saved as a new file under this cache's identity instead.
@@ -1378,6 +1457,11 @@ bool ConversationSpillCache::spill_delta(size_t index, const SavedConversation& 
                                          size_t& bytes, std::string& error, bool durable, bool state_codec_rht,
                                          SessionWriteTimings* timings, bool layout_v3) {
     bytes = 0;
+    // --conversation-cache-origin-split: the same refusal as reserve_delta's, at this entry too: an appended record
+    // would put a session-file conversation's state on disk under an entry that is not its copy.
+    if (!conversation_origin_spills(meta.origin)) {
+        error = "a session-file conversation is never spilled"; return false;
+    }
     try {
         ConversationSpillDeltaWrite target;
         if (!reserve_delta(index, target, error)) return false;
@@ -1466,6 +1550,10 @@ void ConversationSpillCache::touch(const std::string& path) {
 
 uint64_t ConversationSpillCache::entry_last_used(size_t index) const {
     return index < entries_.size() ? entries_[index].last_used : 0;
+}
+
+ConversationOrigin ConversationSpillCache::entry_origin(size_t index) const {
+    return index < entries_.size() ? entries_[index].origin : ConversationOrigin::ordinary;
 }
 
 bool ConversationSpillCache::entry_info(size_t index, int64_t& tokens, int64_t& deepest, uint64_t& base_bytes,

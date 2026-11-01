@@ -888,6 +888,7 @@ struct Options {
     int64_t conversation_cache_min_free_mib = 2560;
     /// --serve: outgoing WRITE 最小 token 数；同时作为自动读取阈值的旧单值兼容形式。
     int64_t conversation_cache_min_tokens = 0;
+    int64_t conversation_cache_min_delta_tokens = 0;
     /// --serve: 自动读取驻留会话的最小完整输入 token 数；0 表示不限制。
     int64_t conversation_cache_min_read_tokens = 0;
     /// --serve: park only after the conversation has advanced this many tokens past the copy it would supersede.
@@ -1103,6 +1104,8 @@ void usage() {
                   "                       自动读取驻留 RAM/磁盘会话的最小完整输入长度（含缓存历史，不是未缓存尾段）；\n"
                   "                       低于 READ 时仍复用活动会话/检查点/缓存槽，且不影响符合 WRITE 的离开会话保存。\n"
                   "                       单值等同 WRITE,0；默认 0,0，逗号为 ASCII 逗号。\n"
+                 "  --conversation-cache-min-delta-tokens N  --serve: skip disk-only switch saves when the unsaved\n"
+                 "                       tail is shorter than N tokens (default 0 = off)\n"
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
@@ -3379,7 +3382,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" ||
-                 a == "--conversation-cache-park-gain" ||
+                 a == "--conversation-cache-park-gain" || a == "--conversation-cache-min-delta-tokens" ||
                  a == "--session-min-free-mib" || a == "--memory-limit-mib" ||
                  a == "--conversation-cache-disk-mib" || a == "--conversation-cache-n-min") {
             const std::string value = next(a.c_str());
@@ -3387,7 +3390,8 @@ int main(int argc, char** argv) {
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-park-gain")
                                       ? INT32_MAX
-                                      : a == "--conversation-cache-n-min" ? INT64_MAX : INT64_MAX / (1024 * 1024);
+                                      : (a == "--conversation-cache-n-min" || a == "--conversation-cache-min-delta-tokens")
+                                            ? INT64_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
                 return 2;
@@ -3395,6 +3399,7 @@ int main(int argc, char** argv) {
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
+            else if (a == "--conversation-cache-min-delta-tokens") o.conversation_cache_min_delta_tokens = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--conversation-cache-slots") o.conversation_cache_slots = (int) number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
@@ -10907,6 +10912,9 @@ int main(int argc, char** argv) {
         // --conversation-cache-disk-only opens the disk tier without a RAM cache (single GPU, no --batch / peer)
         const bool disk_only = o.serve && o.conversation_cache_disk_only && stages.empty() && !multi_gpu &&
                                o.batch <= 0 && o.peer_device < 1;
+        if (o.serve && o.conversation_cache_min_delta_tokens > 0 && !disk_only)
+            std::fprintf(stderr, "strata serve: warning: --conversation-cache-min-delta-tokens needs "
+                                 "--conversation-cache-disk-only; it is off\n");
         if (o.serve && o.conversation_cache_disk_only && !disk_only)
             std::fprintf(stderr, "strata serve: conversation cache: --conversation-cache-disk-only is single-GPU without "
                                  "--batch or --peer-device; it is off\n");
@@ -11762,6 +11770,26 @@ int main(int argc, char** argv) {
                                  live.size(), (long long) o.conversation_cache_min_tokens,
                                  (size_t) (conversation_spill.bytes() >> 20), conversation_spill.size());
                     return true;
+                }
+                if (!disk_continuing && conversation_spill.enabled() && live_ok &&
+                    o.conversation_cache_min_delta_tokens > 0 && disk_kv_prefix > 0 &&
+                    !disk_chain_path.empty() && disk_kv_prefix <= (int64_t) live.size() &&
+                    (int64_t) live.size() - disk_kv_prefix < o.conversation_cache_min_delta_tokens) {
+                    const size_t index = conversation_spill.find(disk_chain_path);
+                    int64_t chain_tokens = 0, chain_deepest = 0;
+                    uint64_t base_bytes = 0, chain_delta = 0;
+                    bool chain_prefix = true;
+                    std::string chain_path;
+                    if (conversation_spill.entry_info(index, chain_tokens, chain_deepest, base_bytes, chain_delta,
+                                                      chain_prefix, chain_path) &&
+                        !chain_prefix && disk_kv_prefix <= chain_tokens &&
+                        conversation_spill.entry_matches_prefix(index, live, (size_t) disk_kv_prefix, live_imgs)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip disk save (%lld tail tokens, "
+                                             "below %lld; chain=%s)\n",
+                                     (long long) ((int64_t) live.size() - disk_kv_prefix),
+                                     (long long) o.conversation_cache_min_delta_tokens, disk_chain_path.c_str());
+                        return true;
+                    }
                 }
                 if (!disk_continuing) disk_save_live(false, "switch");
                 return true;

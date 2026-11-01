@@ -901,6 +901,9 @@ turn of the same conversation (it resumes at the newest turn checkpoint) writes 
 `--conversation-cache-min-tokens WRITE[,READ]` gates switch-time disk saves and the clean-shutdown flush using the
 outgoing conversation length. `READ` gates only automatic parked-session lookup: below its threshold the engine does
 not search or restore disk/RAM candidates, while active-session reuse and eligible outgoing saves remain independent.
+`--conversation-cache-min-delta-tokens N` skips a switch-time disk-only save when a valid on-disk base exists and its
+unsaved tail is shorter than N tokens; the default `0` is off. On restore, skipped tails are recomputed from the client's
+full resubmission.
 A clean shutdown saves the live conversation when it meets WRITE, so the next start continues it. Single GPU, without
 `--batch` or `--peer-device`.
 Measured on a Ryzen AI Max+ 395 (gfx1151, the iGPU alone, internal NVMe; Qwen3.8-Flash-Next with K-quant experts,

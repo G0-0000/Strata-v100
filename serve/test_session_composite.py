@@ -26,20 +26,30 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeEngine(MockEngine):
-    """MockEngine + the SAVE/RESTORE command a strata_session composite drives, recording every command in order."""
+    """MockEngine + the SAVE/RESTORE command a strata_session composite drives, recording every command in order.
+
+    It counts tokens the way the engine does: when the first submitted id is not BOS it prepends one to its live
+    session (this server's ids carry none), so its RESTORE and SAVE answers can be one more than the ids the server
+    holds.  Hand-set counts hid that off-by-one; a real machine answered every fresh save -> splice roundtrip with
+    409 splice_stale."""
 
     def __init__(self, tokenizer, **kw):
         super().__init__(tokenizer, kw.pop("script", "Understood."), **kw)
+        self.bos = tokenizer.encode("<|endoftext|>", parse_special=True)[0]   # the byte tokenizer's BOS stand-in
         self.commands = []                    # GEN / RESTORE / SAVE, in the order the engine saw them
         self.lock = threading.Lock()
-        self.restore_tokens = 0               # what session_file("restore") answers
-        self.save_tokens = 0                  # what session_file("save") answers
+        self.restore_tokens = None            # hand-set count of session_file("restore") (a file no save wrote here)
+        self.save_tokens = None               # hand-set count of session_file("save") (a count no convention explains)
         self.restore_error = None             # (kind, reason): session_file("restore") raises SessionRefused
         self.save_refusal = None              # (kind, reason): session_file("save") raises SessionRefused
         self.reused = 0                       # the RESUME figure Service.run reads after the generation
         self.next_reused = None               # set self.reused on the next generate()
         self.gen_gate = None                  # threading.Event: when set, generate() waits on it before GEN
         self.gen_entered = None               # threading.Event: generate() sets it once it waits on the gate
+        self.live = 0                         # the engine's live session length, BOS included
+        self.files = {}                       # path -> the engine-side count a SAVE recorded there
+        self.prompt_tokens = 0                # the engine-side length of the last generate()'s prompt
+        self.generated = 0                    # the tokens the last generate() yielded
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         if self.gen_gate is not None:         # hold this turn inside the fifo until the test opens the gate
@@ -47,9 +57,20 @@ class FakeEngine(MockEngine):
             self.gen_gate.wait()
         with self.lock:
             self.commands.append("GEN")
+            engine_ids = list(ids)
+            if not engine_ids or engine_ids[0] != self.bos:
+                engine_ids.insert(0, self.bos)             # the engine's leading BOS: this server's ids carry none
+            self.prompt_tokens = len(engine_ids)
+            self.reused = min(self.live, self.prompt_tokens)    # RESUME: what the live session shares
             if self.next_reused is not None:
                 self.reused, self.next_reused = self.next_reused, None
-        yield from super().generate(ids, max_new, sampling, cancel, embeddings=embeddings)
+        self.generated = 0
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings=embeddings):
+                self.generated += 1
+                yield t
+        finally:
+            self.live = self.prompt_tokens + self.generated      # the session this request leaves live
 
     def session_file(self, action, path):
         with self.lock:
@@ -57,10 +78,15 @@ class FakeEngine(MockEngine):
         if action == "restore":
             if self.restore_error:
                 raise SessionRefused(*self.restore_error)
-            return {"tokens": self.restore_tokens, "bytes": self.restore_tokens * 4, "ms": 12.5}
+            # the engine reports the count its own SAVE recorded in that file
+            tokens = self.restore_tokens if self.restore_tokens is not None else self.files.get(path, 0)
+            self.live = tokens
+            return {"tokens": tokens, "bytes": tokens * 4, "ms": 12.5}
         if self.save_refusal:
             raise SessionRefused(*self.save_refusal)
-        return {"tokens": self.save_tokens, "bytes": self.save_tokens * 4, "ms": 34.5}
+        tokens = self.save_tokens if self.save_tokens is not None else self.live
+        self.files[path] = tokens
+        return {"tokens": tokens, "bytes": tokens * 4, "ms": 34.5}
 
 
 class Composite(unittest.TestCase):
@@ -86,14 +112,18 @@ class Composite(unittest.TestCase):
         self.engine.turns = 0
         self.engine.script = self.engine.scripts[0]
         self.engine.commands = []
-        self.engine.restore_tokens = 0
-        self.engine.save_tokens = 0
+        self.engine.restore_tokens = None
+        self.engine.save_tokens = None
         self.engine.restore_error = None
         self.engine.save_refusal = None
         self.engine.reused = 0
         self.engine.next_reused = None
         self.engine.gen_gate = None
         self.engine.gen_entered = None
+        self.engine.live = 0
+        self.engine.files = {}
+        self.engine.prompt_tokens = 0
+        self.engine.generated = 0
 
     def post(self, path, body, headers=None):
         req = urllib.request.Request(self.base_url + path, data=json.dumps(body).encode(),
@@ -109,10 +139,15 @@ class Composite(unittest.TestCase):
         return Path(self.dir.name, name + ".tokens.json")
 
     def write_sidecar(self, name, ids, **kw):
-        data = {"version": 1, "tokenizer": self.svc.session_tok_hash, "template": self.svc.session_tpl_hash,
+        kw.setdefault("engine_tokens", self.engine_count(ids))       # what the engine's SAVE reported for them
+        data = {"version": 2, "tokenizer": self.svc.session_tok_hash, "template": self.svc.session_tpl_hash,
                 "created": 0, "ids": ids}
         data.update(kw)
         self.sidecar(name).write_text(json.dumps(data), encoding="utf-8")
+
+    def engine_count(self, ids):
+        """The tokens the engine keeps for these server-side ids: it prepends one BOS when the first is not BOS."""
+        return len(ids) + (0 if ids and ids[0] == self.engine.bos else 1)
 
     def base_ids(self, user_text, assistant_text, **kw):
         """What a save after one turn records: the submitted prompt + the generated ids (stop token included).
@@ -153,8 +188,7 @@ class Composite(unittest.TestCase):
 
     # T2: one fifo turn - a plain chat's GEN never lands between another request's RESTORE, GEN and SAVE
     def test_t2_restore_generate_save_is_atomic_with_a_plain_chat(self):
-        self.engine.restore_tokens = 11
-        self.engine.save_tokens = 22
+        self.engine.restore_tokens = 11                                # the file it loads: no save here wrote it
         self.engine.gen_gate = threading.Event()                       # hold the composite's generate in the fifo
         self.engine.gen_entered = threading.Event()
         composite = {"messages": [{"role": "user", "content": "composite"}],
@@ -185,7 +219,9 @@ class Composite(unittest.TestCase):
         self.assertEqual(self.engine.commands, ["RESTORE", "GEN", "SAVE", "GEN"])
         session = out["r"][1]["session"]
         self.assertEqual(session["restored"], {"tokens": 11, "bytes": 44, "ms": 12.5})
-        self.assertEqual(session["saved"], {"tokens": 22, "bytes": 88, "ms": 34.5})
+        sidecar = json.loads(self.sidecar("t2.sess").read_text())
+        self.assertEqual(session["saved"]["tokens"], sidecar["engine_tokens"])   # the engine's own count
+        self.assertEqual(session["saved"]["tokens"], self.engine_count(sidecar["ids"]))
         self.assertNotIn("splice", session)
         self.assertNotIn("save_error", session)
         self.assertNotIn("session", plain["r"][1])                   # the plain request is untouched
@@ -266,31 +302,35 @@ class Composite(unittest.TestCase):
     def test_t5_a_restore_count_below_the_sidecar_is_409_with_expected_and_got(self):
         base = self.base_ids("one", "one done")
         self.write_sidecar("t5b.sess", base)
-        self.engine.restore_tokens = len(base) - 3
+        engine_base = self.engine_count(base)                       # the engine's count: the restore check's number
+        self.engine.restore_tokens = engine_base - 3                 # the file changed underneath: it restores fewer
         body = {"messages": [{"role": "user", "content": "next"}],
                 "strata_session": {"restore": "t5b.sess", "splice": True}}
         s, b = self.post("/v1/chat/completions", body)
         self.assertEqual(s, 409, b)
         self.assertEqual(b["error"]["type"], "splice_stale")
-        self.assertEqual(b["error"]["expected"], len(base))
-        self.assertEqual(b["error"]["got"], len(base) - 3)
+        self.assertEqual(b["error"]["expected"], engine_base)
+        self.assertEqual(b["error"]["got"], engine_base - 3)
+        self.assertIn(f"the engine restored {engine_base - 3} tokens, the sidecar's engine count is {engine_base}",
+                      b["error"]["message"])                        # both conventions named
         self.assertEqual(self.engine.commands, ["RESTORE"])
 
     # T6: the engine reused fewer tokens than the base holds - a warning and resume_ok=false, the answer still stands
     def test_t6_a_short_resume_degrades_to_resume_ok_false(self):
         base = self.base_ids("one", "one done")
         self.write_sidecar("t6.sess", base)
-        self.engine.restore_tokens = len(base)
-        self.engine.next_reused = len(base) - 10                     # the engine's RESUME, short of the base
+        engine_base = self.engine_count(base)
+        self.engine.restore_tokens = engine_base
+        self.engine.next_reused = engine_base - 10                   # the engine's RESUME, short of the base
         body = {"messages": [{"role": "user", "content": "next"}],
                 "strata_session": {"restore": "t6.sess", "save": "t6.sess", "splice": True}}
         s, b = self.post("/v1/chat/completions", body)
         self.assertEqual(s, 200, b)
         session = b["session"]
-        self.assertEqual(session["restored"]["tokens"], len(base))
+        self.assertEqual(session["restored"]["tokens"], engine_base)
         splice = session["splice"]
-        self.assertEqual(splice["base_tokens"], len(base))
-        self.assertEqual(splice["resume"], len(base) - 10)
+        self.assertEqual(splice["base_tokens"], len(base))           # the server-side ids the sidecar holds
+        self.assertEqual(splice["resume"], engine_base - 10)
         self.assertFalse(splice["resume_ok"])
         self.assertIn("saved", session)
         got = json.loads(self.sidecar("t6.sess").read_text())["ids"]
@@ -313,7 +353,7 @@ class Composite(unittest.TestCase):
         try:
             base = self.base_ids("one", "one done")
             self.write_sidecar("t7b.sess", base)
-            self.engine.restore_tokens = len(base)
+            self.engine.restore_tokens = self.engine_count(base)
             loop = "<think>" + "ab" * 1500 + "</think>\n\nThe answer is 42."
             end = self.tok.encode(IM_END, parse_special=True)
             self.engine.scripts = [self.tok.encode(loop, parse_special=True) + end]
@@ -371,7 +411,8 @@ class Composite(unittest.TestCase):
 
     def test_t8_a_bad_sidecar_version_or_garbage_is_409(self):
         base = self.base_ids("one", "one done")
-        for make, word in ((lambda: json.dumps({"version": 2, "ids": base}), "version 2"),
+        for make, word in ((lambda: json.dumps({"version": 1, "ids": base}), "version 1 (no engine count)"),
+                           (lambda: json.dumps({"version": 2, "ids": base}), "version 2 without engine_tokens"),
                            (lambda: "{not json", "garbage")):
             with self.subTest(word=word):
                 self.sidecar("t8ver.sess").write_text(make(), encoding="utf-8")
@@ -410,7 +451,7 @@ class Composite(unittest.TestCase):
     def test_t9_a_same_name_save_between_prepare_and_the_turn_is_409(self):
         base = self.base_ids("one", "one done")
         self.write_sidecar("race.sess", base)
-        self.engine.restore_tokens = len(base)                     # both restores answer the base's length
+        self.engine.restore_tokens = self.engine_count(base)        # both restores answer the base's count
         self.engine.gen_gate = threading.Event()                   # B holds the fifo inside its generate
         self.engine.gen_entered = threading.Event()
         outb, outa = {}, {}
@@ -440,6 +481,61 @@ class Composite(unittest.TestCase):
         self.assertEqual(b["error"]["expected"], len(base))
         self.assertEqual(b["error"]["got"],
                          len(json.loads(self.sidecar("race.sess").read_text())["ids"]))
+
+    # T10: the counts the engine reports are its own - it prepends one BOS this server's ids do not hold, so a fresh
+    # save -> splice roundtrip must compare the restore against the sidecar's engine count, not against its ids
+    def test_t10_a_fresh_save_then_splice_roundtrip_succeeds(self):
+        s, b = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "one"}],
+                                                  "strata_session": {"save": "t10.sess"}})
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.engine.commands, ["GEN", "SAVE"])
+        first = json.loads(self.sidecar("t10.sess").read_text())
+        self.assertEqual(first["version"], 2)
+        self.assertEqual(b["session"]["saved"]["tokens"], first["engine_tokens"])   # the SAVED count, as reported
+        self.assertEqual(first["engine_tokens"], self.engine_count(first["ids"]))
+        self.assertEqual(first["engine_tokens"], len(first["ids"]) + 1)             # the engine's one leading BOS
+        s, b = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "two"}],
+                                                  "strata_session": {"restore": "t10.sess", "splice": True}})
+        self.assertEqual(s, 200, b)                                   # it answered 409 splice_stale before the fix
+        session = b["session"]
+        self.assertEqual(session["restored"]["tokens"], first["engine_tokens"])
+        splice = session["splice"]
+        self.assertEqual(splice["base_tokens"], len(first["ids"]))     # the ids the new turns were spliced onto
+        self.assertEqual(splice["resume"], first["engine_tokens"])
+        self.assertTrue(splice["resume_ok"], splice)
+        self.assertEqual(self.engine.commands, ["GEN", "SAVE", "RESTORE", "GEN"])
+
+    def test_t10_a_version_1_sidecar_heals_with_one_full_resend(self):
+        base = self.base_ids("one", "one done")
+        old = {"version": 1, "tokenizer": self.svc.session_tok_hash, "template": self.svc.session_tpl_hash,
+               "created": 0, "ids": base}
+        self.sidecar("t10v1.sess").write_text(json.dumps(old), encoding="utf-8")
+        s, b = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "next"}],
+                                                  "strata_session": {"restore": "t10v1.sess", "splice": True}})
+        self.assertEqual(s, 409, b)                                    # a v1 sidecar is stale: resend once
+        self.assertEqual(b["error"]["type"], "splice_stale")
+        self.assertEqual(self.engine.commands, [])
+        whole = [{"role": "user", "content": "one"}, {"role": "assistant", "content": "one done"},
+                 {"role": "user", "content": "next"}]
+        s, b = self.post("/v1/chat/completions", {"messages": whole,
+                                                  "strata_session": {"save": "t10v1.sess"}})
+        self.assertEqual(s, 200, b)                                    # the full resend rebuilds the base
+        self.assertEqual(json.loads(self.sidecar("t10v1.sess").read_text())["version"], 2)
+        s, b = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "third"}],
+                                                  "strata_session": {"restore": "t10v1.sess", "splice": True}})
+        self.assertEqual(s, 200, b)                                    # and the splice now works
+        self.assertTrue(b["session"]["splice"]["resume_ok"], b["session"])
+
+    # T11: an engine count that is no BOS explanation is logged, not fixed: the sidecar still records it as reported
+    def test_t11_an_unusual_save_count_is_logged_and_still_written(self):
+        self.engine.save_tokens = 5                                    # neither the ids' count nor that plus one
+        s, b = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "one"}],
+                                                  "strata_session": {"save": "t11.sess"}})
+        self.assertEqual(s, 200, b)
+        self.assertEqual(b["session"]["saved"]["tokens"], 5)
+        data = json.loads(self.sidecar("t11.sess").read_text())
+        self.assertEqual(data["engine_tokens"], 5)                   # the engine's count: authoritative for restore
+        self.assertGreater(len(data["ids"]), 6)
 
 
 if __name__ == "__main__":

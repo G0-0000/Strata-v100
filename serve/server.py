@@ -5273,22 +5273,30 @@ class Service:
             return []
         return self.tok.encode(rendered[end + len(IM_END):nxt], parse_special=True)
 
-    def _sidecar_base_ids(self, session) -> list[int]:
-        """The base turn ids of a spliced strata_session request: <restore path>.sess.tokens.json, written by an
-        earlier save.  A SpliceConflict (409 splice_stale) when the file is missing, unreadable, of an unknown
-        version, or carries another tokenizer/template's hash - the client resends the whole conversation once to
-        rebuild the base; the file itself is reported, never deleted."""
+    def _sidecar_base(self, session) -> dict:
+        """The base turn of a spliced strata_session request: <restore path>.sess.tokens.json, written by an
+        earlier save.  -> {"ids": the base's server-side token ids, "engine_tokens": the count the engine reported
+        in that save's SAVED answer}.  The two differ by the leading BOS the engine prepends when the first
+        submitted id is not BOS (this server's ids carry none): the ids drive the splice's math, the engine's count
+        the restore check, so both are recorded.  A SpliceConflict (409 splice_stale) when the file is missing,
+        unreadable, not a version-2 file, or carries another tokenizer/template's hash - the client resends the
+        whole conversation once to rebuild the base; the file itself is reported, never deleted.  A version-1
+        sidecar (written before the engine's count was recorded) is refused the same way and heals with that one
+        resend."""
         path = session["restore"] + ".tokens.json"
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = None
         ids = data.get("ids") if isinstance(data, dict) else None
-        if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(ids, list) \
-                or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+        engine_tokens = data.get("engine_tokens") if isinstance(data, dict) else None
+        if not isinstance(data, dict) or data.get("version") != 2 or not isinstance(ids, list) \
+                or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids) \
+                or not isinstance(engine_tokens, int) or isinstance(engine_tokens, bool) or engine_tokens < 0:
             raise SpliceConflict("splice_stale", f"{session['restore_name']}: the token sidecar is missing, "
-                                                 "unreadable or not a version-1 token file; resend the whole "
-                                                 "conversation once to rebuild the base", expected=1,
+                                                 "unreadable or not a version-2 token file (the base's ids and the "
+                                                 "token count the engine reported for that save); resend the whole "
+                                                 "conversation once to rebuild the base", expected=2,
                                  got=(data.get("version") if isinstance(data, dict) else None) or 0)
         bad = None
         if self.session_tok_hash and data.get("tokenizer") != self.session_tok_hash:
@@ -5299,7 +5307,7 @@ class Service:
             # identity-hash mismatch: no two numbers are compared, so no expected/got - the explanation rides detail
             raise SpliceConflict("splice_stale", f"{session['restore_name']}: {bad}; resend the whole conversation "
                                                  "once to rebuild the base", detail=bad)
-        return ids
+        return {"ids": ids, "engine_tokens": engine_tokens}
 
     def _spliced_prompt(self, ids_new, messages, session) -> list[int]:
         """The prompt of a spliced strata_session request: the sidecar's base ids + the freshly rendered new turns.
@@ -5307,7 +5315,8 @@ class Service:
         the newline some tokenizers merge); a base that does not end on a stop token is a 409 splice_base_seam;
         a render without the opening is a 400 splice_render_mismatch.  The seam between base and delta is the
         template's turn separator, which the engine's token stream does not carry."""
-        base_ids = self._sidecar_base_ids(session)
+        base = self._sidecar_base(session)
+        base_ids = base["ids"]
         if not base_ids or base_ids[-1] not in self.stop_ids:
             raise SpliceConflict("splice_base_seam", f"{session['restore_name']}: the base does not end on a full "
                                                      "turn's stop token (it was cut mid-turn or is corrupt), so the "
@@ -5333,16 +5342,20 @@ class Service:
         if self.splice_sep_ids:
             delta = self.splice_sep_ids + delta
         session["splice_base_len"] = len(base_ids)
+        session["splice_engine_tokens"] = base["engine_tokens"]    # the engine's count: the restore check's number
         session["splice_delta_len"] = len(delta)
         session["splice_base_ids"] = base_ids     # kept for the in-turn re-read (a same-name save can swap the sidecar)
         return base_ids + delta
 
-    def _write_sidecar(self, path: str, ids: list[int]) -> None:
+    def _write_sidecar(self, path: str, ids: list[int], engine_tokens: int) -> None:
         """The token sidecar of a saved session: <save path>.sess.tokens.json, the ids the engine will be handed on
-        a later spliced restore (the submitted prompt + the generated ids, stop token included).  Written to a
-        temporary file and renamed, so a reader never sees a half-written file; the temporary is removed on failure."""
-        data = {"version": 1, "tokenizer": self.session_tok_hash, "template": self.session_tpl_hash,
-                "created": int(time.time()), "ids": ids}
+        a later spliced restore (the submitted prompt + the generated ids, stop token included) and the token count
+        the engine reported in that save's SAVED answer.  The engine prepends one BOS when the first submitted id is
+        not BOS, so its count can be one more than the ids hold: the ids drive the splice's math, its count the
+        restore check.  Written to a temporary file and renamed, so a reader never sees a half-written file; the
+        temporary is removed on failure."""
+        data = {"version": 2, "tokenizer": self.session_tok_hash, "template": self.session_tpl_hash,
+                "created": int(time.time()), "ids": ids, "engine_tokens": engine_tokens}
         tmp = path + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -5817,26 +5830,30 @@ class Service:
                             st.update(phase="restoring a session", started=time.time(), first_token=None)
                         restored = self.engine.session_file("restore", session["restore"])
                         session_out["restored"] = restored
-                        if session.get("splice") and restored["tokens"] != session.get("splice_base_len"):
+                        if session.get("splice") and restored["tokens"] != session.get("splice_engine_tokens"):
                             raise SpliceConflict("splice_stale", f"{session['restore_name']}: the engine restored "
-                                                 f"{restored['tokens']} tokens, the sidecar holds "
-                                                 f"{session['splice_base_len']}; the base changed underneath "
+                                                 f"{restored['tokens']} tokens, the sidecar's engine count is "
+                                                 f"{session['splice_engine_tokens']} (its ids hold "
+                                                 f"{session['splice_base_len']} server-side tokens: the engine "
+                                                 "counts one leading BOS these do not); the base changed underneath "
                                                  "(resend the whole conversation once to rebuild it)",
-                                                 expected=session["splice_base_len"], got=restored["tokens"])
+                                                 expected=session["splice_engine_tokens"], got=restored["tokens"])
                         if session.get("splice"):
                             # the sidecar was first read in prepare(), outside the fifo: another request could have
                             # restored and saved the same name in between, swapping .sess and sidecar under this one.
                             # The fifo is held now, so this re-read is stable: the ids must be exactly the base the
-                            # prompt was rendered with (value by value: a same-length swap passes the count check)
-                            now_ids = self._sidecar_base_ids(session)
-                            if now_ids != session.get("splice_base_ids"):
+                            # prompt was rendered with (value by value: a same-length swap passes the count check),
+                            # and its engine count must be the one the restore was checked against
+                            now = self._sidecar_base(session)
+                            if now["ids"] != session.get("splice_base_ids") \
+                                    or now["engine_tokens"] != session.get("splice_engine_tokens"):
                                 raise SpliceConflict("splice_stale", f"{session['restore_name']}: the token sidecar "
                                                      "changed after the prompt was rendered (another request saved "
                                                      "the same name); resend the whole conversation once to rebuild "
                                                      "the base", expected=len(session["splice_base_ids"]),
-                                                     got=len(now_ids),
-                                                     detail="the sidecar's token ids differ from the base the prompt "
-                                                            "was rendered with")
+                                                     got=len(now["ids"]),
+                                                     detail="the sidecar's ids or engine count differ from the base "
+                                                            "the prompt was rendered with")
                     with self.status_lock:
                         if par:
                             self.status["queued"] -= 1
@@ -6182,12 +6199,12 @@ class Service:
                     if session.get("splice"):
                         resume = splice_resume if splice_resume is not None \
                             else int(getattr(self.engine, "reused", 0) or 0)
-                        ok = resume == session["splice_base_len"]
+                        ok = resume == session["splice_engine_tokens"]
                         if not ok:
                             print(f"[strata] splice: the engine reused {resume} tokens, not the "
-                                  f"{session['splice_base_len']} the base holds (its cache changed): the answer is "
-                                  "still correct, recomputed from the fork; the client is told resume_ok=false",
-                                  flush=True)
+                                  f"{session['splice_engine_tokens']} its session holds for the base (its cache "
+                                  "changed): the answer is still correct, recomputed from the fork; the client is "
+                                  "told resume_ok=false", flush=True)
                         session_out["splice"] = {"base_tokens": session["splice_base_len"],
                                                  "delta_tokens": session["splice_delta_len"],
                                                  "resume": resume, "resume_ok": ok}
@@ -6211,8 +6228,18 @@ class Service:
                                 # resends the whole conversation once (self-healing by design)
                                 session_out["sidecar"] = "skipped_recovery"
                             else:
+                                saved_ids = list(ids) + raw_ids
+                                extra = saved["tokens"] - len(saved_ids)
+                                if extra not in (0, 1):
+                                    # the engine's count is authoritative for the restore check, so it is written as
+                                    # reported; anything other than its one leading BOS is worth one line
+                                    print(f"[strata] session {session['save_name']}: the engine saved "
+                                          f"{saved['tokens']} tokens, the submitted ids hold {len(saved_ids)} "
+                                          f"({extra:+d}, not the engine's single leading BOS); the sidecar records "
+                                          "the engine's count", flush=True)
                                 try:
-                                    self._write_sidecar(session["save"] + ".tokens.json", list(ids) + raw_ids)
+                                    self._write_sidecar(session["save"] + ".tokens.json", saved_ids,
+                                                        saved["tokens"])
                                 except OSError as e:
                                     session_out["save_error"] = {"kind": "io",
                                                                  "reason": "the session saved, but its token "

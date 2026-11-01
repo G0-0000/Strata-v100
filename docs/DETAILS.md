@@ -1223,28 +1223,36 @@ holds the engine between them: add an opt-in `strata_session` object beside `mes
   sidecar.
 
 With `"splice": true` the request's `messages` carry only the new turns. The server keeps a small token sidecar
-beside each saved session — `NAME.sess.tokens.json`, the token ids the engine was handed plus the ids the answer
-added (stop token included) — and splices the rendered new turns onto it, so the client never resends the base:
+beside each saved session — `NAME.sess.tokens.json`, format version 2: the token ids the engine was handed plus the
+ids the answer added (stop token included), and the token count the engine itself reported in that save's `SAVED`
+answer — and splices the rendered new turns onto it, so the client never resends the base:
 
 - The first new message must be a `user` turn, and no `system` turn may be among the new turns: the system prompt
   belongs to the base and cannot change. `splice` needs `restore`. Images are not spliced (v1).
 - The seam between base and new turns is the template's turn separator (a newline in ChatML). The engine's token
   stream has no such separator — a saved base ends on its stop token — so the server adds the separator's ids
   itself. The base's last token must be a stop token; a base cut mid-turn (a truncated generation) is refused.
-- The sidecar names the tokenizer and chat template that wrote it (content hashes). A missing sidecar, an unknown
-  version, or a different tokenizer or template answers `409 splice_stale`: resend the whole conversation once to
-  rebuild the base; the server reports the mismatch and never deletes anything. The same answer comes when the
-  engine restores a different number of tokens than the sidecar holds (its file changed underneath). A seam
+- The sidecar names the tokenizer and chat template that wrote it (content hashes) and carries format version 2. A
+  missing sidecar, a file of another version (a version-1 sidecar predates the engine's own count), or a different
+  tokenizer or template answers `409 splice_stale`: resend the whole conversation once to rebuild the base; the
+  server reports the mismatch and never deletes anything. That one full resend writes a version-2 sidecar, so the
+  next splice of that name works.
+- The restore's count is checked against the count the engine reported when the session was saved, not against the
+  number of ids the sidecar holds: when the first id a request submits is not BOS the engine puts one BOS in front
+  of it, so a saved session holds one token more than this server's ids. A restore that answers another count than
+  the sidecar's engine count means the file changed underneath: `409 splice_stale` names both numbers. A seam
   violation answers `409 splice_base_seam`.
-- When the splice runs, the answer's `"splice"` block reports `base_tokens`, `delta_tokens`, the tokens the engine
-  actually reused (`resume`) and `resume_ok`. `resume_ok` is true only when `resume` equals `base_tokens` (the
-  comparison is `!=`, and `resume` is the first generation pass's count: a request that ran a second pass continued
-  from a longer prompt); any other count means the engine's cache had changed: the answer is still correct
-  (recomputed from the fork) and the client is told with `resume_ok: false`.
+- When the splice runs, the answer's `"splice"` block reports `base_tokens` (the server-side ids the sidecar holds),
+  `delta_tokens`, the tokens the engine actually reused (`resume`) and `resume_ok`. `resume_ok` is true only when
+  `resume` equals the count the engine holds for the base — the one its save reported, `base_tokens` plus the BOS
+  above when the engine prepended one (the comparison is `!=`, and `resume` is the first generation pass's count: a
+  request that ran a second pass continued from a longer prompt); any other count means the engine's cache had
+  changed: the answer is still correct (recomputed from the fork) and the client is told with `resume_ok: false`.
 - On save the sidecar is rewritten atomically (a temporary file, renamed after the save succeeded) with the submitted
-  ids plus the answer's ids. When the request's reasoning was recovered mid-generation (`reasoning_loop_recovery`
-  re-sent the prompt), the engine state is right but a sidecar would not replay: it is skipped, the answer says
-  `"sidecar": "skipped_recovery"`, and the next splice of that name answers 409 until a clean save rebuilds it.
+  ids plus the answer's ids, and the token count the engine's `SAVED` answer reported. When the request's reasoning
+  was recovered mid-generation (`reasoning_loop_recovery` re-sent the prompt), the engine state is right but a
+  sidecar would not replay: it is skipped, the answer says `"sidecar": "skipped_recovery"`, and the next splice of
+  that name answers 409 until a clean save rebuilds it.
 
 **v1 limits:** non-streaming requests only (the save must follow the answer inside one engine turn); no images with
 `splice`; `strata_session` is not read by `/v1/messages` or `/v1/responses`; not with parallel requests (`"parallel"` /

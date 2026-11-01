@@ -27,9 +27,13 @@ struct Options {
     int64_t max_context = 32768;
     std::vector<int> gpus;            // empty: every visible GPU
     int64_t reserve_mib = 600;        // VRAM left free on each GPU
+    bool vram_experts_auto = true;    // (Metal: no --vram-experts given: the share the anonymous-memory cap leaves - metal_expert_cap)
     double vram_experts = 1.0;        // the share of the expert budget to use (tests: less, so the CPU lane works)
     int cpu_threads = 0;              // 0: the physical cores
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
+    // --profile-readonly: read the profile to place the experts, never write it back.  Without this the run's routing
+    // counts go into the file, so the next run places experts differently and greedy output / KL move between runs.
+    bool profile_readonly = false;
     bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used
     // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
     // copied into RAM: 1 on, 0 off, -1 (auto) where the RAM this process can get does not hold them
@@ -153,6 +157,10 @@ public:
     const std::vector<int32_t>& tokens() const;   // what the state has consumed, in order
 
     void reset();
+    /// The post-prompt cache settle run on a thread of its own while the server waits for its next request (WP-8's option 1):
+    /// the swap rounds of cache_settle without the store preload, stopped early when `cancel` goes true.  `done` is set when
+    /// the thread has nothing left to do.  Only one such run at a time; the caller joins the thread after setting cancel.
+    void settle_idle(const std::atomic<bool>& cancel);
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
     /// restore(limit) goes back to the latest one at or before limit (-1: none).
     void checkpoint(int slot = 0);

@@ -8,7 +8,7 @@
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
-project(strata VERSION 0.1.52 LANGUAGES CXX)
+project(strata VERSION 0.1.55 LANGUAGES CXX)
 # Fork-local revision (G0-0000/Strata-v100): a numeric LOCAL_REVISION at the repo root appends one
 # more version segment (0.1.52 -> 0.1.52.<rev>). Appending literally keeps it working whatever segment count
 # upstream's project() line carries. Upstream never ships the file, so merges leave it untouched.
@@ -106,6 +106,31 @@ if(STRATA_HIP_GFX906)
 endif()
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1012/gfx1030 unvalidated)" OFF)
 option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
+# The rows one verify / batch window holds (include/strata/kernels/window_limits.hpp): 8, the 0.2.7 window, or 16 (four pipelined
+# groups of 16 slots = 64 slots on a four-card split, docs/BATCHING.md).  Only the CUDA and HIP engines are built from
+# these sources with a wide window; the SYCL and Metal builds never read this variable and keep 8.  A window of up to
+# 8 rows runs the kernels it always ran, whichever is chosen (the wide instantiations are extra code).  "auto" = 16 for
+# the HIP engines (a HIP code object loads on first use, so the extra kernels cost nothing until a wide window forms)
+# and 8 for CUDA, which loads every kernel at start (CUDA_MODULE_LOADING=EAGER: the wide kernels would take VRAM from
+# the expert cache of every card); -DSTRATA_WINDOW_MAX_T=16 builds the wide CUDA engine.
+set(STRATA_WINDOW_MAX_T "auto" CACHE STRING "rows of a verify / batch window: 8, 16 or auto (HIP 16, CUDA 8)")
+set_property(CACHE STRATA_WINDOW_MAX_T PROPERTY STRINGS auto 8 16)
+if(NOT STRATA_WINDOW_MAX_T STREQUAL "auto" AND NOT STRATA_WINDOW_MAX_T STREQUAL "8" AND NOT STRATA_WINDOW_MAX_T STREQUAL "16")
+  message(FATAL_ERROR "STRATA_WINDOW_MAX_T must be auto, 8 or 16 (got '${STRATA_WINDOW_MAX_T}')")
+endif()
+if(STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA)
+  if(STRATA_WINDOW_MAX_T STREQUAL "auto")
+    if(STRATA_ENABLE_HIP)
+      set(_strata_window_max_t 16)
+    else()
+      set(_strata_window_max_t 8)
+    endif()
+  else()
+    set(_strata_window_max_t ${STRATA_WINDOW_MAX_T})
+  endif()
+  add_compile_definitions(STRATA_VERIFY_MAX_T=${_strata_window_max_t})
+  message(STATUS "Strata: verify / batch windows hold up to ${_strata_window_max_t} rows")
+endif()
 # MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K (Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF
 # projections, STRATA_DENSE_MMQ).  On by default since MODEL-UPDATE Phase 1: on CUDA they are their own library
 # (strata_kq, loaded only for a model with these formats: the engine loads every kernel of its own binary at start,
@@ -144,6 +169,11 @@ endif()
 set(_strata_tests_default OFF)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/micro)
   set(_strata_tests_default ON)
+endif()
+if(NOT STRATA_CPU_X86)
+  # arm64 Linux (DGX Spark): much of the suite drives the x86 CPU kernels, which this build does not have.  A default, not a
+  # prohibition: -DSTRATA_BUILD_TESTS=ON still builds what builds (classifying the tests by capability is a follow-up).
+  set(_strata_tests_default OFF)
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
@@ -1100,6 +1130,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME hip_gdn_chunked_off COMMAND hip_gdn_chunked --off)
     add_test(NAME hip_gdn_chunked_default COMMAND hip_gdn_chunked --default)
     list(APPEND _strata_hip_tests hip_gdn_chunked hip_gdn_chunked_off hip_gdn_chunked_default)
+    # GDN prompt stage bench (gates + conv + recurrence, per-piece times and output/state hashes at 4K/16K/32K); a measurement
+    # tool, run by hand with the STRATA_GDN_* knobs under test - no add_test
+    add_executable(hip_gdn_stage_bench tests/hip/gdn_stage_bench.cpp)
+    target_link_libraries(hip_gdn_stage_bench PRIVATE strata_prefill strata_hip_runtime)
     # #313: the RDNA3 / RDNA3.5 WMMA dense GEMMs (opt-in STRATA_WMMA_GEMM=1) against a reference
     add_executable(hip_prefill_wmma_gemm_parity tests/hip/prefill_wmma_gemm_parity.cpp)
     target_include_directories(hip_prefill_wmma_gemm_parity PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
@@ -1122,6 +1156,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME hip_router_fast COMMAND hip_router_fast)
     list(APPEND _strata_hip_tests hip_router_fast)
     # S6: the RDNA4 matrix-core prompt attention (STRATA_HIP_WMMA) against the FP32 kernel and FP64; skips off gfx12
+    # the prompt attention on a recorded selection (STRATA_QSA_DUMP), for A/B of kernel variants (STRATA_QSA_UNION=1)
+    add_executable(hip_pa_bench tests/cuda/pa_bench.cpp)
+    target_link_libraries(hip_pa_bench PRIVATE strata_kernels strata_hip_runtime)
     add_executable(hip_prompt_attn_wmma src/kernels/qsa_prompt_attn_parity.cpp)
     target_link_libraries(hip_prompt_attn_wmma PRIVATE strata_kernels strata_hip_runtime)
     add_test(NAME hip_prompt_attn_wmma COMMAND hip_prompt_attn_wmma 32768 2048 3)
@@ -1302,6 +1339,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # "not on this card" for the tc variant
     add_test(NAME gdn_rec_parity_selftest_frag COMMAND gdn_rec_parity --selftest-frag)
     set_tests_properties(gdn_rec_parity_selftest_frag PROPERTIES SKIP_RETURN_CODE 77)
+    # the production-linked GDN parity / benchmark harness (no kernel copies: it calls gdn_gates, gdn_conv and
+    # gdn_recurrence of strata_prefill through the GdnProbe of include/strata/prefill/gdn_probe.hpp, against an FP64
+    # oracle from tests/gdn/gdn_fixture.hpp).  Usage: docs/GDN_CONTRACT.md.  The smoke test is small and CPU-cheap.
+    execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short=9 HEAD OUTPUT_VARIABLE _gdn_sha
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(NOT _gdn_sha)
+      set(_gdn_sha unknown)
+    endif()
+    add_executable(gdn_harness src/prefill/gdn_harness.cu)
+    target_include_directories(gdn_harness PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdn)
+    target_compile_definitions(gdn_harness PRIVATE GDN_HARNESS_SHA="${_gdn_sha}")
+    target_link_libraries(gdn_harness PRIVATE strata_prefill)
+    add_test(NAME gdn_harness_smoke COMMAND gdn_harness --T 400 --chunk 160 --cuts 37 --paths auto,keyhead,pipe --ref-heads 0,17)
+    set_tests_properties(gdn_harness_smoke PROPERTIES TIMEOUT 300)
     # the prompt path's BF16 products against cuBLAS's own BF16 GEMM, within fp32 rounding (sm_7x runs them on the
     # FP16 tensor cores; GPU, synthetic, no model; --bench adds timings)
     add_executable(gemm_bf16_parity src/prefill/gemm_bf16_parity.cu)
@@ -1662,6 +1713,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(pinned_shared_test PRIVATE strata_core ${_strata_gpu_runtime_target})
     add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
   endif()
+  if(WIN32)   # the replicas' shared expert arena as a named section (src/core/pinned.cu): two arenas, a child process, the last handle
+    add_executable(pinned_shared_win_test src/core/pinned_shared_win_test.cpp)
+    target_include_directories(pinned_shared_win_test PRIVATE include)
+    target_link_libraries(pinned_shared_win_test PRIVATE strata_core ${_strata_gpu_runtime_target})
+    add_test(NAME pinned_shared_win_test COMMAND pinned_shared_win_test)
+    set_tests_properties(pinned_shared_win_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+  endif()
 
   # Plan v0.3 P2: the n-gram table read straight from the SSD. The selftest needs only the CPU and a temp file.
   add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
@@ -1681,6 +1739,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(ple_residency_test src/core/ple_residency_test.cpp)
   target_include_directories(ple_residency_test PRIVATE include)
   add_test(NAME ple_residency_test COMMAND ple_residency_test)
+
+  # #4474: the automatic expert cache's slot rule (the late allocation priced); header-only, needs nothing
+  add_executable(auto_cache_test src/core/auto_cache_test.cpp)
+  target_include_directories(auto_cache_test PRIVATE include)
+  add_test(NAME auto_cache_test COMMAND auto_cache_test)
 
   # 0.2.7 (#3911): the qwen35 host sampler's penalties on a short (draft-vocab) logit row; header-only, CPU
   add_executable(qwen35_sampling_test src/qwen35/sampling_test.cpp)
@@ -1744,6 +1807,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(arch_defaults_test src/core/arch_defaults_test.cpp src/core/arch_defaults.cpp)
   target_include_directories(arch_defaults_test PRIVATE include)
   add_test(NAME arch_defaults_test COMMAND arch_defaults_test)
+  add_executable(nv_defaults_test src/core/nv_defaults_test.cpp src/core/nv_defaults.cpp)   # the sm_121 (GB10) table and its two off switches
+  target_include_directories(nv_defaults_test PRIVATE include)
+  add_test(NAME nv_defaults_test COMMAND nv_defaults_test)
   add_executable(kva_test src/prefill/kva_test.cpp)   # KVA: the switch, the automatic tail, the reasons a read is turned away
   target_include_directories(kva_test PRIVATE include)
   add_test(NAME kva_test COMMAND kva_test)
@@ -1782,6 +1848,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(adapt_decay_test src/program/adapt_decay_test.cpp)
   target_include_directories(adapt_decay_test PRIVATE include)
   add_test(NAME adapt_decay_test COMMAND adapt_decay_test)
+  # the window limits (8 rows, or 16 in a wide CUDA / HIP build) and the pipelined-window probe (header-only, CPU)
+  add_executable(window_limits_test src/core/window_limits_test.cpp)
+  target_include_directories(window_limits_test PRIVATE include)
+  add_test(NAME window_limits_test COMMAND window_limits_test)
   # which window-size graph is freed when the next one does not fit (#3702; header-only, CPU)
   add_executable(window_evict_test src/core/window_evict_test.cpp)
   target_include_directories(window_evict_test PRIVATE include)
@@ -1898,7 +1968,14 @@ if(STRATA_NATIVE_EXPERTS)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  if(STRATA_PORTABLE)
+  if(STRATA_PORTABLE AND NOT STRATA_CPU_X86)
+    # arm64 (DGX Spark: Cortex-X925 + A725): ggml-cpu for any Armv8.2 CPU with dot product, FP16 and int8 matmul instead of the build
+    # host's, so the engine built here does not depend on which core the compiler ran on.  Without it GGML_NATIVE OFF would leave
+    # ggml-cpu at plain armv8-a, and a native pack's CPU experts would lose the NEON dot products.
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    set(STRATA_ARM64_ARCH "armv8.2-a+dotprod+fp16+i8mm" CACHE STRING "arm64: ggml-cpu's -march for a STRATA_PORTABLE build")
+    set(GGML_CPU_ARM_ARCH "${STRATA_ARM64_ARCH}" CACHE STRING "" FORCE)
+  elseif(STRATA_PORTABLE)
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
     foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
       set(${_f} ON CACHE BOOL "" FORCE)
@@ -1951,6 +2028,10 @@ if(STRATA_NATIVE_EXPERTS)
                                              src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp
                                              src/kernels/cpu/iq_avx1.cpp src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
                                              src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
+  else()
+    # the trellis dispatcher alone (the DeepSeek engine's CPU lane and Gyro): tq_cpu.cpp runs its scalar rows when the x86 units are
+    # not compiled (the Metal build does the same)
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/tq_cpu.cpp)
   endif()
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
@@ -2003,6 +2084,8 @@ if(STRATA_NATIVE_EXPERTS)
     target_link_libraries(dequant_q5_1_test PRIVATE strata_artifact ggml-base)
     add_test(NAME dequant_q5_1_test COMMAND dequant_q5_1_test)
   endif()
+  # the x86 kernels' parity programs and benches (to the matching endif below): not on arm64, which has none of those kernels
+  if(STRATA_CPU_X86)
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
   add_executable(router_dot_parity src/kernels/cpu/router_dot_parity.cpp)
   target_link_libraries(router_dot_parity PRIVATE strata_kernels_cpu)
@@ -2063,6 +2146,7 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
     add_test(NAME q8k_quant_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:q8k_quant_parity>)
   endif()
+  endif()   # STRATA_CPU_X86
   set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
   # APR: the agention llama.cpp fork has MMQ instances for its trellis expert types (f62fdead0); any other ggml
   # tree leaves them to the FP16 prompt path

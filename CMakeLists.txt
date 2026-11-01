@@ -10,7 +10,7 @@
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.55 LANGUAGES CXX)
 # Fork-local revision (G0-0000/Strata-v100): a numeric LOCAL_REVISION at the repo root appends one
-# more version segment (0.1.52 -> 0.1.52.<rev>). Appending literally keeps it working whatever segment count
+# more version segment (0.1.55 -> 0.1.55.<rev>). Appending literally keeps it working whatever segment count
 # upstream's project() line carries. Upstream never ships the file, so merges leave it untouched.
 # Runs before the STRATA_ENABLE_SYCL branch below so that early-return path sees the revised
 # PROJECT_VERSION too; sycl/CMakeLists.txt re-parses this file's literal project() line and applies
@@ -2305,7 +2305,7 @@ if(STRATA_NATIVE_EXPERTS)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
     # GGML's CUDA error reporting calls cuGetErrorString from the driver API.
-    target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
     if(TARGET CUDA::cuda_driver)   # not in the HIP (gfx906) build, whose CUDA::cudart is a stand-in
       target_link_libraries(strata_mmq PUBLIC CUDA::cuda_driver)
     endif()

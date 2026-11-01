@@ -13791,7 +13791,7 @@ int main(int argc, char** argv) {
             const bool in_main = live_ok && cvec_cached == sl.cvec && prefix_of(live) &&
                                  imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
             if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
-            if (conversations.supersedes_richer(sl.ids, {}, sl.checks, sl.cvec)) {
+            if (conversations.supersedes_richer(std::vector<int32_t>(sl.ids.begin(), sl.ids.end()), {}, sl.checks, sl.cvec)) {
                 // its park would drop (as superseded) the main session's copy of this conversation, and with it the checkpoints the slot
                 // does not hold - an agent's system-prompt root that the next requests borrow (#4420, as 0.2.6 did: the slot is overwritten)
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (a parked copy of its "

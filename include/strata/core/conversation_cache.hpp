@@ -692,7 +692,8 @@ public:
     bool supersedes_richer(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
         auto held = [&](const ConversationCheckpoint& c) {
-            if (c.ids == ids && c.imgs == images) return true;
+            if (c.ids.size() == ids.size() && std::equal(c.ids.begin(), c.ids.end(), ids.begin()) &&
+                c.imgs == images) return true;
             for (const auto& k : checkpoints)
                 if (k.ids == c.ids && k.imgs == c.imgs) return true;
             return false;

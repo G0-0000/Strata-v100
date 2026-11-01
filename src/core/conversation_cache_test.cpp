@@ -803,7 +803,7 @@ int main() {
         // #4420: a batch slot's chain holds one checkpoint (its admission's): parking it must not drop (#342) the main session's copy of the
         // same conversation that also holds the root a sibling borrows from (an agent's system prompt and tools) - supersedes_richer()
         // names that case, so the slot is not parked
-        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids.assign(ids.begin(), ids.end()); return c; };
         SavedConversation main_copy = image({1, 2, 3, 4, 10, 11, 12});
         main_copy.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
         ConversationCache cache(1 << 20, 4);
@@ -821,7 +821,7 @@ int main() {
         const auto sib = cache.best(std::vector<int64_t>{1, 2, 3, 4, 40}, {}, true);
         check(sib.tokens == 4 && cache.borrows(sib), "a sibling still borrows the root");
         // what drop_superseded does with the slot's chain (the park this rule prevents): the root goes
-        check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
+        check(cache.drop_superseded(ConversationIds(slot_ids.begin(), slot_ids.end()), {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);

@@ -4471,6 +4471,7 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        self._live_note = None                        # the one session file known to be in the engine's live chain
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -4641,6 +4642,7 @@ class Service:
     def note_client_disconnect(self, cancel: threading.Event) -> None:
         """Cancel once; count only work that was still queued or active when the client left."""
         with self.status_lock:
+            self._live_note = None
             if not cancel.is_set():
                 request_id = getattr(cancel, "_strata_request_id", None)
                 active = request_id in self.terminal_requests
@@ -4728,6 +4730,7 @@ class Service:
         waiting = True
         try:
             with self.fifo:
+                self._live_note = None
                 with self.status_lock:
                     self.status["queued"] -= 1
                 waiting = False
@@ -5015,6 +5018,7 @@ class Service:
             raise ValueError("this engine cannot resize its VRAM use")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
+        self._live_note = None
         # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,
         # and the engine refuses a resize while a slot decodes
         ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
@@ -5436,6 +5440,7 @@ class Service:
             while not self.fifo.acquire(timeout=0.25):
                 if cancel.is_set():
                     raise ClientGone()
+        self._live_note = None                         # image turns may resize, unload, or use the engine
         try:
             yield
         finally:
@@ -6031,8 +6036,15 @@ class Service:
                         turn.callback(self.fifo.release)
                     else:
                         yield "ping", None
+            def finish_turn(exc_type, _exc, _tb):
+                # Run before releasing the fifo, including on generator close or a cancelled save.
+                if exc_type is not None or cancel.is_set():
+                    self._live_note = None
+            turn.push(finish_turn)
             with turn:
                 try:
+                    if session is None or not session.get("restore"):
+                        self._live_note = None
                     with self.status_lock:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
@@ -6053,14 +6065,25 @@ class Service:
                         with self._inference_fifo(deadline, cancel):
                             self.ensure_loaded()
                     if session is not None and session.get("restore"):
-                        # a composite strata_session request: the restore runs here, inside this request's fifo turn
-                        # and before any generation, so restore -> generate -> save cannot interleave with another
-                        # request.  A refusal (SessionRefused) or a dead engine fails the whole request: nothing is
-                        # generated and nothing is saved.  Only the phase is set: busy stays off until the prompt is
-                        # read, so a failed restore records no history row.
+                        # a composite strata_session request: restore or skip inside this request's fifo turn and
+                        # before any generation, so restore -> generate -> save cannot interleave with another request.
+                        # A refusal (SessionRefused) or a dead engine fails the whole request: nothing is generated and
+                        # nothing is saved. Only the phase is set: busy stays off until the prompt is read, so a failed
+                        # restore records no history row.
                         with self.status_lock:
                             st.update(phase="restoring a session", started=time.time(), first_token=None)
-                        restored = self.engine.session_file("restore", session["restore"])
+                        note = self._live_note
+                        engine_gen = getattr(self.engine, "gen", None)
+                        hit = (note is not None and engine_gen is not None
+                               and note["gen"] == engine_gen and note["path"] == session["restore"]
+                               and (not session.get("splice")
+                                    or note["base_tokens"] == session.get("splice_engine_tokens")))
+                        if hit:
+                            restored = {"tokens": note["base_tokens"], "skipped": True}
+                        else:
+                            restored = self.engine.session_file("restore", session["restore"])
+                            self._live_note = {"path": session["restore"], "base_tokens": restored["tokens"],
+                                               "gen": getattr(self.engine, "gen", None)}
                         session_out["restored"] = restored
                         if session.get("splice") and restored["tokens"] != session.get("splice_engine_tokens"):
                             raise SpliceConflict("splice_stale", f"{session['restore_name']}: the engine restored "
@@ -6446,13 +6469,15 @@ class Service:
                         try:
                             saved = self.engine.session_file("save", session["save"])
                         except SessionRefused as e:
-                            # the engine is still in step: the answer stands, the failure rides it (the sidecar is
-                            # not written, so a later splice of this name answers 409 until a save succeeds)
+                            # the engine is still in step: the answer stands, the failure rides it. No sidecar is
+                            # written; an existing sidecar and the restored file's note are left in place.
                             session_out["save_error"] = {"kind": e.kind, "reason": str(e)}
                             if e.published:
                                 session_out["save_error"]["published"] = True
                         else:
                             session_out["saved"] = saved
+                            self._live_note = {"path": session["save"], "base_tokens": saved["tokens"],
+                                               "gen": getattr(self.engine, "gen", None)}
                             if recovery_count:
                                 # the engine state is right (.sess is saved), but this server's submitted ids were
                                 # re-sent mid-generation (reasoning_loop_recovery): a sidecar written from them

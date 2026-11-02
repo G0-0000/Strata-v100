@@ -1231,10 +1231,12 @@ holds the engine between them: add an opt-in `strata_session` object beside `mes
   files. Four combinations: `restore` alone (answer from the saved conversation, write nothing), `save` alone
   (answer, then save), `restore` + `save` (continue and keep the result), and neither (an empty object asks for
   nothing: the request is ordinary).
-- The restore runs after the model is loaded and before the prompt is read; the save runs after the answer is
-  complete, both inside the request's own engine turn. No other request can interleave: restore → answer → save
-  is atomic because the engine's turn is held throughout. There is no lock of its own.
-- The answer carries a `session` block: `"restored"` / `"saved"` are the engine's `{tokens, bytes, ms}` answers.
+- The restore is done (or skipped as described below) after the model is loaded and before the prompt is read; the
+  save runs after the answer is complete, both inside the request's own engine turn. No other request can interleave:
+  restore → answer → save is atomic because the engine's turn is held throughout. There is no lock of its own.
+- The answer carries a `session` block: `"saved"` and a restore that ran are the engine's `{tokens, bytes, ms}`
+  answers. A skipped restore instead reports `"restored": {"tokens": N, "skipped": true}`; there are no engine
+  `bytes` or `ms` for that restore.
 - A restore the engine refuses (or a dead engine) fails the whole request: nothing is generated, nothing is saved.
   A save the engine refuses does not fail the answer: the response is still 200, `"saved"` is absent and
   `"save_error": {"kind", "reason"}` (plus `published` when it applies, as above) says why. The session file
@@ -1243,6 +1245,19 @@ holds the engine between them: add an opt-in `strata_session` object beside `mes
   the response is still 200 and carries both: `"saved"` (the engine's save succeeded) and
   `"save_error": {"kind": "io", "reason"}` — a later splice of that name answers 409 until a save writes the
   sidecar.
+
+The server remembers one session file in memory after a successful restore or save. If the same file is requested
+again, the engine has not restarted, and no other request has used the engine in between, the server skips the
+redundant restore. The file name is its identity; the server does not watch for changes made outside the server.
+For a splice, the remembered file's engine token count must also match the sidecar's engine count; otherwise the server
+runs the ordinary restore. The sidecar is still read again inside the engine turn even when the restore is skipped.
+The engine checks the prompt against its cached token ids and recomputes when they do not match.
+Skipping is the default and has no setting: the server always skips a redundant restore when it can. To go
+back to restoring every time, revert the change.
+
+Skipping keeps the engine running from its live state rather than reloading the file each time. As with the replay
+limit described above, the same request can produce different output tokens after some point on these two paths;
+exact future token replay is not guaranteed.
 
 With `"splice": true` the request's `messages` carry only the new turns. The server keeps a small token sidecar
 beside each saved session — `NAME.sess.tokens.json`, format version 2: the token ids the engine was handed plus the

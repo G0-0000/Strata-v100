@@ -16,6 +16,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
@@ -43,6 +44,7 @@ class FakeEngine(MockEngine):
         self.restore_error = None             # (kind, reason): session_file("restore") raises SessionRefused
         self.save_refusal = None              # (kind, reason): session_file("save") raises SessionRefused
         self.reused = 0                       # the RESUME figure Service.run reads after the generation
+        self.gen = 1                          # the engine process generation, incremented on restart
         self.next_reused = None               # set self.reused on the next generate()
         self.gen_gate = None                  # threading.Event: when set, generate() waits on it before GEN
         self.gen_entered = None               # threading.Event: generate() sets it once it waits on the gate
@@ -503,7 +505,8 @@ class Composite(unittest.TestCase):
         self.assertEqual(splice["base_tokens"], len(first["ids"]))     # the ids the new turns were spliced onto
         self.assertEqual(splice["resume"], first["engine_tokens"])
         self.assertTrue(splice["resume_ok"], splice)
-        self.assertEqual(self.engine.commands, ["GEN", "SAVE", "RESTORE", "GEN"])
+        # 2026-11-02 intentional behavior change: personal/plans/20261102-strata-session-skip-restore.md.
+        self.assertEqual(self.engine.commands, ["GEN", "SAVE", "GEN"])
 
     def test_t10_a_version_1_sidecar_heals_with_one_full_resend(self):
         base = self.base_ids("one", "one done")
@@ -536,6 +539,155 @@ class Composite(unittest.TestCase):
         data = json.loads(self.sidecar("t11.sess").read_text())
         self.assertEqual(data["engine_tokens"], 5)                   # the engine's count: authoritative for restore
         self.assertGreater(len(data["ids"]), 6)
+
+
+    def seed_skip_file(self, name):
+        base = self.base_ids("base", "base answer")
+        self.write_sidecar(name, base)
+        count = self.engine_count(base)
+        self.engine.files[str(Path(self.dir.name, name))] = count
+        return count
+
+    def test_skip_restore_same_file_and_recheck_sidecar_inside_turn(self):
+        name = "skip-hit.sess"
+        original_count = self.seed_skip_file(name)
+        body = {"messages": [{"role": "user", "content": "next"}],
+                "strata_session": {"restore": name, "save": name, "splice": True}}
+        s, first = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, first)
+        self.assertEqual(first["session"]["restored"]["tokens"], original_count)
+        self.assertEqual(self.engine.commands, ["RESTORE", "GEN", "SAVE"])
+        saved_count = first["session"]["saved"]["tokens"]
+        self.engine.commands = []
+        s, second = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, second)
+        self.assertEqual(self.engine.commands, ["GEN", "SAVE"])
+        self.assertEqual(second["session"]["restored"], {"tokens": saved_count, "skipped": True})
+
+        # A same-length sidecar replacement between prepare and the turn must still be caught on a hit.
+        self.engine.commands = []
+        sidecar_base = self.svc._sidecar_base
+        reads = 0
+
+        def replace_after_prepare(session):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                data = json.loads(self.sidecar(name).read_text(encoding="utf-8"))
+                data["ids"][0] += 1
+                self.sidecar(name).write_text(json.dumps(data), encoding="utf-8")
+            return sidecar_base(session)
+
+        with mock.patch.object(self.svc, "_sidecar_base", side_effect=replace_after_prepare):
+            s, conflict = self.post("/v1/chat/completions", body)
+        self.assertEqual(reads, 2)
+        self.assertEqual(s, 409, conflict)
+        self.assertEqual(conflict["error"]["type"], "splice_stale")
+        self.assertEqual(self.engine.commands, [])                 # no RESTORE, GEN, or SAVE
+        self.assertIsNone(self.svc._live_note)                      # an exception inside the turn invalidates it
+
+    def test_plain_chat_invalidates_skip_restore(self):
+        name = "skip-plain.sess"
+        self.seed_skip_file(name)
+        body = {"messages": [{"role": "user", "content": "next"}],
+                "strata_session": {"restore": name, "save": name, "splice": True}}
+        s, first = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, first)
+        self.engine.commands = []
+        s, plain = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "plain"}]})
+        self.assertEqual(s, 200, plain)
+        self.assertNotIn("session", plain)
+        s, second = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, second)
+        self.assertEqual(self.engine.commands, ["GEN", "RESTORE", "GEN", "SAVE"])
+        self.assertNotIn("skipped", second["session"]["restored"])
+
+    def test_save_refusal_keeps_the_restored_file_note(self):
+        name = "skip-save-fail.sess"
+        count = self.seed_skip_file(name)
+        before = self.sidecar(name).read_bytes()
+        self.engine.save_refusal = ("storage", "No space left on device")
+        body = {"messages": [{"role": "user", "content": "next"}],
+                "strata_session": {"restore": name, "save": name, "splice": True}}
+        s, first = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, first)
+        self.assertEqual(first["session"]["save_error"]["kind"], "storage")
+        self.assertEqual(self.engine.commands, ["RESTORE", "GEN", "SAVE"])
+        self.assertEqual(self.sidecar(name).read_bytes(), before)
+        self.assertGreater(self.engine.live, count)
+        self.assertEqual(self.svc._live_note, {"path": str(Path(self.dir.name, name)),
+                                               "base_tokens": count, "gen": self.engine.gen})
+        self.engine.save_refusal = None
+        self.engine.commands = []
+        s, second = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, second)
+        self.assertEqual(self.engine.commands, ["GEN", "SAVE"])
+        self.assertEqual(second["session"]["restored"], {"tokens": count, "skipped": True})
+
+    def test_different_file_does_not_skip_restore(self):
+        self.seed_skip_file("skip-a.sess")
+        count = self.seed_skip_file("skip-b.sess")
+        body = {"messages": [{"role": "user", "content": "next"}],
+                "strata_session": {"restore": "skip-a.sess", "splice": True}}
+        s, first = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, first)
+        body["strata_session"]["restore"] = "skip-b.sess"
+        s, second = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, second)
+        self.assertEqual(self.engine.commands, ["RESTORE", "GEN", "RESTORE", "GEN"])
+        self.assertEqual(second["session"]["restored"], {"tokens": count, "bytes": count * 4, "ms": 12.5})
+
+    def test_engine_work_and_generation_change_restore(self):
+        name = "skip-restart.sess"
+        self.seed_skip_file(name)
+        body = {"messages": [{"role": "user", "content": "next"}],
+                "strata_session": {"restore": name, "splice": True}}
+        s, first = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, first)
+
+        cancel = threading.Event()
+        self.svc.note_client_disconnect(cancel)
+        self.assertTrue(cancel.is_set())
+        self.assertIsNone(self.svc._live_note)
+        self.engine.commands = []
+        s, after_cancel = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, after_cancel)
+        self.assertEqual(self.engine.commands, ["RESTORE", "GEN"])
+
+        s, legacy = self.svc.slot_action("0", "save", "skip-legacy.sess")
+        self.assertEqual(s, 200, legacy)
+        self.assertIsNone(self.svc._live_note)
+        self.engine.commands = []
+        s, after_slot = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, after_slot)
+        self.assertEqual(self.engine.commands, ["RESTORE", "GEN"])
+
+        with mock.patch.object(self.engine, "vram", return_value={}, create=True):
+            self.assertEqual(self.svc.vram(None)["status"], "ok")
+        self.assertIsNone(self.svc._live_note)
+        self.engine.commands = []
+        s, after_vram = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, after_vram)
+        self.assertEqual(self.engine.commands, ["RESTORE", "GEN"])
+
+        old_gen = self.engine.gen
+        self.addCleanup(setattr, self.engine, "gen", old_gen)
+        self.engine.gen += 1
+        self.engine.commands = []
+        s, second = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 200, second)
+        self.assertEqual(self.engine.commands, ["RESTORE", "GEN"])
+        self.assertNotIn("skipped", second["session"]["restored"])
+
+        # A different sidecar engine count must fall back to RESTORE, not be rejected by the note.
+        data = json.loads(self.sidecar(name).read_text(encoding="utf-8"))
+        data["engine_tokens"] += 1
+        self.sidecar(name).write_text(json.dumps(data), encoding="utf-8")
+        self.engine.commands = []
+        s, conflict = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 409, conflict)
+        self.assertEqual(conflict["error"]["type"], "splice_stale")
+        self.assertEqual(self.engine.commands, ["RESTORE"])
 
 
 if __name__ == "__main__":

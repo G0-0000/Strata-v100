@@ -164,6 +164,8 @@ public:
             std::filesystem::rename(local_path, target, rename_error);
             if (rename_error) { error = "cannot publish " + name + ": " + rename_error.message(); return false; }
             flush_directory();
+            // stage() registered the published name, not the writer's temporary that was just renamed onto it
+            fresh_.erase(target.string());
         }
         const Inspection info = inspect_local(target);
         if (!info.inspected || !info.regular) {

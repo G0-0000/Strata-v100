@@ -953,8 +953,9 @@ struct Options {
     /// this engine, byte-identical to the last release.  plugin is the external cache plugin (protocol v3,
     /// S1 skeleton): the engine handshakes with it over a unix socket BEFORE any weight is read, maps the
     /// memfd the plugin hands over at the announced base, and refuses every EXPLICITLY set engine-side
-    /// conversation cache option (an unset one is forced to 0: current-session-only; --prompt-cache must be
-    /// 0); acquire/release and the segment moves arrive in later steps.  Plugin mode needs --serve.
+    /// conversation cache option (an unset one is forced to 0: current-session-only; --prompt-cache 0 is
+    /// refused - the checkpoints stay on); acquire/release and the segment moves arrive in later steps.
+    /// Plugin mode needs --serve.
     std::string conversation_cache_store = "local";
     /// --conversation-cache-store-socket PATH: the plugin's control socket (plugin store only)
     std::string conversation_cache_store_socket;
@@ -4152,7 +4153,7 @@ int main(int argc, char** argv) {
         if (o.batch > 0) refuse("--batch (needs 0 in plugin mode)");
         if (!o.layer_split.empty()) refuse("--layer-split");
         if (o.peer_device > 0) refuse("--peer-device");
-        if (o.prompt_cache != 0) refuse("--prompt-cache (needs 0 in plugin mode)");
+        if (o.prompt_cache <= 0) refuse("--prompt-cache (needs >= 1 in plugin mode)");
         if (o.conversation_cache_store_socket.empty()) {
             std::fprintf(stderr, "strata serve: --conversation-cache-store plugin needs --conversation-cache-store-socket\n");
             refused = true;

@@ -952,9 +952,9 @@ struct Options {
     /// --conversation-cache-store local|plugin: where the conversation cache lives.  local (the default) is
     /// this engine, byte-identical to the last release.  plugin is the external cache plugin (protocol v3,
     /// S1 skeleton): the engine handshakes with it over a unix socket BEFORE any weight is read, maps the
-    /// memfd the plugin hands over at the announced base, and refuses every engine-side conversation cache
-    /// path (--conversation-cache-*, --prompt-cache, --batch, splits); acquire/release and the segment moves
-    /// arrive in later steps.  Plugin mode needs --serve.
+    /// memfd the plugin hands over at the announced base, and refuses every EXPLICITLY set engine-side
+    /// conversation cache option (an unset one is forced to 0: current-session-only; --prompt-cache must be
+    /// 0); acquire/release and the segment moves arrive in later steps.  Plugin mode needs --serve.
     std::string conversation_cache_store = "local";
     /// --conversation-cache-store-socket PATH: the plugin's control socket (plugin store only)
     std::string conversation_cache_store_socket;
@@ -3446,6 +3446,9 @@ int main(int argc, char** argv) {
     bool have_tokens = false;
     bool have_logits_stride = false;
     bool ram_keep_by_flag = false;
+    // the plugin store's conflict rule (below): a cache option the user EXPLICITLY passed is refused when
+    // nonzero, an option never given is silently forced to 0
+    bool cache_mib_seen = false, cache_slots_seen = false, cache_min_tokens_seen = false, cache_park_gain_seen = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -3684,6 +3687,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
             ++i;
+            cache_min_tokens_seen = true;
             o.conversation_cache_min_tokens = limits.write_min_tokens;
             o.conversation_cache_min_read_tokens = limits.read_min_tokens;
         }
@@ -3703,12 +3707,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
                 return 2;
             }
-            if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
+            if (a == "--conversation-cache-mib") { o.conversation_cache_mib = number; cache_mib_seen = true; }
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
-            else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
+            else if (a == "--conversation-cache-park-gain") { o.conversation_cache_park_gain = number; cache_park_gain_seen = true; }
             else if (a == "--conversation-cache-min-delta-tokens") o.conversation_cache_min_delta_tokens = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
-            else if (a == "--conversation-cache-slots") o.conversation_cache_slots = (int) number;
+            else if (a == "--conversation-cache-slots") { o.conversation_cache_slots = (int) number; cache_slots_seen = true; }
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
             else o.conversation_cache_n_min = number;
@@ -4112,8 +4116,11 @@ int main(int argc, char** argv) {
     }
     if (o.conversation_cache_store == "plugin") {
         // The plugin store is a --serve mode (the handshake needs the resident loop), and the plugin owns the
-        // conversation cache: every engine-side conversation cache path must be off.  Each conflict is named
-        // as it is refused - a half-open cache is worse than a refusal at startup.
+        // conversation cache: every engine-side conversation cache path must be off.  A cache option the user
+        // EXPLICITLY passed a nonzero value is a named conflict; one never given is just forced to 0 here, so
+        // the engine runs current-session-only and the parked/disk tiers stay dark.  slot-save-path is not an
+        // engine option - it is checked in serve/server.py.  Each conflict is named as it is refused - a
+        // half-open cache is worse than a refusal at startup.
         if (!o.serve) {
             std::fprintf(stderr, "strata generate: --conversation-cache-store plugin needs --serve\n");
             return 2;
@@ -4123,18 +4130,25 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: --conversation-cache-store plugin conflicts with %s\n", what);
             refused = true;
         };
-        if (o.conversation_cache_mib != 0) refuse("--conversation-cache-mib (needs 0 in plugin mode)");
-        if (o.conversation_cache_slots != 0) refuse("--conversation-cache-slots (needs 0 in plugin mode)");
+        if (cache_mib_seen && o.conversation_cache_mib != 0)
+            refuse("--conversation-cache-mib (needs 0 in plugin mode)");
+        if (cache_slots_seen && o.conversation_cache_slots != 0)
+            refuse("--conversation-cache-slots (needs 0 in plugin mode)");
+        if (cache_min_tokens_seen &&
+            (o.conversation_cache_min_tokens != 0 || o.conversation_cache_min_read_tokens != 0))
+            refuse("--conversation-cache-min-tokens (needs 0 in plugin mode)");
+        if (cache_park_gain_seen && o.conversation_cache_park_gain != 0)
+            refuse("--conversation-cache-park-gain (needs 0 in plugin mode)");
+        if (!cache_mib_seen) o.conversation_cache_mib = 0;
+        if (!cache_slots_seen) o.conversation_cache_slots = 0;
+        if (!cache_park_gain_seen) o.conversation_cache_park_gain = 0;
         if (o.conversation_cache_disk_only) refuse("--conversation-cache-disk-only");
         if (o.conversation_cache_disk_delta) refuse("--conversation-cache-disk-delta");
         if (o.conversation_cache_disk_state_ref) refuse("--conversation-cache-disk-state-ref");
         if (o.conversation_cache_disk_state_codec_rht) refuse("--conversation-cache-disk-state-codec-rht");
         if (o.conversation_cache_disk_background_state) refuse("--conversation-cache-disk-background-state");
         if (o.conversation_cache_disk_recompute_gate) refuse("--conversation-cache-disk-recompute-gate");
-        if (o.conversation_cache_min_tokens != 0 || o.conversation_cache_min_read_tokens != 0)
-            refuse("--conversation-cache-min-tokens (needs 0 in plugin mode)");
         if (!o.conversation_cache_spill_dir.empty()) refuse("--conversation-cache-spill-dir");
-        if (o.conversation_cache_park_gain != 0) refuse("--conversation-cache-park-gain (needs 0 in plugin mode)");
         if (o.batch > 0) refuse("--batch (needs 0 in plugin mode)");
         if (!o.layer_split.empty()) refuse("--layer-split");
         if (o.peer_device > 0) refuse("--peer-device");

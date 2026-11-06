@@ -33,6 +33,8 @@
 #include "strata/core/serve_stop_bound.hpp"
 #endif
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_plugin_client.hpp"
+#include "strata/core/shared_control.hpp"
 #include "strata/core/rht_state_codec.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -144,6 +146,7 @@
 #else
 #include <unistd.h>
 #include <cerrno>
+#include <sys/mman.h>   // the plugin share's mmap (MAP_FIXED_NOREPLACE; its #ifndef fallback lives at the use)
 #include <sys/stat.h>
 #if !defined(__APPLE__)   // major() / minor(): <sys/types.h> on macOS
 #include <sys/sysmacros.h>
@@ -946,6 +949,15 @@ struct Options {
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
     int prompt_cache = 6;
+    /// --conversation-cache-store local|plugin: where the conversation cache lives.  local (the default) is
+    /// this engine, byte-identical to the last release.  plugin is the external cache plugin (protocol v3,
+    /// S1 skeleton): the engine handshakes with it over a unix socket BEFORE any weight is read, maps the
+    /// memfd the plugin hands over at the announced base, and refuses every engine-side conversation cache
+    /// path (--conversation-cache-*, --prompt-cache, --batch, splits); acquire/release and the segment moves
+    /// arrive in later steps.  Plugin mode needs --serve.
+    std::string conversation_cache_store = "local";
+    /// --conversation-cache-store-socket PATH: the plugin's control socket (plugin store only)
+    std::string conversation_cache_store_socket;
     int64_t conversation_cache_mib = -1; // host RAM for independent conversations; -1: not given, --serve sizes it from the free RAM (#3493), 0: off
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
@@ -1193,6 +1205,11 @@ void usage() {
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --conversation-cache-spill-dir DIR  --serve: keep conversations the RAM cache evicts on disk,\n"
                  "                       across restarts (default off; needs --conversation-cache-mib)\n"
+                 "  --conversation-cache-store local|plugin  --serve: the conversation cache in this engine\n"
+                 "                       (local, the default) or in the external cache plugin: the engine\n"
+                 "                       handshakes with it before any weight is read and refuses every engine-side\n"
+                 "                       conversation cache path (plugin mode is the S1 skeleton: handshake only)\n"
+                 "  --conversation-cache-store-socket PATH  the plugin's control socket (with store plugin)\n"
                  "  --conversation-cache-disk-only  --serve, one GPU: the conversation cache on disk only: a\n"
                  "                       conversation switched away from is streamed from the GPU straight into\n"
                  "                       --conversation-cache-spill-dir and streamed back when it returns (no RAM\n"
@@ -3703,6 +3720,16 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-disk-state-codec-rht") o.conversation_cache_disk_state_codec_rht = true;
         else if (a == "--conversation-cache-disk-background-state") o.conversation_cache_disk_background_state = true;
         else if (a == "--conversation-cache-disk-recompute-gate") o.conversation_cache_disk_recompute_gate = true;
+        else if (a == "--conversation-cache-store") {
+            const std::string value = next("--conversation-cache-store");
+            if (value != "local" && value != "plugin") {
+                std::fprintf(stderr, "--conversation-cache-store needs local or plugin\n");
+                return 2;
+            }
+            o.conversation_cache_store = value;
+        }
+        else if (a == "--conversation-cache-store-socket")
+            o.conversation_cache_store_socket = next("--conversation-cache-store-socket");
         else if (a == "--conversation-cache-origin-split") o.conversation_cache_origin_split = true;
         else if (a == "--conversation-cache-disk-delta-percent") {
             const std::string value = next("--conversation-cache-disk-delta-percent");
@@ -4082,6 +4109,41 @@ int main(int argc, char** argv) {
                              (long long) o.conversation_cache_min_free_mib);
             }
         }
+    }
+    if (o.conversation_cache_store == "plugin") {
+        // The plugin store is a --serve mode (the handshake needs the resident loop), and the plugin owns the
+        // conversation cache: every engine-side conversation cache path must be off.  Each conflict is named
+        // as it is refused - a half-open cache is worse than a refusal at startup.
+        if (!o.serve) {
+            std::fprintf(stderr, "strata generate: --conversation-cache-store plugin needs --serve\n");
+            return 2;
+        }
+        bool refused = false;
+        const auto refuse = [&refused](const char* what) {
+            std::fprintf(stderr, "strata serve: --conversation-cache-store plugin conflicts with %s\n", what);
+            refused = true;
+        };
+        if (o.conversation_cache_mib != 0) refuse("--conversation-cache-mib (needs 0 in plugin mode)");
+        if (o.conversation_cache_slots != 0) refuse("--conversation-cache-slots (needs 0 in plugin mode)");
+        if (o.conversation_cache_disk_only) refuse("--conversation-cache-disk-only");
+        if (o.conversation_cache_disk_delta) refuse("--conversation-cache-disk-delta");
+        if (o.conversation_cache_disk_state_ref) refuse("--conversation-cache-disk-state-ref");
+        if (o.conversation_cache_disk_state_codec_rht) refuse("--conversation-cache-disk-state-codec-rht");
+        if (o.conversation_cache_disk_background_state) refuse("--conversation-cache-disk-background-state");
+        if (o.conversation_cache_disk_recompute_gate) refuse("--conversation-cache-disk-recompute-gate");
+        if (o.conversation_cache_min_tokens != 0 || o.conversation_cache_min_read_tokens != 0)
+            refuse("--conversation-cache-min-tokens (needs 0 in plugin mode)");
+        if (!o.conversation_cache_spill_dir.empty()) refuse("--conversation-cache-spill-dir");
+        if (o.conversation_cache_park_gain != 0) refuse("--conversation-cache-park-gain (needs 0 in plugin mode)");
+        if (o.batch > 0) refuse("--batch (needs 0 in plugin mode)");
+        if (!o.layer_split.empty()) refuse("--layer-split");
+        if (o.peer_device > 0) refuse("--peer-device");
+        if (o.prompt_cache != 0) refuse("--prompt-cache (needs 0 in plugin mode)");
+        if (o.conversation_cache_store_socket.empty()) {
+            std::fprintf(stderr, "strata serve: --conversation-cache-store plugin needs --conversation-cache-store-socket\n");
+            refused = true;
+        }
+        if (refused) return 2;
     }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
@@ -4737,6 +4799,62 @@ int main(int argc, char** argv) {
     if (!o.native_head_gguf.empty() && !o.stream_token) {
         std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
         return 2;
+    }
+    if (o.conversation_cache_store == "plugin") {
+        // The plugin store's handshake runs here, BEFORE any weight is read (S1v3's startup order): connect,
+        // hello, and the share's memfd, mapped at the address the plugin announced.  Any failure exits 2 with
+        // the address (or the errno): a run that starts without its announced cache is worse than a refusal.
+#ifndef MAP_FIXED_NOREPLACE   // kernel 4.17+; an older toolchain's headers may lack the name
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+        strata::core::PluginShare share;
+        strata::core::PluginClientError perr = strata::core::PluginClientError::none;
+        std::string pdetail;
+        // S1: the identity object is empty - the model/config ids arrive with the store handoff (v10).
+        if (!strata::core::plugin_hello(o.conversation_cache_store_socket, STRATA_VERSION, "{}", share, perr, pdetail)) {
+            std::fprintf(stderr, "strata generate: conversation-cache-store plugin: hello to %s failed (%s%s%s)\n",
+                         o.conversation_cache_store_socket.c_str(), strata::core::plugin_client_error_name(perr),
+                         pdetail.empty() ? "" : ": ", pdetail.c_str());
+            return 2;
+        }
+        void* share_map = mmap(reinterpret_cast<void*>(static_cast<uintptr_t>(share.share_base)), share.share_bytes,
+                               PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, share.fd, 0);
+        if (share_map == MAP_FAILED) {
+            const int saved = errno;
+            std::fprintf(stderr, "strata generate: conversation-cache-store plugin: mmap of the share at 0x%llx "
+                                 "failed (errno %d: %s)\n", (unsigned long long) share.share_base, saved,
+                         std::strerror(saved));
+            strata::core::plugin_share_close(share);
+            return 2;
+        }
+        if (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(share_map)) != share.share_base) {
+            // The kernel took the mapping elsewhere: it ignored MAP_FIXED_NOREPLACE (a kernel that accepts the
+            // flag's bit without honoring it), so the plugin's pointers would not line up with ours.
+            std::fprintf(stderr, "strata generate: conversation-cache-store plugin: the share landed at 0x%llx, not "
+                                 "at the announced 0x%llx (MAP_FIXED_NOREPLACE ignored)\n",
+                         (unsigned long long) reinterpret_cast<uintptr_t>(share_map),
+                         (unsigned long long) share.share_base);
+            munmap(share_map, share.share_bytes);
+            strata::core::plugin_share_close(share);
+            return 2;
+        }
+        const strata::core::SharedControl* ctl = reinterpret_cast<const strata::core::SharedControl*>(share_map);
+        if (ctl->magic != strata::core::SharedControl::kMagic || ctl->version != strata::core::SharedControl::kVersion) {
+            std::fprintf(stderr, "strata generate: conversation-cache-store plugin: the control block at 0x%llx has "
+                                 "magic 0x%llx version %u (expected magic 0x%llx version %u)\n",
+                         (unsigned long long) share.share_base, (unsigned long long) ctl->magic, ctl->version,
+                         (unsigned long long) strata::core::SharedControl::kMagic,
+                         strata::core::SharedControl::kVersion);
+            munmap(share_map, share.share_bytes);
+            strata::core::plugin_share_close(share);
+            return 2;
+        }
+        std::fprintf(stderr, "strata generate: conversation cache plugin: hello ok, share of %llu bytes mapped at "
+                             "0x%llx (epoch %llu, %u segment%s)\n", (unsigned long long) share.share_bytes,
+                     (unsigned long long) share.share_base, (unsigned long long) ctl->epoch, ctl->segment_count,
+                     ctl->segment_count == 1 ? "" : "s");
+        // The fd can go once the mapping is up: the mapping itself holds the pages.
+        strata::core::plugin_share_close(share);
     }
     // Plan v0.3 P6: where the experts live.  A native pack (tools/iq_pack.py: the IQ2_XS / IQ3_XXS files) keeps
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
@@ -16294,6 +16412,11 @@ int main(int argc, char** argv) {
                                  ms(), read_ms);
                     std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
                 }
+                std::fflush(stdout);
+                continue;
+            }
+            if (line == "DUMP") {   // the plugin store's dump command (S1 skeleton): acknowledged, no data moves
+                std::printf("DUMPED\n");
                 std::fflush(stdout);
                 continue;
             }

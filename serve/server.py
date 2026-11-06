@@ -1121,6 +1121,59 @@ def parse_stage_in_flight_sample(line: str) -> dict | None:
     return {"elapsed_us": elapsed_us, "in_flight_us": in_flight_us}
 
 
+# The cache plugin's client side (S1v3 spec, section 4): one NDJSON request, one reply, over a Unix socket.
+# The plugin holds a cache; it can never fail a request - every failure is a lost cache entry, said once in the log.
+PLUGIN_CONNECT_TIMEOUT_S = 1.0
+PLUGIN_REPLY_TIMEOUT_S = 2.0
+PLUGIN_RETRIES = 2
+PLUGIN_DUMP_WAIT_S = 5.0             # DUMP -> DUMPED (S1 answers at once; the wait only bounds a broken engine)
+
+
+class PluginClient:
+    """One acquire/release exchange with the cache plugin (`plugin_socket`).  `call` sends `op_dict` (the "id" is
+    added here) and returns the reply's parsed dict, or None when the plugin is unreachable, too slow or answered
+    badly - said once in the log, after the retries, and the caller goes on without it."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._id_n = 0
+        self._id_lock = threading.Lock()
+
+    def call(self, op_dict: dict) -> dict | None:
+        with self._id_lock:
+            self._id_n += 1
+            req = {"id": str(self._id_n), **op_dict}
+        payload = (json.dumps(req, separators=(",", ":")) + "\n").encode()
+        err: Exception = OSError("no attempt was made")
+        for _ in range(1 + PLUGIN_RETRIES):
+            try:
+                return self._once(payload, req["id"])
+            except (OSError, ValueError) as e:
+                err = e
+        print(f"[strata] cache plugin {self.path} is not answering ({err}); the request goes on without it",
+              flush=True)
+        return None
+
+    def _once(self, payload: bytes, req_id: str) -> dict:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(PLUGIN_CONNECT_TIMEOUT_S)
+            s.connect(self.path)                        # OSError: nothing listens, or the connect took too long
+            s.settimeout(PLUGIN_REPLY_TIMEOUT_S)
+            s.sendall(payload)
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise ValueError("the plugin closed the connection before a reply")
+                buf += chunk
+                if len(buf) > (1 << 20):                # one line in, one line out: this much is already wrong
+                    raise ValueError("the plugin's reply is not a single line")
+        reply = json.loads(buf.decode("utf-8"))         # ValueError on a malformed line
+        if not isinstance(reply, dict) or reply.get("id") != req_id:
+            raise ValueError(f"the plugin's reply does not answer request {req_id}: {buf[:200]!r}")
+        return reply
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -1135,6 +1188,7 @@ class StrataEngine:
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
     multi = 0                            # DeepSeek --parallel (READY ... multi=N): conversations the engine holds at once (batch = N too)
+    plugin_client = None                 # the config's "plugin_socket" (main() sets it): the cache plugin's client (S1v3 spec 4)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -2549,6 +2603,53 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
+    def _plugin_call(self, op: dict) -> dict | None:
+        """One exchange with the cache plugin (plugin mode; the caller holds the service FIFO).  None - and the one
+        log line the client already printed - when the plugin cannot be reached in time or answers badly."""
+        try:
+            return self.plugin_client.call(op)
+        except Exception as e:                    # the client does not raise; a plugin problem must never take a request down
+            print(f"[strata] cache plugin call failed ({e}); the request goes on without it", flush=True)
+            return None
+
+    def _plugin_acquire(self, ids) -> None:
+        """The plugin's acquire for this request, before the GEN line (still inside the FIFO).  `need_dump`: the engine
+        empties its device cache first (DUMP, a bounded wait for DUMPED), then acquire is asked once more.  Every
+        failure ends here: the request is sent exactly as it would be without the plugin."""
+        first = {"op": "acquire", "epoch": 0, "tokens": len(ids), "identity": {},
+                 "ids": [int(t) for t in ids]}
+        reply = self._plugin_call(dict(first))
+        if not isinstance(reply, dict) or not isinstance(reply.get("result"), dict) \
+                or reply["result"].get("need_dump") is not True:
+            return
+        try:
+            self.proc.stdin.write("DUMP\n")
+            self.proc.stdin.flush()
+        except (OSError, AttributeError):         # the engine is going down; the request path reports it
+            return
+        heard = time.monotonic()
+        while time.monotonic() - heard < PLUGIN_DUMP_WAIT_S:
+            try:
+                line = self.lines.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if line is None:                      # the engine died; the request's own read reports it
+                return
+            if line.strip() == "":
+                continue
+            if line.startswith("DUMPED"):
+                break
+            if line.startswith(("INFO", "WARN")): # engine log lines may interleave; they are not answers
+                continue
+            print(f"[strata] unexpected engine line {line.strip()[:120]!r} while waiting for DUMPED; "
+                  "the request goes on", flush=True)
+            break
+        self._plugin_call(dict(first))
+
+    def _plugin_release(self) -> None:
+        """The plugin's release after the request's DONE (still inside the FIFO); a failure is logged and ignored."""
+        self._plugin_call({"op": "release", "epoch": 0})
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
@@ -2586,6 +2687,8 @@ class StrataEngine:
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
             head = f"GEN 0 prefill=1{rid_key}"
+        if self.plugin_client is not None and rid is None:   # plugin mode (S1v3 spec 4): acquire before the GEN line,
+            self._plugin_acquire(ids)                        # still inside the service FIFO (a rid request: no plugin)
         try:
             if rid is not None:                          # several requests write to the engine at once
                 self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
@@ -2678,6 +2781,7 @@ class StrataEngine:
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
+                    self._plugin_release()               # plugin mode: the request is over, give the entry back
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     return
@@ -2714,6 +2818,7 @@ class StrataEngine:
                         break
                     if line.startswith("DONE"):
                         self._parse_done(line)
+                        self._plugin_release()           # the request ended on STOP: the entry goes back all the same
                         break
                     if not self.can_stop:
                         heard = time.monotonic()
@@ -10379,6 +10484,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                               assume_pass=cache_assume_pass(cfg))
             engine = start_engine_or_fallback(cfg, exe, effort_end, env, lazy, tok, offline=a.offline, batch_telemetry=a.batch_telemetry)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
+        socket_path = cfg.get("plugin_socket")          # S1v3 spec 4: absent = today's behaviour, byte-identical
+        if socket_path is not None:
+            if not isinstance(socket_path, str) or not socket_path.strip():
+                raise SystemExit('[strata] config "plugin_socket" must be a non-empty socket path, or absent')
+            engine.plugin_client = PluginClient(socket_path.strip())
+            print(f"[strata] cache plugin mode: acquire before each request, release after its DONE "
+                  f"({engine.plugin_client.path}); a plugin failure only loses the cache, never the request",
+                  flush=True)
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups and not split else None

@@ -158,7 +158,7 @@ int main() {
     CHECK(strata::core::shared_arena_record(o1, 100, strata::core::kSegmentIds, 0));
     CHECK(strata::core::shared_arena_record(o2, 4096, strata::core::kSegmentK, 3));   // kind 4, layer 3
     std::string perr;
-    CHECK(strata::core::shared_arena_publish(perr));
+    CHECK(strata::core::shared_arena_publish(11, perr));
     CHECK(perr.empty());
     CHECK(share.ctl->state == SharedControl::kStateEngine);
     CHECK(share.ctl->epoch == 1);   // the plugin wrote 0; the publish counted the handover
@@ -182,7 +182,7 @@ int main() {
         const uintptr_t bg = reinterpret_cast<uintptr_t>(big.data());
         CHECK(bg < lo || bg >= lo + share_bytes);   // outside the share: an own anonymous mapping
         CHECK(mapped_with_name("[anon:strata/session_active]"));
-        CHECK(strata::core::shared_arena_publish(perr));   // the release publishes no row for the fallback
+        CHECK(strata::core::shared_arena_publish(11, perr));   // the release publishes no row for the fallback
         CHECK(share.ctl->segment_count == 2 && share.ctl->epoch == 2);
     }
     CHECK(!mapped_with_name("[anon:strata/session_active]"));   // deallocate still munmaps the fallback
@@ -210,7 +210,7 @@ int main() {
 
     // --- the arena's own record refuses the same way once the rows it will publish fill the table ---
     while (strata::core::shared_arena_record(0, 4096, strata::core::kSegmentSidecar, 0)) {}
-    CHECK(strata::core::shared_arena_publish(perr));
+    CHECK(strata::core::shared_arena_publish(11, perr));
     CHECK(share.ctl->segment_count == SharedControl::kTableCapacity);
     CHECK(share.ctl->epoch == 3);
 
@@ -227,7 +227,7 @@ int main() {
 
     // --- record_bytes: the same row record takes, with the arguments in the order a caller states them ---
     CHECK(strata::core::shared_arena_record_bytes(strata::core::kSegmentIds, 0, 4096, 100));
-    CHECK(strata::core::shared_arena_publish(perr));
+    CHECK(strata::core::shared_arena_publish(11, perr));
     CHECK(share.ctl->segment_count == 1);
     CHECK(table[0].offset == 4096 && table[0].bytes == 100 && table[0].kind == 1 && table[0].index == 0);
 

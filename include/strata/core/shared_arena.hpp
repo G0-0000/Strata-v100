@@ -147,7 +147,7 @@ inline bool shared_arena_record_bytes(uint32_t kind, uint32_t index, uint64_t of
 /// pure copy - no page of the session is touched, so a release costs microseconds), the plugin's geometry
 /// numbers are re-asserted from the bound arena, the epoch counts the handover and the state says the engine
 /// owns the share now.  False (with `error`) when no arena is bound.
-inline bool shared_arena_publish(std::string& error) {
+inline bool shared_arena_publish(uint64_t tokens, std::string& error) {
     SharedArena& a = shared_arena_instance();
     if (!a.bound) { error = "the share arena is not bound"; return false; }
     if (a.rows.size() > a.control->table_capacity) {
@@ -160,6 +160,7 @@ inline bool shared_arena_publish(std::string& error) {
     auto* table = reinterpret_cast<SharedControlSegment*>(a.base + SharedControl::kTableOffset);
     for (size_t i = 0; i < a.rows.size(); ++i) table[i] = a.rows[i];
     a.control->segment_count = static_cast<uint32_t>(a.rows.size());
+    a.control->tokens = tokens;   // how many tokens the published session holds
     a.control->epoch += 1;
     std::atomic_thread_fence(std::memory_order_release);   // the rows and the count are visible before the handover
     a.control->state = SharedControl::kStateEngine;

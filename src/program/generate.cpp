@@ -16757,7 +16757,7 @@ int main(int argc, char** argv) {
                     }
                     // the same publish a completed request does: the table says what the share holds right now
                     std::string pub_err;
-                    if (!strata::core::shared_arena_publish(pub_err)) {
+                    if (!strata::core::shared_arena_publish((uint64_t) live.size(), pub_err)) {
                         static bool pub_said = false;
                         if (!pub_said) {
                             pub_said = true;
@@ -21263,7 +21263,7 @@ int main(int argc, char** argv) {
             // once and never breaks the request: the plugin just sees a share that was never handed over.
             if (strata::core::shared_arena_control() != nullptr) {
                 std::string pub_err;
-                if (!strata::core::shared_arena_publish(pub_err)) {
+                if (!strata::core::shared_arena_publish((uint64_t) live.size(), pub_err)) {
                     static bool pub_said = false;
                     if (!pub_said) {
                         pub_said = true;

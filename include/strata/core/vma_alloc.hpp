@@ -28,6 +28,8 @@
 #include <sys/prctl.h>
 #endif
 
+#include "strata/core/shared_arena.hpp"
+
 namespace strata::core {
 
 /// The class names of the approved RAM map (PLAN_RAM_VMA_NAMING_2026-10-16.md §Class names).  Static strings,
@@ -85,6 +87,7 @@ inline std::atomic<uint64_t>& map_fail_after() {
 /// named with the class the buffer belongs to now.  One cell per buffer, made by its allocator's constructors.
 struct ClassCell {
     const char* name = nullptr;   ///< the [anon:<name>] a mapping gets; null: unnamed memory
+    SharedArena* arena = nullptr; ///< the process share this class carves from; null: one own mapping per allocation
 };
 
 /// One mapping: anonymous private pages, page aligned.  No page is touched here - the first touch stays with the
@@ -132,7 +135,14 @@ struct VmaAllocator {
 
     VmaAllocator() = default;
     VmaAllocator(const char* class_name)
-        : cell_(std::make_shared<vma_detail::ClassCell>(vma_detail::ClassCell{class_name})) {}   // NOLINT: vector/std::pmr-style implicit naming
+        : cell_(std::make_shared<vma_detail::ClassCell>(vma_detail::ClassCell{class_name})) {
+        // The current session lives in the plugin's shared segment: a class_name of session_active takes the
+        // process arena when one is bound (generate.cpp binds it at startup, before any session exists).  The
+        // binding is by name, at construction, once for the cell's life: conv_cache - parked images - and the
+        // unnamed default never see the arena, and a cell constructed before the bind keeps its own mappings.
+        if (class_name != nullptr && std::strcmp(class_name, vma_class::session_active) == 0)
+            cell_->arena = shared_arena_handle();
+    }
     template<class U> VmaAllocator(const VmaAllocator<U>& other) noexcept : cell_(other.cell_) {}
     VmaAllocator(const VmaAllocator&) noexcept = default;                  // copies share the buffer's class cell
     VmaAllocator& operator=(const VmaAllocator&) noexcept = default;
@@ -149,17 +159,41 @@ struct VmaAllocator {
     T* allocate(size_t n) {
         if (n > max_size()) throw std::bad_alloc();
         const size_t bytes = std::max<size_t>(1, n * sizeof(T));   // allocate(0) still hands out addressable bytes
+        if (cell_->arena != nullptr) {
+            // The class carves from the shared segment: the size page-rounded so the slices pack without
+            // gaps, the offset the arena returns page aligned (a row a release can publish needs that).  A
+            // carve that does not fit falls through to the kernel mapping below: the session keeps working,
+            // it only stops being published in the segment.
+            const uint64_t rounded = bytes <= UINT64_MAX - (kSharedArenaPageBytes - 1)
+                                         ? (bytes + (kSharedArenaPageBytes - 1)) & ~(kSharedArenaPageBytes - 1)
+                                         : bytes;   // astronomic: no rounding, the arena's fit check refuses it
+            const uint64_t off = shared_arena_alloc(rounded, kSharedArenaPageBytes);
+            if (off != kNoOffset) {
+                void* carved = shared_arena_ptr(off);
+                if (carved != nullptr) return static_cast<T*>(carved);
+            }
+        }
         void* p = vma_detail::map_bytes(bytes);
         if (p == nullptr) throw std::bad_alloc();
         if (const char* class_name = name(); class_name != nullptr) vma_name_warn(p, bytes, class_name);
         return static_cast<T*>(p);
     }
     void deallocate(T* p, size_t n) noexcept {
-        if (p != nullptr) vma_detail::unmap_bytes(p, std::max<size_t>(1, n * sizeof(T)));
+        if (p == nullptr) return;
+        if (cell_->arena != nullptr && cell_->arena->bound) {
+            // A slice of the shared segment: the share owns the pages (the plugin maps the same memfd), so
+            // there is nothing to unmap and nothing to hand back - a bump arena has no free.  A fallback
+            // mapping (the arena was out of bytes) lies outside the share and takes the munmap below.
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(p);
+            if (b >= cell_->arena->base && b < cell_->arena->base + cell_->arena->bytes) return;
+        }
+        vma_detail::unmap_bytes(p, std::max<size_t>(1, n * sizeof(T)));
     }
     size_t max_size() const noexcept { return SIZE_MAX / sizeof(T); }
-    template<class U> bool operator==(const VmaAllocator<U>& other) const noexcept { return name() == other.name(); }
-    template<class U> bool operator!=(const VmaAllocator<U>& other) const noexcept { return name() != other.name(); }
+    template<class U> bool operator==(const VmaAllocator<U>& other) const noexcept {
+        return name() == other.name() && cell_->arena == other.cell_->arena;
+    }
+    template<class U> bool operator!=(const VmaAllocator<U>& other) const noexcept { return !(*this == other); }
 
 private:
     std::shared_ptr<vma_detail::ClassCell> cell_ = std::make_shared<vma_detail::ClassCell>();   ///< the class, shared with this allocator's copies

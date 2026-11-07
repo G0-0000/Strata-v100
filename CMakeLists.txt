@@ -230,6 +230,13 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   target_include_directories(conversation_plugin_client_test PRIVATE include)
   target_link_libraries(conversation_plugin_client_test PRIVATE pthread)
   add_test(NAME conversation_plugin_client_test COMMAND conversation_plugin_client_test)
+  # host-only: the plugin share as the session's arena (shared_arena.hpp + vma_alloc.hpp): the bind, the
+  # page-aligned bump, a session_active VmaAllocator carving from the share while conv_cache maps its own, the
+  # rows published into the control block's table on the plugin's layout, and the fallback when the arena ran
+  # out; no model, no GPU
+  add_executable(shared_arena_test src/core/shared_arena_test.cpp)
+  target_include_directories(shared_arena_test PRIVATE include)
+  add_test(NAME shared_arena_test COMMAND shared_arena_test)
   # host benchmark of the session file/delta writers' stage timings at production geometry (not a test:
   # it writes ~1 GB per round to a scratch dir it removes; run it by hand)
   add_executable(conversation_file_bench src/core/conversation_file_bench.cpp src/core/conversation_file.cpp)

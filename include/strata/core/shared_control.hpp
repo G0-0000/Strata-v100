@@ -20,9 +20,21 @@ constexpr uint64_t kPluginShareBase = 0x600000000000ull;
 struct SharedControlSegment {
     uint64_t offset;  // where the segment's payload starts, in bytes from the share base
     uint64_t bytes;   // the segment's payload size
-    uint32_t kind;    // what the span holds (ids, gdn, ple, K/V part, sidecar)
+    uint32_t kind;    // what the span holds (kSegment* below)
     uint32_t index;   // which entry of that kind (the layer for K/V)
 };
+
+// What a span holds, in the numbering the plugin fixes (its session_encode.hpp): the engine's rows must use
+// exactly these numbers, so both sides read one table.
+inline constexpr uint32_t kSegmentIds = 1;      // the live token ids, int32, 4 bytes each
+inline constexpr uint32_t kSegmentGdn = 2;      // the live GDN running state
+inline constexpr uint32_t kSegmentPle = 3;      // the live PLE running state
+inline constexpr uint32_t kSegmentK = 4;        // one layer's keys; `index` = the layer
+inline constexpr uint32_t kSegmentV = 5;        // the same layer's values
+inline constexpr uint32_t kSegmentKScale = 6;   // the same layer's key scales
+inline constexpr uint32_t kSegmentVScale = 7;   // the same layer's value scales
+inline constexpr uint32_t kSegmentPooled = 8;   // the same layer's pooled indexer keys
+inline constexpr uint32_t kSegmentSidecar = 9;  // the directory and the small state
 
 struct SharedControl {
     static constexpr uint64_t kMagic = 0x5354524154410001ull;   // "STRATA" 0x00 0x01
@@ -51,5 +63,17 @@ static_assert(sizeof(SharedControlSegment) == 24, "one segment row, three pointe
 static_assert(SharedControl::kTableOffset + (uint64_t) SharedControl::kTableCapacity * sizeof(SharedControlSegment)
                   == 28672,
               "the segment table ends at 28672; the segments themselves start there");
+
+/// Append one row to the control block's segment table (which starts at table_offset, right behind this block
+/// in the mapped share): the row lands at segment_count, which grows by one.  False when the table is full
+/// (segment_count has reached table_capacity): the count is left unchanged and nothing is written.
+inline bool shared_control_append_segment(SharedControl& ctl, uint64_t offset, uint64_t bytes,
+                                          uint32_t kind, uint32_t index) {
+    if (ctl.segment_count >= ctl.table_capacity) return false;
+    auto* table = reinterpret_cast<SharedControlSegment*>(reinterpret_cast<uint8_t*>(&ctl) + ctl.table_offset);
+    table[ctl.segment_count] = SharedControlSegment{offset, bytes, kind, index};
+    ctl.segment_count += 1;
+    return true;
+}
 
 }   // namespace strata::core

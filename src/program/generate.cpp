@@ -35,6 +35,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_plugin_client.hpp"
 #include "strata/core/shared_control.hpp"
+#include "strata/core/shared_arena.hpp"
 #include "strata/core/rht_state_codec.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -4853,7 +4854,7 @@ int main(int argc, char** argv) {
             strata::core::plugin_share_close(share);
             return 2;
         }
-        const strata::core::SharedControl* ctl = reinterpret_cast<const strata::core::SharedControl*>(share_map);
+        strata::core::SharedControl* ctl = reinterpret_cast<strata::core::SharedControl*>(share_map);
         if (ctl->magic != strata::core::SharedControl::kMagic || ctl->version != strata::core::SharedControl::kVersion) {
             std::fprintf(stderr, "strata generate: conversation-cache-store plugin: the control block at 0x%llx has "
                                  "magic 0x%llx version %u (expected magic 0x%llx version %u)\n",
@@ -4868,6 +4869,20 @@ int main(int argc, char** argv) {
                              "0x%llx (epoch %llu, %u segment%s)\n", (unsigned long long) share.share_bytes,
                      (unsigned long long) share.share_base, (unsigned long long) ctl->epoch, ctl->segment_count,
                      ctl->segment_count == 1 ? "" : "s");
+        // The share is the process's arena from here on: the current session's memory (vma_alloc's
+        // session_active class, and the KV host pools after it) carves from it, so a release publishes the
+        // session where it already lies.  Bound once, before anything allocates; a share too small for even
+        // the control block and the segment table refuses like every other handshake failure.  (A guard
+        // against a share smaller than the session's own bytes needs the model geometry, which is read later;
+        // the per-allocation fallback covers the difference until then.)
+        std::string arena_err;
+        if (!strata::core::shared_arena_bind(share_map, share.share_bytes, ctl, arena_err)) {
+            std::fprintf(stderr, "strata generate: conversation-cache-store plugin: the share at 0x%llx is not "
+                                 "usable as the session arena (%s)\n",
+                         (unsigned long long) share.share_base, arena_err.c_str());
+            munmap(share_map, share.share_bytes);
+            return 2;
+        }
         // The fd can go once the mapping is up: the mapping itself holds the pages.
         strata::core::plugin_share_close(share);
     }

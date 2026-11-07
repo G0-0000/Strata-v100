@@ -18,9 +18,10 @@ constexpr uint64_t kPluginShareBase = 0x600000000000ull;
 // A segment table row.  S1 writes none (no segment moves yet - the skeleton only fixes the layout so the
 // table's extent never moves in later steps).
 struct SharedControlSegment {
-    uint64_t id;      // the plugin's conversation id
     uint64_t offset;  // where the segment's payload starts, in bytes from the share base
     uint64_t bytes;   // the segment's payload size
+    uint32_t kind;    // what the span holds (ids, gdn, ple, K/V part, sidecar)
+    uint32_t index;   // which entry of that kind (the layer for K/V)
 };
 
 struct SharedControl {

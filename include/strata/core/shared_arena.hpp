@@ -143,6 +143,21 @@ inline bool shared_arena_record_bytes(uint32_t kind, uint32_t index, uint64_t of
     return shared_arena_record(offset, bytes, kind, index);
 }
 
+/// Record or replace the one row for (kind, index): a caller that republishes the same region (the live ids move
+/// with every request) must not grow the table by one row per publish.  False when the arena is not bound.
+inline bool shared_arena_set_row(uint32_t kind, uint32_t index, uint64_t offset, uint64_t bytes) {
+    SharedArena& a = shared_arena_instance();
+    if (!a.bound) return false;
+    for (auto& row : a.rows) {
+        if (row.kind == kind && row.index == index) {
+            row.offset = offset;
+            row.bytes = bytes;
+            return true;
+        }
+    }
+    return shared_arena_record(offset, bytes, kind, index);
+}
+
 /// Publish the recorded rows and hand the share over: the rows are copied into the control block's table (a
 /// pure copy - no page of the session is touched, so a release costs microseconds), the plugin's geometry
 /// numbers are re-asserted from the bound arena, the epoch counts the handover and the state says the engine

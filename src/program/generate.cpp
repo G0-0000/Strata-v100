@@ -21262,6 +21262,14 @@ int main(int argc, char** argv) {
             // into the share's table and flips the state - no page of the session is touched).  A failure logs
             // once and never breaks the request: the plugin just sees a share that was never handed over.
             if (strata::core::shared_arena_control() != nullptr) {
+                // The ids move with the session: keep one row naming them, so the published table always says
+                // where the live token array is (the DUMP path records the rest).
+                if (!live.empty()) {
+                    const uint64_t ids_off = strata::core::shared_arena_offset(live.data());
+                    if (ids_off != strata::core::kNoOffset)
+                        strata::core::shared_arena_set_row(strata::core::kSegmentIds, 0, ids_off,
+                                                           (uint64_t) live.size() * sizeof(int32_t));
+                }
                 std::string pub_err;
                 if (!strata::core::shared_arena_publish((uint64_t) live.size(), pub_err)) {
                     static bool pub_said = false;

@@ -18,6 +18,7 @@
 
 #include "strata/core/shared_control.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <string>

@@ -3730,6 +3730,7 @@ int main(int argc, char** argv) {
     // the plugin store's conflict rule (below): a cache option the user EXPLICITLY passed is refused when
     // nonzero, an option never given is silently forced to 0
     bool cache_mib_seen = false, cache_slots_seen = false, cache_min_tokens_seen = false, cache_park_gain_seen = false;
+    bool cache_disk_mib_seen = false, cache_disk_delta_percent_seen = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -3995,7 +3996,7 @@ int main(int argc, char** argv) {
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--conversation-cache-slots") { o.conversation_cache_slots = (int) number; cache_slots_seen = true; }
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
-            else if (a == "--conversation-cache-disk-mib") o.conversation_cache_disk_mib = number;
+            else if (a == "--conversation-cache-disk-mib") { o.conversation_cache_disk_mib = number; cache_disk_mib_seen = true; }
             else o.conversation_cache_n_min = number;
         }
         else if (a == "--conversation-cache-spill-dir") o.conversation_cache_spill_dir = next("--conversation-cache-spill-dir");
@@ -4024,7 +4025,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--conversation-cache-disk-delta-percent needs an integer in [1, 100]\n");
                 return 2;
             }
-            o.conversation_cache_disk_delta_percent = number;
+            { o.conversation_cache_disk_delta_percent = number; cache_disk_delta_percent_seen = true; }
         }
         else if (a == "--conversation-cache-similarity") {
             const std::string value = next("--conversation-cache-similarity");
@@ -4429,6 +4430,8 @@ int main(int argc, char** argv) {
         if (o.conversation_cache_disk_state_codec_rht) refuse("--conversation-cache-disk-state-codec-rht");
         if (o.conversation_cache_disk_background_state) refuse("--conversation-cache-disk-background-state");
         if (o.conversation_cache_disk_recompute_gate) refuse("--conversation-cache-disk-recompute-gate");
+        if (cache_disk_mib_seen) refuse("--conversation-cache-disk-mib");
+        if (cache_disk_delta_percent_seen) refuse("--conversation-cache-disk-delta-percent");
         if (!o.conversation_cache_spill_dir.empty()) refuse("--conversation-cache-spill-dir");
         if (o.batch > 0) refuse("--batch (needs 0 in plugin mode)");
         if (!o.layer_split.empty()) refuse("--layer-split");

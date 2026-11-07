@@ -172,6 +172,8 @@ struct VmaAllocator {
                 void* carved = shared_arena_ptr(off);
                 if (carved != nullptr) return static_cast<T*>(carved);
             }
+            // The memory below is not in the share: whatever publishes this session must fail closed.
+            shared_arena_mark_incomplete();
         }
         void* p = vma_detail::map_bytes(bytes);
         if (p == nullptr) throw std::bad_alloc();

@@ -607,7 +607,8 @@ uint8_t* kv_host_alloc(uint64_t bytes, uint64_t& share_off) {
             }
             (void) cudaGetLastError();
             // a spent offset cannot be given back (a bump arena has no free): the fallback below keeps the
-            // session up, the block just is not published
+            // session up, and the share is marked incomplete so no partial session is ever published
+            strata::core::shared_arena_mark_incomplete();
         }
     }
     auto host_alloc = [](uint64_t n) -> uint8_t* {

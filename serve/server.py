@@ -10488,6 +10488,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if socket_path is not None:
             if not isinstance(socket_path, str) or not socket_path.strip():
                 raise SystemExit('[strata] config "plugin_socket" must be a non-empty socket path, or absent')
+            if getattr(engine, "multi", 0) or getattr(engine, "batch", 0):
+                raise SystemExit('[strata] "plugin_socket" holds one conversation at a time: it cannot be combined '
+                                 'with --parallel, --batch or --slots > 1')
             engine.plugin_client = PluginClient(socket_path.strip())
             print(f"[strata] cache plugin mode: acquire before each request, release after its DONE "
                   f"({engine.plugin_client.path}); a plugin failure only loses the cache, never the request",

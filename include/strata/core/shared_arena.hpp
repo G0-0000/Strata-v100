@@ -54,6 +54,15 @@ inline SharedArena& shared_arena_instance() {
     return arena;
 }
 
+/// Set once when any piece of the session could not be carved out of the share (a KV pool fell back to its own
+/// mapping).  A session carrying such a piece must not be published.
+inline bool& shared_arena_incomplete_flag() {
+    static bool incomplete = false;
+    return incomplete;
+}
+inline void shared_arena_mark_incomplete() { shared_arena_incomplete_flag() = true; }
+inline bool shared_arena_incomplete() { return shared_arena_incomplete_flag(); }
+
 /// The bound arena, or null when none is bound: what a VmaAllocator's session_active cell holds.  A null cell
 /// keeps one own mapping per allocation - the behaviour before the arena existed, byte for byte.
 inline SharedArena* shared_arena_handle() {
@@ -143,6 +152,11 @@ inline bool shared_arena_record_bytes(uint32_t kind, uint32_t index, uint64_t of
     return shared_arena_record(offset, bytes, kind, index);
 }
 
+/// The share could not hold a piece of this session (a KV pool fell back to a private mapping): the session
+/// must not be published, or a reader would restore a partial image and answer from stale K/V.
+inline void shared_arena_mark_incomplete();
+inline bool shared_arena_incomplete();
+
 /// Drop the rows a DUMP records (the running state: gdn, ple, sidecar).  A request that computed without a dump
 /// leaves rows that name the previous session's bytes; publishing them would hand the reader a stale image.
 inline void shared_arena_erase_running_rows() {
@@ -178,6 +192,19 @@ inline bool shared_arena_set_row(uint32_t kind, uint32_t index, uint64_t offset,
 inline bool shared_arena_publish(uint64_t tokens, std::string& error) {
     SharedArena& a = shared_arena_instance();
     if (!a.bound) { error = "the share arena is not bound"; return false; }
+    if (shared_arena_incomplete()) {
+        // Fail closed: a partial session is not offered.  An empty table with tokens 0 reads as "nothing to
+        // restore", so the next request recomputes instead of resuming from stale K/V.
+        a.control->bytes = a.bytes;
+        a.control->table_offset = SharedControl::kTableOffset;
+        a.control->table_capacity = SharedControl::kTableCapacity;
+        a.control->segment_count = 0;
+        a.control->tokens = 0;
+        a.control->epoch += 1;
+        std::atomic_thread_fence(std::memory_order_release);
+        a.control->state = SharedControl::kStateEngine;
+        return true;
+    }
     if (a.rows.size() > a.control->table_capacity) {
         error = "more recorded rows than the segment table holds";
         return false;

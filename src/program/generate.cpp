@@ -16339,6 +16339,29 @@ int main(int argc, char** argv) {
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
+            // The share's identity (shared_control.hpp's identity[32], offset 56): the plugin keys its store by
+            // it, so the engine's fingerprints are in the block before the first publish or reload touches the
+            // share.  Once per process, on the first request that reaches here: model then config as two
+            // little-endian u64s (identity[0..8) and identity[8..16)), the rest zeroed.  A failure says so once
+            // and leaves the block zeroed - the plugin's lookups then all miss.
+            static bool share_identity_done = false;
+            if (!share_identity_done) {
+                share_identity_done = true;
+                if (strata::core::SharedControl* share_ctl = strata::core::shared_arena_control()) {
+                    strata::core::SessionFileIdentity share_id;
+                    std::string share_id_err;
+                    if (session_identity(share_id, share_id_err, nullptr)) {
+                        const uint64_t share_fps[2] = {share_id.model, share_id.config};
+                        std::memcpy(share_ctl->identity, share_fps, sizeof(share_fps));   // little-endian (x86_64)
+                        std::memset(share_ctl->identity + sizeof(share_fps),
+                                    0, sizeof(share_ctl->identity) - sizeof(share_fps));
+                    } else {
+                        std::fprintf(stderr, "strata serve: the session identity was not computed (%s): the share's "
+                                             "identity stays zeroed and the plugin's store misses\n",
+                                     share_id_err.c_str());
+                    }
+                }
+            }
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
             // RESTORED <tokens> <bytes> <ms>; SERR <invalid|storage|memory|io> <published 0|1> <reason> for a refusal

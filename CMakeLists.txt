@@ -958,6 +958,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(dflash2_attn_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
 
   add_executable(strata src/program/generate.cpp)
+  # the plugin store's client (8893663a calls it from main's handshake): POSIX-only, so Windows keeps
+  # compiling without it (the plugin block itself is a separate, pre-existing gap there)
+  if(UNIX)
+    target_sources(strata PRIVATE src/core/conversation_plugin_client.cpp)
+  endif()
   strata_utf8_manifest(strata)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})

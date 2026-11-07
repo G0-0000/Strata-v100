@@ -394,7 +394,8 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
                              sb, dpct::get_in_order_queue())) != 0) {
         err = "mtp: the K/V state does not fit"; return false;
     }
-    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
+    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring,
+                       (uint32_t) ss.qsa_alloc) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
         /*
@@ -409,7 +410,8 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
                                  sb, dpct::get_in_order_queue())) != 0) {
             err = "mtp: the K/V state does not fit"; return false;
         }
-        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
+        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring,
+                           (uint32_t) ss.qsa_alloc) == 0) { err = "mtp: state init failed"; return false; }
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);

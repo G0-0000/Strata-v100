@@ -5,6 +5,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/numa_policy.hpp"
+#include "strata/core/shared_arena.hpp"
 #include "strata/core/vma_alloc.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -48,6 +49,7 @@
 #include <sys/mman.h>
 #endif
 #include <memory>
+#include <type_traits>
 #include <vector>
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
@@ -584,7 +586,30 @@ uint64_t g_kv_host_bytes = 0;
 // staging buffers. Elsewhere cudaHostAlloc stays first. Either way the other method is the fallback when the first
 // is refused. STRATA_KV_HOST_REGISTER=1/0 forces registering first or cudaHostAlloc first. Like the cudaHostAlloc
 // copy it lives as long as the process.
-uint8_t* kv_host_alloc(uint64_t bytes) {
+//
+// `share_off` (out): when a process share arena is bound (shared_arena.hpp, the plugin's memfd) the whole block is
+// carved from it, so the session's authoritative K/V lies in the segment a release publishes where it already lies;
+// `share_off` is the block's offset there.  kNoOffset: the block is the process's own mapping (no arena, a carve
+// that does not fit, or pages the driver refused to pin) - the layer keeps working, it is just not published.  A
+// carved block is pinned through pin_register (the test ceiling keeps counting) with the same flags either route
+// takes below.
+uint8_t* kv_host_alloc(uint64_t bytes, uint64_t& share_off) {
+    share_off = kNoOffset;
+    if (strata::core::shared_arena_control() != nullptr) {
+        const uint64_t off = strata::core::shared_arena_alloc(bytes, strata::core::kSharedArenaPageBytes);
+        if (off != strata::core::kNoOffset) {
+            void* p = strata::core::shared_arena_ptr(off);
+            if (p != nullptr &&
+                strata::core::pin_register(p, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) ==
+                    cudaSuccess) {
+                share_off = off;
+                return (uint8_t*) p;
+            }
+            (void) cudaGetLastError();
+            // a spent offset cannot be given back (a bump arena has no free): the fallback below keeps the
+            // session up, the block just is not published
+        }
+    }
     auto host_alloc = [](uint64_t n) -> uint8_t* {
         uint8_t* h = nullptr;
         if (strata::core::host_alloc_guarded((void**) &h, n, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) return h;
@@ -807,7 +832,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells) {
+                        const QsaState* share_rope, int64_t ring_cells, uint32_t layer) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
@@ -923,6 +948,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
+        uint64_t share_off = kNoOffset;   // != kNoOffset: the block lives in the share arena (kv_host_alloc)
         {
             // S2: the pages the driver takes for this pinned KV copy are faults on THIS thread, so the light rule of
             // S1 - bind the thread for the scope that allocates - decides which node they come from.  Off (hot < 0):
@@ -935,7 +961,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             if (hot >= 0 && !nb.bind(hot, why))
                 std::fprintf(stderr, "strata: KV streaming: WARNING: cannot bind this thread to NUMA node %d (%s): "
                                      "the pinned KV copy takes the process's memory policy\n", hot, why.c_str());
-            if ((h = kv_host_alloc(bytes)) == nullptr ||
+            if ((h = kv_host_alloc(bytes, share_off)) == nullptr ||
                 cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
                 // both cudaHostRegister and cudaHostAlloc were refused (kv_host_alloc): usually not enough free RAM
                 if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
@@ -947,26 +973,38 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             // VMA naming (vma_alloc.hpp): this pinned copy is the active session's authoritative K/V - the RAM
             // reader attributes its resident pages by [anon_shmem:...].  Either pinning route ends in a nameable
             // anonymous mapping (cudaHostAlloc's VMA, or the registered MAP_ANONYMOUS region); a refusal is logged
-            // once and only leaves the bytes unnamed.
-            vma_name_warn(h, (size_t) bytes, vma_class::session_active);
+            // once and only leaves the bytes unnamed.  A block carved from the share arena is file-backed, which
+            // prctl refuses to name: skipped silently - the share's table says what the bytes are.
+            if (share_off == kNoOffset) vma_name_warn(h, (size_t) bytes, vma_class::session_active);
         }
         g_kv_host_bytes += bytes;
         Cursor hc{d};
+        // One part at a time, in the block's own order - the offsets inside the block are what the graphs baked
+        // in, and none of that arithmetic moves.  When the block lives in the share, each part is recorded as a
+        // segment row (kinds 4-7, `index` = the layer) for the release to publish; Pooled stays device-side, no row.
+        auto take_host = [&](auto* tag, uint32_t kind, uint64_t elems) {
+            using T = std::remove_pointer_t<decltype(tag)>;
+            T* r = hc.take<T>(elems);
+            if (share_off != kNoOffset)
+                shared_arena_record(share_off + (uint64_t) ((const uint8_t*) r - d), elems * (uint64_t) sizeof(T), kind,
+                                    layer);
+            return r;
+        };
         if (st.kv_hybrid) {
-            st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
-            st.host.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
-            st.host.v_q4 = hc.take<uint8_t>(hrows * q4_row);
+            st.host.k_q = take_host((int8_t*) nullptr, kSegmentK, hrows * s.head_dim);
+            st.host.k_scale = take_host((uint16_t*) nullptr, kSegmentKScale, hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            st.host.v_q4 = take_host((uint8_t*) nullptr, kSegmentV, hrows * q4_row);
         } else if (st.kv_q4) {
-            st.host.k_q4 = hc.take<uint8_t>(hrows * q4_row);
-            st.host.v_q4 = hc.take<uint8_t>(hrows * q4_row);
+            st.host.k_q4 = take_host((uint8_t*) nullptr, kSegmentK, hrows * q4_row);
+            st.host.v_q4 = take_host((uint8_t*) nullptr, kSegmentV, hrows * q4_row);
         } else if (st.kv_int8) {
-            st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
-            st.host.v_q = hc.take<int8_t>(hrows * s.head_dim);
-            st.host.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
-            st.host.v_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            st.host.k_q = take_host((int8_t*) nullptr, kSegmentK, hrows * s.head_dim);
+            st.host.v_q = take_host((int8_t*) nullptr, kSegmentV, hrows * s.head_dim);
+            st.host.k_scale = take_host((uint16_t*) nullptr, kSegmentKScale, hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            st.host.v_scale = take_host((uint16_t*) nullptr, kSegmentVScale, hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
         } else {
-            st.host.k_pool = hc.take<uint16_t>(hrows * s.head_dim);
-            st.host.v_pool = hc.take<uint16_t>(hrows * s.head_dim);
+            st.host.k_pool = take_host((uint16_t*) nullptr, kSegmentK, hrows * s.head_dim);
+            st.host.v_pool = take_host((uint16_t*) nullptr, kSegmentV, hrows * s.head_dim);
         }
     }
     // THE ROPE TABLE IS BUILT ON THE HOST IN FLOAT64 and uploaded once, because the reference computes its

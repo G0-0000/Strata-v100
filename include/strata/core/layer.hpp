@@ -323,8 +323,11 @@ inline int qsa_kv_format(const QsaState& st) {
     if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
+/// `layer`: the layer the state's published parts belong to (the segment row's `index`): the QSA ordinal for a
+/// session's states, and the position the session file counts the draft ring at (right behind the session's QSA
+/// layers) for the drafter.  Only read when the KV host copy is carved from the share arena (shared_arena.hpp).
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0, uint32_t layer = 0);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,

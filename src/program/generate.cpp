@@ -2340,6 +2340,11 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
     return false;
 }
 
+/// The share epoch this process last applied (the request-start reload) or published (DONE, DUMP): the
+/// reload fires only when the control block's epoch has moved past it, and every publish re-syncs it, so
+/// the engine never reloads an image it wrote itself.  Seeded with the share's epoch at the bind.
+static uint64_t g_share_last_applied_epoch = 0;
+
 /// The DUMP command's data movement: the session's device-only running state lands in the share, in page-rounded
 /// slices the arena carves, and rows name them for the publish - kind 2 the GDN state, kind 3 the PLE history,
 /// kind 9 one sidecar blob, kind 1 the ids.  The ids already lie in the arena (vma_class::session_active), so
@@ -2457,6 +2462,150 @@ bool shared_arena_dump_running_state(const ConvIds& ids, const strata::core::Ses
                                                     sizeof(uint64_t) * 3 + tails + dead + block_pos);
     }
     return ok;
+}
+
+/// The request-start reload's data movement, the counterpart of shared_arena_dump_running_state: the session
+/// the plugin staged into the share comes back into the device.  The running state copies H2D out of the
+/// published rows (the same bytes and order the DUMP wrote); the K/V host pools ARE the share's kinds 4-7
+/// rows (the plugin rewrote them in place), so only their residency refresh moves anything - the streamed
+/// window map or the resident ring is refilled from the pools (ConversationKvTarget::finish).
+///
+/// False (with `error`) when the rows are missing, their sizes disagree with this session's
+/// (conversation_session_sizes, and `tokens` against the session's cells), or a copy failed - the caller
+/// treats the reload as a miss and zeroes the session (a failed copy can leave the device half-written).
+/// On success `ids_row` points at `tokens` token ids in the share, the device holds the whole running
+/// state, and the device is synchronized: the caller's next work reads complete copies.
+bool shared_arena_load_running_state(const int32_t*& ids_row, uint64_t tokens, strata::core::SessionState& ss,
+                                     const strata::core::ModelGeometry& g, std::string& error) {
+    ids_row = nullptr;
+    error.clear();
+    strata::core::SharedControl* ctl = strata::core::shared_arena_control();
+    auto* table = static_cast<const strata::core::SharedControlSegment*>(
+        ctl != nullptr ? strata::core::shared_arena_ptr(ctl->table_offset) : nullptr);
+    const uint32_t rows = table != nullptr ? std::min<uint32_t>(ctl->segment_count, ctl->table_capacity) : 0;
+    const strata::core::SharedControlSegment *row_ids = nullptr, *row_gdn = nullptr, *row_ple = nullptr,
+                                             *row_side = nullptr;
+    for (uint32_t i = 0; i < rows; ++i) {
+        const strata::core::SharedControlSegment& r = table[i];
+        if (r.index != 0) continue;   // the K/V kinds (4-7) carry the layer in `index`; the running state is 0
+        if (r.kind == strata::core::kSegmentIds) { if (row_ids == nullptr) row_ids = &r; }
+        else if (r.kind == strata::core::kSegmentGdn) { if (row_gdn == nullptr) row_gdn = &r; }
+        else if (r.kind == strata::core::kSegmentPle) { if (row_ple == nullptr) row_ple = &r; }
+        else if (r.kind == strata::core::kSegmentSidecar) { if (row_side == nullptr) row_side = &r; }
+    }
+    strata::core::ConversationStateSizes z;
+    if (!strata::core::conversation_session_sizes(g, ss, z, error)) return false;
+    const size_t layers = (size_t) std::max<int64_t>(ss.qsa_alloc, 0);
+    const uint64_t tails = layers * z.tail, dead = layers * z.dead, block_pos = layers * z.block_pos;
+    if (ss.max_cells < 0 || tokens > (uint64_t) ss.max_cells) {   // bounds `tokens` before any arithmetic on it
+        error = "the staged session is longer than the session's cells";
+        return false;
+    }
+    if (row_ids == nullptr || row_ids->bytes != tokens * (uint64_t) sizeof(int32_t)) {
+        error = "the ids row is missing or another length";
+        return false;
+    }
+    const bool want_gdn = z.gdn != 0 && ss.gdn_state != nullptr;
+    if (want_gdn != (row_gdn != nullptr) || (want_gdn && row_gdn->bytes != z.gdn)) {
+        error = "the GDN row is missing or another size";
+        return false;
+    }
+    const bool want_ple = z.ple != 0 && ss.ple_hist != nullptr;
+    if (want_ple != (row_ple != nullptr) || (want_ple && row_ple->bytes != z.ple)) {
+        error = "the PLE row is missing or another size";
+        return false;
+    }
+    const uint8_t* side_bytes = nullptr;
+    if (row_side != nullptr) {   // the sidecar says its payload sizes again; they must be this session's
+        side_bytes = static_cast<const uint8_t*>(strata::core::shared_arena_ptr(row_side->offset));
+        if (side_bytes == nullptr) { error = "the sidecar row points outside the share"; return false; }
+        uint64_t side_tails = 0, side_dead = 0, side_block_pos = 0;
+        std::memcpy(&side_tails, side_bytes, sizeof(side_tails));
+        std::memcpy(&side_dead, side_bytes + 8, sizeof(side_dead));
+        std::memcpy(&side_block_pos, side_bytes + 16, sizeof(side_block_pos));
+        if (side_tails != tails || side_dead != dead || side_block_pos != block_pos ||
+            row_side->bytes != sizeof(uint64_t) * 3 + tails + dead + block_pos) {
+            error = "the indexer sidecar names other payload sizes";
+            return false;
+        }
+    }
+    if ((tails != 0 || dead != 0 || block_pos != 0) != (row_side != nullptr)) {
+        error = "the indexer sidecar is missing";   // this session's indexer state has nowhere to come from
+        return false;
+    }
+    const uint64_t idx_block = strata::kernels::qsa_real_shapes().idx_block;
+    for (size_t j = 0; j < layers; ++j) {
+        const strata::core::QsaState& st = ss.qsa_states[(size_t) ss.qsa_ord0 + j];
+        if (st.idx_tail == nullptr || st.idx_dead == nullptr || st.idx_block_pos == nullptr ||
+            st.idx_pooled == nullptr || st.max_cells < 0 || tokens > (uint64_t) st.max_cells ||
+            tokens / idx_block >= (uint64_t) std::max<int64_t>(0, st.idx_pooled_rows)) {
+            error = "the staged session does not fit the session's indexer state";
+            return false;
+        }
+    }
+    auto* ids_bytes = static_cast<const uint8_t*>(strata::core::shared_arena_ptr(row_ids->offset));
+    void* gdn_row = want_gdn ? strata::core::shared_arena_ptr(row_gdn->offset) : nullptr;
+    void* ple_row = want_ple ? strata::core::shared_arena_ptr(row_ple->offset) : nullptr;
+    if (ids_bytes == nullptr || (want_gdn && gdn_row == nullptr) || (want_ple && ple_row == nullptr)) {
+        error = "a running-state row points outside the share";
+        return false;
+    }
+    const uint8_t* payloads = side_bytes != nullptr ? side_bytes + sizeof(uint64_t) * 3 : nullptr;
+    bool ok = true;
+    auto fail = [&](const std::string& why) {
+        if (ok) error = why;   // the first failure is the one the log names
+        ok = false;
+        return false;
+    };
+    auto h2d = [&](void* dst, const void* src, size_t bytes) -> bool {
+        if (!ok || bytes == 0) return ok;
+        if (dst == nullptr || src == nullptr) return fail("missing running-state buffer");
+        const cudaError_t status = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, nullptr);
+        if (status != cudaSuccess) {
+            (void) cudaGetLastError();   // a failed copy must not poison the engine
+            return fail(std::string("session share reload copy: ") + cudaGetErrorString(status));
+        }
+        return true;
+    };
+    const cudaError_t quiet = cudaDeviceSynchronize();   // the copies ride no stream the session uses
+    if (quiet != cudaSuccess) {
+        (void) cudaGetLastError();
+        return fail(std::string("session share reload synchronize: ") + cudaGetErrorString(quiet));
+    }
+    h2d(ss.gdn_state, gdn_row, z.gdn);
+    if (ss.ple_hist != nullptr) h2d(ss.ple_hist, ple_row, z.ple);
+    for (size_t j = 0; j < layers && ok; ++j) {
+        strata::core::QsaState& st = ss.qsa_states[(size_t) ss.qsa_ord0 + j];
+        h2d(st.idx_tail, payloads + j * z.tail, z.tail);
+        h2d(st.idx_dead, payloads + tails + j * z.dead, z.dead);
+        h2d(st.idx_block_pos, payloads + tails + dead + j * z.block_pos, z.block_pos);
+        // the pooled row the next token fills is rebuilt from `dead`, as a checkpoint restore rebuilds it
+        h2d(st.idx_pooled + (size_t) (tokens / idx_block) * g.idx_key_dim, payloads + tails + j * z.dead, z.dead);
+    }
+    if (!ok) return false;
+    const cudaError_t landed = cudaDeviceSynchronize();
+    if (landed != cudaSuccess) {
+        (void) cudaGetLastError();
+        return fail(std::string("session share reload synchronize: ") + cudaGetErrorString(landed));
+    }
+    for (size_t j = 0; j < layers; ++j) {   // the pools already hold the plugin's bytes: refill what the
+        strata::core::ConversationKvTarget t;   // K/V mode keeps in VRAM (the window map or the ring)
+        t.state = &ss.qsa_states[(size_t) ss.qsa_ord0 + j];
+        t.geometry = &g;
+        t.upto = (int64_t) tokens;
+        t.index = true;
+        std::string fin_err;
+        if (!t.finish(fin_err)) return fail("the K/V residency refresh failed: " + fin_err);
+    }
+    const cudaError_t settled = cudaDeviceSynchronize();
+    if (settled != cudaSuccess) {
+        (void) cudaGetLastError();
+        return fail(std::string("session share reload synchronize: ") + cudaGetErrorString(settled));
+    }
+    ids_row = reinterpret_cast<const int32_t*>(ids_bytes);
+    ss.ple_prev[0] = tokens >= 2 ? ids_row[tokens - 2] : -1;   // the last two tokens OLDEST FIRST, as a
+    ss.ple_prev[1] = tokens >= 1 ? ids_row[tokens - 1] : -1;   // checkpoint restore derives them from its ids
+    return true;
 }
 
 /// STRATA_CKPT_POOL: the storage of dropped checkpoints, for the next save or slot copy to reuse.  `give` keeps a
@@ -5002,6 +5151,10 @@ int main(int argc, char** argv) {
             munmap(share_map, share.share_bytes);
             return 2;
         }
+        // The request-start reload fires on an epoch change: the epoch the share arrives with counts as
+        // applied (the session build below carves fresh pages over anything the plugin staged before
+        // startup - only a handover after this point reloads).
+        g_share_last_applied_epoch = ctl->epoch;
         // The fd can go once the mapping is up: the mapping itself holds the pages.
         strata::core::plugin_share_close(share);
     }
@@ -16589,6 +16742,9 @@ int main(int argc, char** argv) {
                                          pub_err.c_str());
                         }
                     }
+                    // the engine wrote the share: the next request must not reload this image as if the
+                    // plugin had staged it
+                    g_share_last_applied_epoch = strata::core::shared_arena_control()->epoch;
                 }
                 std::printf("DUMPED\n");
                 std::fflush(stdout);
@@ -17005,6 +17161,65 @@ int main(int argc, char** argv) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
+            }
+            // The plugin store's handover (the share is bound only when the conversation-cache-store plugin
+            // is): an epoch other than the one this process last applied or published means the plugin has
+            // staged a session into the segment - or cleared it - since.  Load it back and continue from its
+            // token count; the share is where the conversation of record lives now, so this overrides
+            // whatever the engine's own caches found above.
+            if (strata::core::SharedControl* share_ctl = strata::core::shared_arena_control()) {
+                if (share_ctl->epoch != g_share_last_applied_epoch) {
+                    g_share_last_applied_epoch = share_ctl->epoch;
+                    if (share_ctl->tokens == 0) {
+                        // the share was handed over empty: a miss, this prompt reads from token 0 (the
+                        // resume == 0 block below zeroes the device again - harmless)
+                        strata::core::session_zero(ss, g, nullptr, main_cs);
+                        cudaStreamSynchronize(main_stream);
+                        live.clear();
+                        live_imgs.clear();
+                        checks.clear();
+                        live_ok = false;
+                        resume = 0;
+                        from_live = false;
+                        std::fprintf(stderr, "strata serve: the share hands over an empty session (epoch %llu); "
+                                             "reading from token 0\n", (unsigned long long) share_ctl->epoch);
+                    } else {
+                        const int32_t* staged_ids = nullptr;
+                        std::string reload_err;
+                        if (shared_arena_load_running_state(staged_ids, share_ctl->tokens, ss, g, reload_err)) {
+                            live.assign(staged_ids, staged_ids + (size_t) share_ctl->tokens);
+                            live_imgs.clear();   // images are not in the segment yet
+                            if (!req_imgs.empty())
+                                std::fprintf(stderr, "strata serve: the reloaded session carries no images; this "
+                                             "request's %zu image%s are outside the reused state\n",
+                                             req_imgs.size(), req_imgs.size() == 1 ? "" : "s");
+                            live_ok = true;
+                            resume = (int64_t) share_ctl->tokens;
+                            from_live = true;
+                            checks.clear();
+                            std::fprintf(stderr, "strata serve: the share's session is back on the device: %llu "
+                                         "tokens (epoch %llu)\n", (unsigned long long) share_ctl->tokens,
+                                         (unsigned long long) share_ctl->epoch);
+                        } else {
+                            // refuse the reload (once) and treat it as a miss: the device goes back to a
+                            // zeroed session and this prompt reads from token 0
+                            static bool reload_said = false;
+                            if (!reload_said) {
+                                reload_said = true;
+                                std::fprintf(stderr, "strata serve: the share's staged session is not usable (%s); "
+                                             "treated as a cache miss\n", reload_err.c_str());
+                            }
+                            strata::core::session_zero(ss, g, nullptr, main_cs);
+                            cudaStreamSynchronize(main_stream);
+                            live.clear();
+                            live_imgs.clear();
+                            checks.clear();
+                            live_ok = false;
+                            resume = 0;
+                            from_live = false;
+                        }
+                    }
+                }
             }
             // STRATA_SLOT_CKPT_MOVE: a turn checkpoint a batch admission moved into its slot is still one of the main
             // session's while the main session holds its tokens (the cells below it are the ones it was taken over):
@@ -21032,6 +21247,9 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: the session share was not published (%s)\n", pub_err.c_str());
                     }
                 }
+                // the engine wrote the share: the next request must not reload this image as if the
+                // plugin had staged it
+                g_share_last_applied_epoch = strata::core::shared_arena_control()->epoch;
             }
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
                         "experts_streamed=%lld\n",

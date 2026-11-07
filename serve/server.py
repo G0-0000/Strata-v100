@@ -1130,7 +1130,7 @@ PLUGIN_DUMP_WAIT_S = 5.0             # DUMP -> DUMPED (S1 answers at once; the w
 
 
 class PluginClient:
-    """One acquire/release exchange with the cache plugin (`plugin_socket`).  `call` sends `op_dict` (the "id" is
+    """One acquire/release exchange with the cache plugin (`--conversation-cache-store`).  `call` sends `op_dict` (the "id" is
     added here) and returns the reply's parsed dict, or None when the plugin is unreachable, too slow or answered
     badly - said once in the log, after the retries, and the caller goes on without it."""
 
@@ -1189,7 +1189,7 @@ class StrataEngine:
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
     multi = 0                            # DeepSeek --parallel (READY ... multi=N): conversations the engine holds at once (batch = N too)
-    plugin_client = None                 # the config's "plugin_socket" (main() sets it): the cache plugin's client (S1v3 spec 4)
+    plugin_client = None                 # set by main() when the engine args name a cache plugin socket
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -10485,17 +10485,28 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                               assume_pass=cache_assume_pass(cfg))
             engine = start_engine_or_fallback(cfg, exe, effort_end, env, lazy, tok, offline=a.offline, batch_telemetry=a.batch_telemetry)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
-        socket_path = cfg.get("plugin_socket")          # S1v3 spec 4: absent = today's behaviour, byte-identical
-        if socket_path is not None:
-            if not isinstance(socket_path, str) or not socket_path.strip():
-                raise SystemExit('[strata] config "plugin_socket" must be a non-empty socket path, or absent')
+        # Plugin mode is one engine flag: --conversation-cache-store <socket>.  The server reads it from the same
+        # args it hands the engine, so the user writes it once; --conversation-cache-store-timeout is optional.
+        plugin_socket = None
+        plugin_timeout = PLUGIN_REPLY_TIMEOUT_S
+        engine_args_list = cfg.get("args") or []
+        for index, item in enumerate(engine_args_list):
+            if item == "--conversation-cache-store" and index + 1 < len(engine_args_list):
+                plugin_socket = engine_args_list[index + 1]
+            elif item == "--conversation-cache-store-timeout" and index + 1 < len(engine_args_list):
+                try:
+                    plugin_timeout = float(engine_args_list[index + 1])
+                except (TypeError, ValueError):
+                    raise SystemExit("[strata] --conversation-cache-store-timeout needs a number of seconds")
+        if plugin_socket is not None:
+            if not isinstance(plugin_socket, str) or not plugin_socket.strip():
+                raise SystemExit("[strata] --conversation-cache-store needs the plugin's socket path")
+            if plugin_timeout <= 0:
+                raise SystemExit("[strata] --conversation-cache-store-timeout must be positive")
             if getattr(engine, "multi", 0) or getattr(engine, "batch", 0):
-                raise SystemExit('[strata] "plugin_socket" holds one conversation at a time: it cannot be combined '
-                                 'with --parallel, --batch or --slots > 1')
-            reply_timeout = cfg.get("plugin_timeout_s", PLUGIN_REPLY_TIMEOUT_S)
-            if not isinstance(reply_timeout, (int, float)) or isinstance(reply_timeout, bool) or reply_timeout <= 0:
-                raise SystemExit('[strata] config "plugin_timeout_s" must be a positive number of seconds')
-            engine.plugin_client = PluginClient(socket_path.strip(), float(reply_timeout))
+                raise SystemExit("[strata] the cache plugin holds one conversation at a time: it cannot be combined "
+                                 "with --parallel, --batch or --slots > 1")
+            engine.plugin_client = PluginClient(plugin_socket.strip(), plugin_timeout)
             print(f"[strata] cache plugin mode: acquire before each request, release after its DONE "
                   f"({engine.plugin_client.path}); a plugin failure only loses the cache, never the request",
                   flush=True)

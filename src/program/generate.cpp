@@ -957,9 +957,13 @@ struct Options {
     /// conversation cache option (an unset one is forced to 0: current-session-only; --prompt-cache 0 is
     /// refused - the checkpoints stay on); acquire/release and the segment moves arrive in later steps.
     /// Plugin mode needs --serve.
-    std::string conversation_cache_store = "local";
-    /// --conversation-cache-store-socket PATH: the plugin's control socket (plugin store only)
-    std::string conversation_cache_store_socket;
+    /// Empty: the engine's own cache (the default, byte-identical to the last release).  Otherwise the plugin's
+    /// control socket: plugin mode, one switch.  Engine-side cache options set explicitly are refused; unset ones
+    /// are forced to 0 (current-session-only).  Needs --serve.
+    std::string conversation_cache_store;
+    /// --conversation-cache-store-timeout S: how long the server waits for one acquire/release answer (default
+    /// 120 s).  The connect stays the handshake's 1 s.
+    int64_t conversation_cache_store_timeout_s = 120;
     int64_t conversation_cache_mib = -1; // host RAM for independent conversations; -1: not given, --serve sizes it from the free RAM (#3493), 0: off
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
@@ -1207,11 +1211,12 @@ void usage() {
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --conversation-cache-spill-dir DIR  --serve: keep conversations the RAM cache evicts on disk,\n"
                  "                       across restarts (default off; needs --conversation-cache-mib)\n"
-                 "  --conversation-cache-store local|plugin  --serve: the conversation cache in this engine\n"
-                 "                       (local, the default) or in the external cache plugin: the engine\n"
-                 "                       handshakes with it before any weight is read and refuses every engine-side\n"
-                 "                       conversation cache path (plugin mode is the S1 skeleton: handshake only)\n"
-                 "  --conversation-cache-store-socket PATH  the plugin's control socket (with store plugin)\n"
+                 "  --conversation-cache-store PATH  --serve: hand the conversation cache to the plugin\n"
+                 "                       listening on this Unix socket (default: the engine's own cache). The engine\n"
+                 "                       handshakes before any weight is read and refuses every engine-side\n"
+                 "                       conversation cache option; the cache's own settings live in the plugin\n"
+                 "  --conversation-cache-store-timeout S  seconds to wait for one acquire/release answer\n"
+                 "                       (default 120; the connect is the handshake's 1 s)\n"
                  "  --conversation-cache-disk-only  --serve, one GPU: the conversation cache on disk only: a\n"
                  "                       conversation switched away from is streamed from the GPU straight into\n"
                  "                       --conversation-cache-spill-dir and streamed back when it returns (no RAM\n"
@@ -4007,15 +4012,22 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-disk-background-state") o.conversation_cache_disk_background_state = true;
         else if (a == "--conversation-cache-disk-recompute-gate") o.conversation_cache_disk_recompute_gate = true;
         else if (a == "--conversation-cache-store") {
-            const std::string value = next("--conversation-cache-store");
-            if (value != "local" && value != "plugin") {
-                std::fprintf(stderr, "--conversation-cache-store needs local or plugin\n");
+            o.conversation_cache_store = next("--conversation-cache-store");
+            if (o.conversation_cache_store.empty()) {
+                std::fprintf(stderr, "--conversation-cache-store needs the plugin's socket path\n");
                 return 2;
             }
-            o.conversation_cache_store = value;
         }
-        else if (a == "--conversation-cache-store-socket")
-            o.conversation_cache_store_socket = next("--conversation-cache-store-socket");
+        else if (a == "--conversation-cache-store-timeout") {
+            const std::string value = next("--conversation-cache-store-timeout");
+            char* end = nullptr;
+            const long long number = std::strtoll(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0' || number <= 0) {
+                std::fprintf(stderr, "--conversation-cache-store-timeout needs a positive number of seconds\n");
+                return 2;
+            }
+            o.conversation_cache_store_timeout_s = number;
+        }
         else if (a == "--conversation-cache-origin-split") o.conversation_cache_origin_split = true;
         else if (a == "--conversation-cache-disk-delta-percent") {
             const std::string value = next("--conversation-cache-disk-delta-percent");
@@ -4396,7 +4408,7 @@ int main(int argc, char** argv) {
             }
         }
     }
-    if (o.conversation_cache_store == "plugin") {
+    if (!o.conversation_cache_store.empty()) {
         // The plugin store is a --serve mode (the handshake needs the resident loop), and the plugin owns the
         // conversation cache: every engine-side conversation cache path must be off.  A cache option the user
         // EXPLICITLY passed a nonzero value is a named conflict; one never given is just forced to 0 here, so
@@ -4437,10 +4449,6 @@ int main(int argc, char** argv) {
         if (!o.layer_split.empty()) refuse("--layer-split");
         if (o.peer_device > 0) refuse("--peer-device");
         if (o.prompt_cache <= 0) refuse("--prompt-cache (needs >= 1 in plugin mode)");
-        if (o.conversation_cache_store_socket.empty()) {
-            std::fprintf(stderr, "strata serve: --conversation-cache-store plugin needs --conversation-cache-store-socket\n");
-            refused = true;
-        }
         if (refused) return 2;
     }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
@@ -5098,7 +5106,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
         return 2;
     }
-    if (o.conversation_cache_store == "plugin") {
+    if (!o.conversation_cache_store.empty()) {
         // The plugin store's handshake runs here, BEFORE any weight is read (S1v3's startup order): connect,
         // hello, and the share's memfd, mapped at the address the plugin announced.  Any failure exits 2 with
         // the address (or the errno): a run that starts without its announced cache is worse than a refusal.
@@ -5109,9 +5117,9 @@ int main(int argc, char** argv) {
         strata::core::PluginClientError perr = strata::core::PluginClientError::none;
         std::string pdetail;
         // S1: the identity object is empty - the model/config ids arrive with the store handoff (v10).
-        if (!strata::core::plugin_hello(o.conversation_cache_store_socket, STRATA_VERSION, "{}", share, perr, pdetail)) {
+        if (!strata::core::plugin_hello(o.conversation_cache_store, STRATA_VERSION, "{}", share, perr, pdetail)) {
             std::fprintf(stderr, "strata generate: conversation-cache-store plugin: hello to %s failed (%s%s%s)\n",
-                         o.conversation_cache_store_socket.c_str(), strata::core::plugin_client_error_name(perr),
+                         o.conversation_cache_store.c_str(), strata::core::plugin_client_error_name(perr),
                          pdetail.empty() ? "" : ": ", pdetail.c_str());
             return 2;
         }

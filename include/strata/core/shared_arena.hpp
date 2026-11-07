@@ -233,6 +233,7 @@ inline void shared_arena_reset() {
     a.bump = kSharedArenaFirstOffset;
     a.rows.clear();
     a.bound = false;
+    shared_arena_incomplete_flag() = false;   // a reset arena starts a new session
 }
 
 }   // namespace strata::core

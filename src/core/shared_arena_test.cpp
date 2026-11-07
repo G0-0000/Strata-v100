@@ -174,19 +174,6 @@ int main() {
                 sizeof(raw));
     CHECK(raw.offset == o2 && raw.bytes == 4096 && raw.kind == 4 && raw.index == 3);
 
-    // --- an arena that ran out: the fallback is the kernel's mapping - named, and munmapped by deallocate -
-    // and no row is published for it ---
-    {
-        std::vector<uint8_t, VmaAllocator<uint8_t>> big{VmaAllocator<uint8_t>(vma_class::session_active)};
-        big.resize(share_bytes, 1);   // the whole share cannot fit behind the bump
-        const uintptr_t bg = reinterpret_cast<uintptr_t>(big.data());
-        CHECK(bg < lo || bg >= lo + share_bytes);   // outside the share: an own anonymous mapping
-        CHECK(mapped_with_name("[anon:strata/session_active]"));
-        CHECK(strata::core::shared_arena_publish(11, perr));   // the release publishes no row for the fallback
-        CHECK(share.ctl->segment_count == 2 && share.ctl->epoch == 2);
-    }
-    CHECK(!mapped_with_name("[anon:strata/session_active]"));   // deallocate still munmaps the fallback
-    CHECK(share_mapping_whole(lo, share_bytes));                // and never touched the share
 
     // --- the inverse of shared_arena_ptr: the offset of an address inside the arena, kNoOffset outside it ---
     CHECK(strata::core::shared_arena_offset(p1) == o1);
@@ -210,9 +197,10 @@ int main() {
 
     // --- the arena's own record refuses the same way once the rows it will publish fill the table ---
     while (strata::core::shared_arena_record(0, 4096, strata::core::kSegmentSidecar, 0)) {}
+    const uint64_t capacity_epoch = share.ctl->epoch;
     CHECK(strata::core::shared_arena_publish(11, perr));
     CHECK(share.ctl->segment_count == SharedControl::kTableCapacity);
-    CHECK(share.ctl->epoch == 3);
+    CHECK(share.ctl->epoch == capacity_epoch + 1);
 
     // --- reset: tests can unbind and bind again; production never does ---
     strata::core::shared_arena_reset();
@@ -230,6 +218,25 @@ int main() {
     CHECK(strata::core::shared_arena_publish(11, perr));
     CHECK(share.ctl->segment_count == 1);
     CHECK(table[0].offset == 4096 && table[0].bytes == 100 && table[0].kind == 1 && table[0].index == 0);
+
+    // --- an arena that ran out: the fallback is the kernel's mapping - named, and munmapped by deallocate -
+    // and no row is published for it ---
+    {
+        std::vector<uint8_t, VmaAllocator<uint8_t>> big{VmaAllocator<uint8_t>(vma_class::session_active)};
+        big.resize(share_bytes, 1);   // the whole share cannot fit behind the bump
+        const uintptr_t bg = reinterpret_cast<uintptr_t>(big.data());
+        CHECK(bg < lo || bg >= lo + share_bytes);   // outside the share: an own anonymous mapping
+        CHECK(mapped_with_name("[anon:strata/session_active]"));
+        // Fail closed: a session with a fallback mapping is not published at all (empty table, tokens 0),
+        // so a reader cannot resume from a partial image.
+        const uint64_t epoch_before = share.ctl->epoch;
+        CHECK(strata::core::shared_arena_publish(11, perr));
+        CHECK(share.ctl->segment_count == 0 && share.ctl->tokens == 0 &&
+              share.ctl->epoch == epoch_before + 1);
+    }
+    CHECK(!mapped_with_name("[anon:strata/session_active]"));   // deallocate still munmaps the fallback
+    CHECK(share_mapping_whole(lo, share_bytes));                // and never touched the share
+    strata::core::shared_arena_clear_incomplete();               // the next case starts a complete session
 
     share.drop();
     if (fails != 0) std::fprintf(stderr, "shared_arena_test: %d of %d checks FAILED\n", fails, checks);

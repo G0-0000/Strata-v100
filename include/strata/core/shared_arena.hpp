@@ -62,6 +62,7 @@ inline bool& shared_arena_incomplete_flag() {
     return incomplete;
 }
 inline void shared_arena_mark_incomplete() { shared_arena_incomplete_flag() = true; }
+inline void shared_arena_clear_incomplete() { shared_arena_incomplete_flag() = false; }
 inline bool shared_arena_incomplete() { return shared_arena_incomplete_flag(); }
 
 /// The bound arena, or null when none is bound: what a VmaAllocator's session_active cell holds.  A null cell

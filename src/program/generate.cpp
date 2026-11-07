@@ -2404,7 +2404,8 @@ bool shared_arena_dump_running_state(const ConvIds& ids, const strata::core::Ses
     if (!ids.empty()) {   // a row, no copy: the bytes are the live vector's own
         const uint64_t off = strata::core::shared_arena_offset(ids.data());
         if (off == strata::core::kNoOffset ||
-            !strata::core::shared_arena_record_bytes(strata::core::kSegmentIds, 0, off, ids.size() * sizeof(int32_t)))
+            !strata::core::shared_arena_record_bytes(strata::core::kSegmentIds, 0, off,
+                                                     ((uint64_t) ids.size() * sizeof(int32_t) + 4095ull) & ~4095ull))
             fail("the live ids are not in the share arena (a carve fell back to a private mapping)");
     }
     // carve + copy one device array; the row goes in after the synchronize below
@@ -21267,8 +21268,10 @@ int main(int argc, char** argv) {
                 if (!live.empty()) {
                     const uint64_t ids_off = strata::core::shared_arena_offset(live.data());
                     if (ids_off != strata::core::kNoOffset)
-                        strata::core::shared_arena_set_row(strata::core::kSegmentIds, 0, ids_off,
-                                                           (uint64_t) live.size() * sizeof(int32_t));
+                        // The reader requires page-rounded spans: round the ids row up like the arena slice it names.
+                        strata::core::shared_arena_set_row(
+                            strata::core::kSegmentIds, 0, ids_off,
+                            ((uint64_t) live.size() * sizeof(int32_t) + 4095ull) & ~4095ull);
                 }
                 std::string pub_err;
                 if (!strata::core::shared_arena_publish((uint64_t) live.size(), pub_err)) {

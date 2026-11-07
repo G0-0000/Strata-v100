@@ -2453,14 +2453,18 @@ bool shared_arena_dump_running_state(const ConvIds& ids, const strata::core::Ses
         landed = false;
     }
     if (landed) {   // a synchronize that failed leaves the bytes unverified: no row names them
+        // Every published span is page-rounded: the plugin refuses an unaligned row.
+        const auto round_page = [](uint64_t n) { return (n + 4095ull) & ~4095ull; };
         if (gdn != nullptr) strata::core::shared_arena_record_bytes(strata::core::kSegmentGdn, 0,
-                                                                    strata::core::shared_arena_offset(gdn), z.gdn);
+                                                                    strata::core::shared_arena_offset(gdn),
+                                                                    round_page(z.gdn));
         if (ple != nullptr) strata::core::shared_arena_record_bytes(strata::core::kSegmentPle, 0,
-                                                                    strata::core::shared_arena_offset(ple), z.ple);
+                                                                    strata::core::shared_arena_offset(ple),
+                                                                    round_page(z.ple));
         if (side != nullptr)
             strata::core::shared_arena_record_bytes(strata::core::kSegmentSidecar, 0,
                                                     strata::core::shared_arena_offset(side),
-                                                    sizeof(uint64_t) * 3 + tails + dead + block_pos);
+                                                    round_page(sizeof(uint64_t) * 3 + tails + dead + block_pos));
     }
     return ok;
 }
@@ -2502,18 +2506,23 @@ bool shared_arena_load_running_state(const int32_t*& ids_row, uint64_t tokens, s
         error = "the staged session is longer than the session's cells";
         return false;
     }
-    if (row_ids == nullptr || row_ids->bytes != tokens * (uint64_t) sizeof(int32_t)) {
-        error = "the ids row is missing or another length";
+    // The published row is page-rounded (the plugin refuses unaligned spans), so it is at least the ids' bytes,
+    // never exactly them.
+    const uint64_t ids_logical = tokens * (uint64_t) sizeof(int32_t);
+    if (row_ids == nullptr || row_ids->bytes < ids_logical || row_ids->bytes % 4096 != 0) {
+        error = "the ids row is missing or shorter than the session";
         return false;
     }
     const bool want_gdn = z.gdn != 0 && ss.gdn_state != nullptr;
-    if (want_gdn != (row_gdn != nullptr) || (want_gdn && row_gdn->bytes != z.gdn)) {
-        error = "the GDN row is missing or another size";
+    if (want_gdn != (row_gdn != nullptr) ||
+        (want_gdn && (row_gdn->bytes < z.gdn || row_gdn->bytes % 4096 != 0))) {
+        error = "the GDN row is missing or shorter than the state";
         return false;
     }
     const bool want_ple = z.ple != 0 && ss.ple_hist != nullptr;
-    if (want_ple != (row_ple != nullptr) || (want_ple && row_ple->bytes != z.ple)) {
-        error = "the PLE row is missing or another size";
+    if (want_ple != (row_ple != nullptr) ||
+        (want_ple && (row_ple->bytes < z.ple || row_ple->bytes % 4096 != 0))) {
+        error = "the PLE row is missing or shorter than the state";
         return false;
     }
     const uint8_t* side_bytes = nullptr;
@@ -2525,7 +2534,8 @@ bool shared_arena_load_running_state(const int32_t*& ids_row, uint64_t tokens, s
         std::memcpy(&side_dead, side_bytes + 8, sizeof(side_dead));
         std::memcpy(&side_block_pos, side_bytes + 16, sizeof(side_block_pos));
         if (side_tails != tails || side_dead != dead || side_block_pos != block_pos ||
-            row_side->bytes != sizeof(uint64_t) * 3 + tails + dead + block_pos) {
+            row_side->bytes < sizeof(uint64_t) * 3 + tails + dead + block_pos ||
+            row_side->bytes % 4096 != 0) {
             error = "the indexer sidecar names other payload sizes";
             return false;
         }
@@ -21263,6 +21273,9 @@ int main(int argc, char** argv) {
             // into the share's table and flips the state - no page of the session is touched).  A failure logs
             // once and never breaks the request: the plugin just sees a share that was never handed over.
             if (strata::core::shared_arena_control() != nullptr) {
+                // The running-state rows a previous DUMP recorded belong to the session that was dumped; this
+                // request computed its own state, so they are stale and must not be published.
+                strata::core::shared_arena_erase_running_rows();
                 // The ids move with the session: keep one row naming them, so the published table always says
                 // where the live token array is (the DUMP path records the rest).
                 if (!live.empty()) {

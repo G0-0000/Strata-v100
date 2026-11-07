@@ -143,6 +143,19 @@ inline bool shared_arena_record_bytes(uint32_t kind, uint32_t index, uint64_t of
     return shared_arena_record(offset, bytes, kind, index);
 }
 
+/// Drop the rows a DUMP records (the running state: gdn, ple, sidecar).  A request that computed without a dump
+/// leaves rows that name the previous session's bytes; publishing them would hand the reader a stale image.
+inline void shared_arena_erase_running_rows() {
+    SharedArena& a = shared_arena_instance();
+    if (!a.bound) return;
+    a.rows.erase(std::remove_if(a.rows.begin(), a.rows.end(),
+                                [](const SharedControlSegment& r) {
+                                    return r.kind == kSegmentGdn || r.kind == kSegmentPle ||
+                                           r.kind == kSegmentSidecar;
+                                }),
+                 a.rows.end());
+}
+
 /// Record or replace the one row for (kind, index): a caller that republishes the same region (the live ids move
 /// with every request) must not grow the table by one row per publish.  False when the arena is not bound.
 inline bool shared_arena_set_row(uint32_t kind, uint32_t index, uint64_t offset, uint64_t bytes) {

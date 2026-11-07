@@ -1123,8 +1123,8 @@ def parse_stage_in_flight_sample(line: str) -> dict | None:
 
 # The cache plugin's client side (S1v3 spec, section 4): one NDJSON request, one reply, over a Unix socket.
 # The plugin holds a cache; it can never fail a request - every failure is a lost cache entry, said once in the log.
-PLUGIN_CONNECT_TIMEOUT_S = 1.0
-PLUGIN_REPLY_TIMEOUT_S = 2.0
+PLUGIN_CONNECT_TIMEOUT_S = 1.0   # the handshake: a connect that takes longer is a plugin that is not there
+PLUGIN_REPLY_TIMEOUT_S = 120.0   # acquire/release may move a whole session; only a hung plugin hits this
 PLUGIN_RETRIES = 2
 PLUGIN_DUMP_WAIT_S = 5.0             # DUMP -> DUMPED (S1 answers at once; the wait only bounds a broken engine)
 
@@ -1134,8 +1134,9 @@ class PluginClient:
     added here) and returns the reply's parsed dict, or None when the plugin is unreachable, too slow or answered
     badly - said once in the log, after the retries, and the caller goes on without it."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, reply_timeout_s: float = PLUGIN_REPLY_TIMEOUT_S):
         self.path = path
+        self.reply_timeout_s = reply_timeout_s
         self._id_n = 0
         self._id_lock = threading.Lock()
 
@@ -1158,7 +1159,7 @@ class PluginClient:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(PLUGIN_CONNECT_TIMEOUT_S)
             s.connect(self.path)                        # OSError: nothing listens, or the connect took too long
-            s.settimeout(PLUGIN_REPLY_TIMEOUT_S)
+            s.settimeout(self.reply_timeout_s)
             s.sendall(payload)
             buf = b""
             while not buf.endswith(b"\n"):
@@ -10491,7 +10492,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             if getattr(engine, "multi", 0) or getattr(engine, "batch", 0):
                 raise SystemExit('[strata] "plugin_socket" holds one conversation at a time: it cannot be combined '
                                  'with --parallel, --batch or --slots > 1')
-            engine.plugin_client = PluginClient(socket_path.strip())
+            reply_timeout = cfg.get("plugin_timeout_s", PLUGIN_REPLY_TIMEOUT_S)
+            if not isinstance(reply_timeout, (int, float)) or isinstance(reply_timeout, bool) or reply_timeout <= 0:
+                raise SystemExit('[strata] config "plugin_timeout_s" must be a positive number of seconds')
+            engine.plugin_client = PluginClient(socket_path.strip(), float(reply_timeout))
             print(f"[strata] cache plugin mode: acquire before each request, release after its DONE "
                   f"({engine.plugin_client.path}); a plugin failure only loses the cache, never the request",
                   flush=True)

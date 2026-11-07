@@ -89,6 +89,7 @@ inline bool shared_arena_bind(void* base, uint64_t bytes, SharedControl* control
     a.bump = kSharedArenaFirstOffset;
     a.rows.clear();
     a.bound = true;
+    shared_arena_incomplete_flag() = false;   // a fresh bind starts a fresh session
     return true;
 }
 

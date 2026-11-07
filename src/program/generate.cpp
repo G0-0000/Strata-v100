@@ -2340,6 +2340,125 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
     return false;
 }
 
+/// The DUMP command's data movement: the session's device-only running state lands in the share, in page-rounded
+/// slices the arena carves, and rows name them for the publish - kind 2 the GDN state, kind 3 the PLE history,
+/// kind 9 one sidecar blob, kind 1 the ids.  The ids already lie in the arena (vma_class::session_active), so
+/// they need only their row: a carve that once fell back to a private mapping lies outside the arena and its row
+/// is skipped (shared_arena_offset says kNoOffset).  The sidecar blob (kind 9, interim layout until the real
+/// sidecar format lands) is
+///
+///     [u64 tails_bytes][u64 dead_bytes][u64 blockpos_bytes][tails payload][dead payload][block_pos payload]
+///
+/// the three u64s are the payload sizes in bytes (this session's carve: layers * z.tail / z.dead / z.block_pos),
+/// the payloads start at byte 24 - 8-byte aligned - packed back to back, each holding every owned QSA layer's
+/// device array in layer order, the same bytes and order as a checkpoint's tails/dead/block_pos vectors.
+///
+/// Best effort, called between requests (the session is at rest, the background copies joined by the caller):
+/// every group is copied first and its row recorded only after the synchronize says the bytes are there, so a
+/// failed copy leaves nothing to read; the error names the first failure and the engine stays in step - a partial
+/// image is the reader's to detect from the published rows.  The rows a previous DUMP recorded are dropped first,
+/// so the published table names each kind once; the K/V rows the session build recorded are not touched.
+bool shared_arena_dump_running_state(const ConvIds& ids, const strata::core::SessionState& ss,
+                                     const strata::core::ModelGeometry& g, std::string& error) {
+    error.clear();
+    strata::core::ConversationStateSizes z;
+    if (!strata::core::conversation_session_sizes(g, ss, z, error)) return false;
+    bool ok = true;
+    auto fail = [&](const std::string& why) {
+        if (ok) error = why;   // the first failure is the one the log names
+        ok = false;
+    };
+    auto d2h = [&](void* dst, const void* src, size_t bytes) {
+        if (bytes == 0) return true;
+        if (dst == nullptr || src == nullptr) { fail("missing running-state buffer"); return false; }
+        const cudaError_t status = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, nullptr);
+        if (status != cudaSuccess) {
+            (void) cudaGetLastError();   // a failed copy must not poison the engine
+            fail(std::string("session share running-state copy: ") + cudaGetErrorString(status));
+            return false;
+        }
+        return true;
+    };
+    auto carve = [&](uint64_t bytes) -> void* {   // page-rounded like every carve of this arena (vma_alloc.hpp)
+        const uint64_t rounded = bytes <= UINT64_MAX - (strata::core::kSharedArenaPageBytes - 1)
+                                     ? (bytes + (strata::core::kSharedArenaPageBytes - 1)) &
+                                           ~(uint64_t) (strata::core::kSharedArenaPageBytes - 1)
+                                     : bytes;
+        const uint64_t off = strata::core::shared_arena_alloc(rounded, strata::core::kSharedArenaPageBytes);
+        return off == strata::core::kNoOffset ? nullptr : strata::core::shared_arena_ptr(off);
+    };
+    // the rows this command owns go: a second DUMP re-records them, the stale ones go first
+    auto& a = strata::core::shared_arena_instance();
+    a.rows.erase(std::remove_if(a.rows.begin(), a.rows.end(),
+                                [](const strata::core::SharedControlSegment& r) {
+                                    return r.index == 0 &&
+                                           (r.kind == strata::core::kSegmentIds || r.kind == strata::core::kSegmentGdn ||
+                                            r.kind == strata::core::kSegmentPle || r.kind == strata::core::kSegmentSidecar);
+                                }),
+                 a.rows.end());
+    if (!ids.empty()) {   // a row, no copy: the bytes are the live vector's own
+        const uint64_t off = strata::core::shared_arena_offset(ids.data());
+        if (off == strata::core::kNoOffset ||
+            !strata::core::shared_arena_record_bytes(strata::core::kSegmentIds, 0, off, ids.size() * sizeof(int32_t)))
+            fail("the live ids are not in the share arena (a carve fell back to a private mapping)");
+    }
+    // carve + copy one device array; the row goes in after the synchronize below
+    auto stage = [&](void*& dst, uint64_t bytes, const void* src, const char* what) {
+        dst = nullptr;
+        if (bytes == 0 || src == nullptr) return;   // the session has no such state (as a checkpoint's empty ple)
+        dst = carve(bytes);
+        if (dst == nullptr) { fail(std::string("the share has no room for the ") + what); return; }
+        if (!d2h(dst, src, bytes)) dst = nullptr;
+    };
+    void* gdn = nullptr;
+    void* ple = nullptr;
+    stage(gdn, z.gdn, ss.gdn_state, "GDN state");
+    stage(ple, z.ple, ss.ple_hist, "PLE history");
+    // the sidecar blob: three u64 sizes, then every owned QSA layer's tail, dead and block_pos, in layer order
+    const size_t layers = (size_t) std::max<int64_t>(ss.qsa_alloc, 0);
+    const uint64_t tails = layers * z.tail, dead = layers * z.dead, block_pos = layers * z.block_pos;
+    void* side = nullptr;
+    if (tails != 0 || dead != 0 || block_pos != 0) {
+        side = carve(sizeof(uint64_t) * 3 + tails + dead + block_pos);
+        if (side == nullptr) {
+            fail("the share has no room for the indexer state");
+        } else {
+            auto* b = (uint8_t*) side;
+            std::memcpy(b, &tails, sizeof(tails));
+            std::memcpy(b + 8, &dead, sizeof(dead));
+            std::memcpy(b + 16, &block_pos, sizeof(block_pos));
+            for (size_t j = 0; j < layers; ++j) {
+                const auto& st = ss.qsa_states[(size_t) ss.qsa_ord0 + j];
+                if (!d2h(b + sizeof(uint64_t) * 3 + j * z.tail, st.idx_tail, z.tail) ||
+                    !d2h(b + sizeof(uint64_t) * 3 + tails + j * z.dead, st.idx_dead, z.dead) ||
+                    !d2h(b + sizeof(uint64_t) * 3 + tails + dead + j * z.block_pos, st.idx_block_pos, z.block_pos)) {
+                    side = nullptr;
+                    break;
+                }
+            }
+        }
+    }
+    // the copies above are ordered on the default stream: the synchronize is what says the share holds them
+    bool landed = true;
+    const cudaError_t status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+        (void) cudaGetLastError();
+        fail(std::string("session share running-state synchronize: ") + cudaGetErrorString(status));
+        landed = false;
+    }
+    if (landed) {   // a synchronize that failed leaves the bytes unverified: no row names them
+        if (gdn != nullptr) strata::core::shared_arena_record_bytes(strata::core::kSegmentGdn, 0,
+                                                                    strata::core::shared_arena_offset(gdn), z.gdn);
+        if (ple != nullptr) strata::core::shared_arena_record_bytes(strata::core::kSegmentPle, 0,
+                                                                    strata::core::shared_arena_offset(ple), z.ple);
+        if (side != nullptr)
+            strata::core::shared_arena_record_bytes(strata::core::kSegmentSidecar, 0,
+                                                    strata::core::shared_arena_offset(side),
+                                                    sizeof(uint64_t) * 3 + tails + dead + block_pos);
+    }
+    return ok;
+}
+
 /// STRATA_CKPT_POOL: the storage of dropped checkpoints, for the next save or slot copy to reuse.  `give` keeps a
 /// checkpoint's vectors (its tokens, pictures and marks cleared), `take` hands one back (an empty checkpoint when none
 /// is kept).  At most `cap` are kept (a batch admission drops and takes about two; STRATA_CKPT_POOL=N), the rest are
@@ -16445,9 +16564,22 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
-            if (line == "DUMP") {   // the plugin store's dump command (S1 skeleton): acknowledged, no data moves
-                // the same publish a completed request does: the table says what the share holds right now
+            if (line == "DUMP") {   // the plugin store's dump command: the device's running state lands in the share
                 if (strata::core::shared_arena_control() != nullptr) {
+                    // the device state is read only when nothing else is copying it - the same joins a session
+                    // file save/restore takes before it touches the checkpoints
+                    strata::core::conversation_checkpoint_join(nullptr);
+                    strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: the last park's K/V)
+                    std::string dump_err;
+                    if (!shared_arena_dump_running_state(live, ss, g, dump_err)) {
+                        static bool dump_said = false;
+                        if (!dump_said) {
+                            dump_said = true;
+                            std::fprintf(stderr, "strata serve: the session's running state did not fully reach the "
+                                                 "share (%s); the rows that landed stay published\n", dump_err.c_str());
+                        }
+                    }
+                    // the same publish a completed request does: the table says what the share holds right now
                     std::string pub_err;
                     if (!strata::core::shared_arena_publish(pub_err)) {
                         static bool pub_said = false;

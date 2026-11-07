@@ -34,7 +34,12 @@ inline constexpr uint32_t kSegmentV = 5;        // the same layer's values
 inline constexpr uint32_t kSegmentKScale = 6;   // the same layer's key scales
 inline constexpr uint32_t kSegmentVScale = 7;   // the same layer's value scales
 inline constexpr uint32_t kSegmentPooled = 8;   // the same layer's pooled indexer keys
-inline constexpr uint32_t kSegmentSidecar = 9;  // the directory and the small state
+inline constexpr uint32_t kSegmentSidecar = 9;  // the directory and the small state.  Interim DUMP layout (the
+                                                // real sidecar format is a later task): [u64 tails_bytes]
+                                                // [u64 dead_bytes][u64 blockpos_bytes][payloads packed in that
+                                                // order, 8-byte aligned at byte 24], each payload every QSA
+                                                // layer's device array in layer order (generate.cpp's
+                                                // shared_arena_dump_running_state)
 
 struct SharedControl {
     static constexpr uint64_t kMagic = 0x5354524154410001ull;   // "STRATA" 0x00 0x01

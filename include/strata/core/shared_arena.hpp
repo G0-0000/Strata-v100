@@ -104,6 +104,16 @@ inline void* shared_arena_ptr(uint64_t offset) {
     return a.base + offset;
 }
 
+/// The inverse of shared_arena_ptr: the offset of an address inside the bound arena, or kNoOffset.  A pointer
+/// whose allocation fell back to a private mapping (the carve did not fit) lies outside, and so does null.
+inline uint64_t shared_arena_offset(const void* p) {
+    SharedArena& a = shared_arena_instance();
+    if (!a.bound || p == nullptr) return kNoOffset;
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    if (b < a.base || b >= a.base + a.bytes) return kNoOffset;
+    return (uint64_t) (b - a.base);
+}
+
 /// The bound control block (publish writes the table through it), or null when no arena is bound.
 inline SharedControl* shared_arena_control() {
     SharedArena& a = shared_arena_instance();
@@ -125,6 +135,12 @@ inline bool shared_arena_record(uint64_t offset, uint64_t bytes, uint32_t kind, 
     if (!a.bound || a.rows.size() >= SharedControl::kTableCapacity) return false;
     a.rows.push_back(SharedControlSegment{offset, bytes, kind, index});
     return true;
+}
+
+/// The same row, with the arguments in the order a caller states them - what the span is, then where and how
+/// big.  One wrapper over shared_arena_record; its failure contract is the same.
+inline bool shared_arena_record_bytes(uint32_t kind, uint32_t index, uint64_t offset, uint64_t bytes) {
+    return shared_arena_record(offset, bytes, kind, index);
 }
 
 /// Publish the recorded rows and hand the share over: the rows are copied into the control block's table (a

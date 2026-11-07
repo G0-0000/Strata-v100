@@ -188,6 +188,13 @@ int main() {
     CHECK(!mapped_with_name("[anon:strata/session_active]"));   // deallocate still munmaps the fallback
     CHECK(share_mapping_whole(lo, share_bytes));                // and never touched the share
 
+    // --- the inverse of shared_arena_ptr: the offset of an address inside the arena, kNoOffset outside it ---
+    CHECK(strata::core::shared_arena_offset(p1) == o1);
+    CHECK(strata::core::shared_arena_offset(static_cast<uint8_t*>(share.base) + share_bytes) ==
+          strata::core::kNoOffset);   // one past the share's last byte: outside
+    CHECK(strata::core::shared_arena_offset(&share_bytes) == strata::core::kNoOffset);   // an unrelated address
+    CHECK(strata::core::shared_arena_offset(nullptr) == strata::core::kNoOffset);
+
     // --- the table append helper: rows land at segment_count, and a full table refuses with the count kept ---
     CHECK(strata::core::shared_control_append_segment(*share.ctl, o1, 4096, strata::core::kSegmentV, 7));
     CHECK(share.ctl->segment_count == 3);
@@ -214,8 +221,15 @@ int main() {
     CHECK(strata::core::shared_arena_handle() == nullptr);
     CHECK(strata::core::shared_arena_alloc(4096, 4096) == strata::core::kNoOffset);
     CHECK(strata::core::shared_arena_record(0, 4096, strata::core::kSegmentIds, 0) == false);
+    CHECK(strata::core::shared_arena_offset(share.base) == strata::core::kNoOffset);   // unbound: nothing is inside
     CHECK(strata::core::shared_arena_bind(share.base, share.bytes, share.ctl, err));
     CHECK(strata::core::shared_arena_alloc(4096, 4096) == strata::core::kSharedArenaFirstOffset);
+
+    // --- record_bytes: the same row record takes, with the arguments in the order a caller states them ---
+    CHECK(strata::core::shared_arena_record_bytes(strata::core::kSegmentIds, 0, 4096, 100));
+    CHECK(strata::core::shared_arena_publish(perr));
+    CHECK(share.ctl->segment_count == 1);
+    CHECK(table[0].offset == 4096 && table[0].bytes == 100 && table[0].kind == 1 && table[0].index == 0);
 
     share.drop();
     if (fails != 0) std::fprintf(stderr, "shared_arena_test: %d of %d checks FAILED\n", fails, checks);

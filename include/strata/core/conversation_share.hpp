@@ -292,4 +292,16 @@ inline bool conversation_share_chain_publish(const ConversationCheckpoint& c, ui
     return true;
 }
 
+/// The DUMP's kind-8 row for one K/V layer: the pooled indexer keys copied into their own share span at
+/// DUMP time (the session build records no row for them - that part stays device-side, layer.cpp's pool
+/// recording).  `offset` names the span the device copy lands in (page-aligned, like every carve of the
+/// arena), `logical_bytes` the sidecar shape's part_bytes[4] - the length the plugin compares the row
+/// against; the row publishes the page-rounded span, which is never shorter.  False when the arena is not
+/// bound, the arguments name no span, or the table has no room for the row.
+inline bool conversation_share_pooled_publish(uint32_t layer, uint64_t offset, uint64_t logical_bytes) {
+    if (logical_bytes == 0 || offset == kNoOffset) return false;
+    const uint64_t rounded = (logical_bytes + kSharedArenaPageBytes - 1) & ~(kSharedArenaPageBytes - 1);
+    return shared_arena_record_bytes(kSegmentPooled, layer, offset, rounded);
+}
+
 }   // namespace strata::core

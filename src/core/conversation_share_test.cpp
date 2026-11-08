@@ -2,9 +2,11 @@
 // (its segment_sidecar.hpp) is built against, ported from the disk-cache line's conversation_share (commit
 // 941e1faf).  The magic and version are pinned against the plugin's own literals, the layout arithmetic puts
 // every member 8-byte aligned behind one header and member table, the writer fills the header, the table and
-// the host-side members while leaving the three device-copied payloads alone, and a dumped chain publishes
+// the host-side members while leaving the three device-copied payloads alone, a dumped chain publishes
 // rows (kinds 1-3, index 1) that name the checkpoint's share-resident ids/gdn/ple at the right offsets and
-// sizes - no bytes moved.  CPU only: no CUDA, no model, a mebibyte of RAM.
+// sizes - no bytes moved - and the DUMP's kind-8 rows name the pooled indexer keys' spans, page-rounded and
+// never shorter than the shape's part_bytes[4], with a republish replacing the row.  CPU only: no CUDA, no
+// model, a mebibyte of RAM.
 #include "strata/core/conversation_share.hpp"
 #include "strata/core/vma_alloc.hpp"
 
@@ -269,6 +271,45 @@ int main() {
         if (r.index == 1) ++plain_rows;
     CHECK(plain_rows == 0);   // conv_cache storage is not share storage: no row names it
 
+    // --- the pooled indexer keys (kind 8): what a DUMP records for a layer whose shape names pooled bytes ---
+    // The session build leaves that part device-side (no row at the build), so the DUMP copies it into its own
+    // span and records the row once the bytes have landed: the row is page-aligned and page-rounded, at least
+    // the shape's part_bytes[4] - the logical length the plugin compares against.
+    SharedKvShape pooled_shape{};
+    pooled_shape.pooled_rows = 3;
+    pooled_shape.idx_dim = 256;
+    pooled_shape.parts[4] = (uint64_t) pooled_shape.pooled_rows * (uint64_t) pooled_shape.idx_dim * sizeof(float);
+    CHECK(pooled_shape.parts[4] == 3072);   // the logical byte count, not page-rounded
+    const uint64_t pooled_span = round_page(pooled_shape.parts[4]);
+    CHECK(pooled_span == 4096);
+    const uint64_t pooled_at = strata::core::shared_arena_alloc(pooled_span, strata::core::kSharedArenaPageBytes);
+    CHECK(pooled_at != strata::core::kNoOffset && pooled_at % 4096 == 0);   // page-aligned
+    CHECK(strata::core::conversation_share_pooled_publish(0, pooled_at, pooled_shape.parts[4]));
+    const strata::core::SharedControlSegment* r_pool = row_of(strata::core::kSegmentPooled, 0);
+    CHECK(r_pool != nullptr && r_pool->offset == pooled_at);
+    CHECK(r_pool->bytes == pooled_span && r_pool->bytes % 4096 == 0);   // page-rounded
+    CHECK(r_pool->bytes >= pooled_shape.parts[4]);                      // the shape's length fits the row
+    // a second layer whose shape names pooled bytes takes its own row at its own index
+    const uint64_t pooled_at_1 = strata::core::shared_arena_alloc(pooled_span, strata::core::kSharedArenaPageBytes);
+    CHECK(pooled_at_1 != strata::core::kNoOffset && pooled_at_1 != pooled_at);
+    CHECK(strata::core::conversation_share_pooled_publish(1, pooled_at_1, pooled_shape.parts[4]));
+    const strata::core::SharedControlSegment* r_pool_1 = row_of(strata::core::kSegmentPooled, 1);
+    CHECK(r_pool_1 != nullptr && r_pool_1->offset == pooled_at_1 && r_pool_1->bytes == pooled_span);
+    // a republish must not leave an old pooled row: the stale kind-8 rows go first (the same erase a request
+    // that computed without a dump takes), then the fresh spans are recorded
+    const uint64_t pooled_at_again = strata::core::shared_arena_alloc(pooled_span, strata::core::kSharedArenaPageBytes);
+    CHECK(pooled_at_again != strata::core::kNoOffset && pooled_at_again != pooled_at);
+    strata::core::shared_arena_erase_running_rows();
+    CHECK(row_of(strata::core::kSegmentPooled, 0) == nullptr);   // the stale row went with the erase
+    CHECK(row_of(strata::core::kSegmentPooled, 1) == nullptr);
+    CHECK(strata::core::conversation_share_pooled_publish(0, pooled_at_again, pooled_shape.parts[4]));
+    int pooled_rows = 0;
+    for (const auto& r : strata::core::shared_arena_instance().rows)
+        if (r.kind == strata::core::kSegmentPooled) ++pooled_rows;
+    CHECK(pooled_rows == 1);   // one row per layer, the republish's own
+    r_pool = row_of(strata::core::kSegmentPooled, 0);
+    CHECK(r_pool != nullptr && r_pool->offset == pooled_at_again && r_pool->bytes == pooled_span);
+
     // the table's room is the row limit: fill it and the next chain row refuses, the entry still fills
     while (strata::core::shared_arena_record(0, 4096, strata::core::kSegmentK, 0)) {}
     ConversationCheckpoint full(vma_class::session_active);
@@ -280,6 +321,7 @@ int main() {
     CHECK(entry4.tokens == 4);   // described either way
 
     strata::core::shared_arena_reset();
+    CHECK(!strata::core::conversation_share_pooled_publish(0, 4096, pooled_shape.parts[4]));   // no arena, no row
     share.drop();
 
     std::fprintf(stderr, "%s: %d checks, %d failed\n", "conversation_share_test", checks, fails);

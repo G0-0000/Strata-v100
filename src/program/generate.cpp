@@ -2353,7 +2353,9 @@ static uint64_t g_share_last_applied_epoch = 0;
 
 /// The DUMP command's data movement: the session's device-only running state lands in the share, in page-rounded
 /// slices the arena carves, and rows name them for the publish - kind 2 the GDN state, kind 3 the PLE history,
-/// kind 9 one sidecar span, kind 1 the ids.  The ids already lie in the arena (vma_class::session_active), so
+/// kind 9 one sidecar span, kind 1 the ids, and kind 8 one span per K/V layer whose shape names pooled bytes
+/// (the pooled indexer keys are the one part the session build leaves device-side, so the DUMP copies them d2h
+/// here).  The ids already lie in the arena (vma_class::session_active), so
 /// they need only their row: a carve that once fell back to a private mapping lies outside the arena and its row
 /// is skipped (shared_arena_offset says kNoOffset).  The sidecar span (kind 9) is the published session's
 /// directory and small state in conversation_share.hpp's format: a STRASIDE header and member table over the
@@ -2399,12 +2401,13 @@ bool shared_arena_dump_running_state(const ConvIds& ids, const std::vector<ImgKe
         return off == strata::core::kNoOffset ? nullptr : strata::core::shared_arena_ptr(off);
     };
     // the rows this command owns go: a second DUMP re-records them, the stale ones go first (the chain's rows
-    // are kinds 1-3 at index >= 1 - the live state's index 0 included, both re-recorded below)
+    // are kinds 1-3 at index >= 1 - the live state's index 0 included, both re-recorded below; the pooled
+    // indexer keys' kind-8 rows are this command's too, one per published layer)
     auto& a = strata::core::shared_arena_instance();
     a.rows.erase(std::remove_if(a.rows.begin(), a.rows.end(),
                                 [](const strata::core::SharedControlSegment& r) {
                                     return (r.kind == strata::core::kSegmentIds || r.kind == strata::core::kSegmentGdn ||
-                                            r.kind == strata::core::kSegmentPle) ||
+                                            r.kind == strata::core::kSegmentPle || r.kind == strata::core::kSegmentPooled) ||
                                            (r.kind == strata::core::kSegmentSidecar && r.index == 0);
                                 }),
                  a.rows.end());
@@ -2469,6 +2472,22 @@ bool shared_arena_dump_running_state(const ConvIds& ids, const std::vector<ImgKe
             kv_layers = 0;
         }
     }
+    // The pooled indexer keys are the one K/V part the session build leaves device-side (no kind-8 row was
+    // recorded for it, layer.cpp's pool parts), so the DUMP moves each layer's pooled part into its own share
+    // span - queued on the same stream as the gdn/ple copies above, the row recorded only once the synchronize
+    // below says the bytes are there.  The shape's part_bytes[4] stays the logical byte count; the row names
+    // the page-rounded span, which is never shorter (the plugin refuses a span shorter than the shape's part).
+    std::vector<uint64_t> pooled_off((size_t) kv_layers, strata::core::kNoOffset);
+    for (uint64_t j = 0; j < kv_layers; ++j) {
+        const uint64_t bytes = shapes[(size_t) j].parts[4];
+        if (bytes == 0) continue;   // the draft ring's shape names no pooled part, and neither does a layer below a block
+        const bool index = j < (uint64_t) ss.qsa_alloc;
+        const strata::core::QsaState& st = index ? ss.qsa_states[(size_t) ss.qsa_ord0 + (int64_t) j] : *draft;
+        void* dst = carve(bytes);
+        if (dst == nullptr) { fail("the share has no room for a layer's pooled indexer keys"); continue; }
+        if (!d2h(dst, st.idx_pooled, bytes)) continue;
+        pooled_off[(size_t) j] = strata::core::shared_arena_offset(dst);
+    }
     // the sidecar: the directory and small state in one span - the engine's device copies fill the three small
     // arrays' payloads at the layout's offsets, the writer fills the rest
     strata::core::SharedChainEntry chain_entry{};
@@ -2520,6 +2539,10 @@ bool shared_arena_dump_running_state(const ConvIds& ids, const std::vector<ImgKe
         if (ple != nullptr) strata::core::shared_arena_record_bytes(strata::core::kSegmentPle, 0,
                                                                     strata::core::shared_arena_offset(ple),
                                                                     round_page(z.ple));
+        for (uint64_t j = 0; j < kv_layers; ++j)   // one row per layer whose pooled span landed
+            if (pooled_off[(size_t) j] != strata::core::kNoOffset)
+                strata::core::conversation_share_pooled_publish((uint32_t) j, pooled_off[(size_t) j],
+                                                                shapes[(size_t) j].parts[4]);
         if (side != nullptr) {
             strata::core::SharedSidecarMeta meta;
             meta.tokens = ids.size();

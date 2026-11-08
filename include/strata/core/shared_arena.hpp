@@ -160,15 +160,18 @@ inline bool shared_arena_record_bytes(uint32_t kind, uint32_t index, uint64_t of
 inline void shared_arena_mark_incomplete();
 inline bool shared_arena_incomplete();
 
-/// Drop the rows a DUMP records (the running state: gdn, ple, sidecar).  A request that computed without a dump
-/// leaves rows that name the previous session's bytes; publishing them would hand the reader a stale image.
+/// Drop the rows a DUMP records (the running state: ids, gdn, ple, sidecar, and the chain's kinds 1-3 rows at
+/// index >= 1).  A request that computed without a dump leaves rows that name the previous session's bytes;
+/// publishing them would hand the reader a stale image.  The live ids' row (kind 1, index 0) stays: the caller
+/// re-points it at the session's own ids with shared_arena_set_row.
 inline void shared_arena_erase_running_rows() {
     SharedArena& a = shared_arena_instance();
     if (!a.bound) return;
     a.rows.erase(std::remove_if(a.rows.begin(), a.rows.end(),
                                 [](const SharedControlSegment& r) {
                                     return r.kind == kSegmentGdn || r.kind == kSegmentPle ||
-                                           r.kind == kSegmentSidecar;
+                                           r.kind == kSegmentSidecar ||
+                                           (r.kind == kSegmentIds && r.index != 0);
                                 }),
                  a.rows.end());
 }

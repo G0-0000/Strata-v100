@@ -237,6 +237,12 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(shared_arena_test src/core/shared_arena_test.cpp)
   target_include_directories(shared_arena_test PRIVATE include)
   add_test(NAME shared_arena_test COMMAND shared_arena_test)
+  # host-only: the plugin share's sidecar (conversation_share.hpp) - the format the plugin's parser is built
+  # against, the layout arithmetic, the writer against a reader's walk, and a dumped chain's rows naming the
+  # checkpoint's share-resident ids/gdn/ple; no model, no GPU
+  add_executable(conversation_share_test src/core/conversation_share_test.cpp)
+  target_include_directories(conversation_share_test PRIVATE include)
+  add_test(NAME conversation_share_test COMMAND conversation_share_test)
   # host benchmark of the session file/delta writers' stage timings at production geometry (not a test:
   # it writes ~1 GB per round to a scratch dir it removes; run it by hand)
   add_executable(conversation_file_bench src/core/conversation_file_bench.cpp src/core/conversation_file.cpp)

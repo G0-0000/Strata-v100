@@ -36,6 +36,7 @@
 #include "strata/core/conversation_plugin_client.hpp"
 #include "strata/core/shared_control.hpp"
 #include "strata/core/shared_arena.hpp"
+#include "strata/core/conversation_share.hpp"
 #include "strata/core/rht_state_codec.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -2352,23 +2353,23 @@ static uint64_t g_share_last_applied_epoch = 0;
 
 /// The DUMP command's data movement: the session's device-only running state lands in the share, in page-rounded
 /// slices the arena carves, and rows name them for the publish - kind 2 the GDN state, kind 3 the PLE history,
-/// kind 9 one sidecar blob, kind 1 the ids.  The ids already lie in the arena (vma_class::session_active), so
+/// kind 9 one sidecar span, kind 1 the ids.  The ids already lie in the arena (vma_class::session_active), so
 /// they need only their row: a carve that once fell back to a private mapping lies outside the arena and its row
-/// is skipped (shared_arena_offset says kNoOffset).  The sidecar blob (kind 9, interim layout until the real
-/// sidecar format lands) is
-///
-///     [u64 tails_bytes][u64 dead_bytes][u64 blockpos_bytes][tails payload][dead payload][block_pos payload]
-///
-/// the three u64s are the payload sizes in bytes (this session's carve: layers * z.tail / z.dead / z.block_pos),
-/// the payloads start at byte 24 - 8-byte aligned - packed back to back, each holding every owned QSA layer's
-/// device array in layer order, the same bytes and order as a checkpoint's tails/dead/block_pos vectors.
+/// is skipped (shared_arena_offset says kNoOffset).  The sidecar span (kind 9) is the published session's
+/// directory and small state in conversation_share.hpp's format: a STRASIDE header and member table over the
+/// live image keys, the three small arrays' payloads (d2h'd here, at the layout's offsets), one shape per
+/// published K/V layer, and the checkpoint chain's directory - one entry per checkpoint a save would write
+/// (session_checkpoints_to_save: the deepest one, `deepest`).  The chain checkpoint's own share-resident
+/// running state (ids/gdn/ple, session_active-class) is published as kinds 1-3 rows at index 1 - no bytes move,
+/// the rows name buffers that already lie in the share (conversation_share_chain_publish).
 ///
 /// Best effort, called between requests (the session is at rest, the background copies joined by the caller):
 /// every group is copied first and its row recorded only after the synchronize says the bytes are there, so a
 /// failed copy leaves nothing to read; the error names the first failure and the engine stays in step - a partial
 /// image is the reader's to detect from the published rows.  The rows a previous DUMP recorded are dropped first,
 /// so the published table names each kind once; the K/V rows the session build recorded are not touched.
-bool shared_arena_dump_running_state(const ConvIds& ids, const strata::core::SessionState& ss,
+bool shared_arena_dump_running_state(const ConvIds& ids, const std::vector<ImgKey>& imgs, const ConvCheckpoint* deepest,
+                                     const strata::core::QsaState* draft, bool cvec, const strata::core::SessionState& ss,
                                      const strata::core::ModelGeometry& g, std::string& error) {
     error.clear();
     strata::core::ConversationStateSizes z;
@@ -2397,13 +2398,14 @@ bool shared_arena_dump_running_state(const ConvIds& ids, const strata::core::Ses
         const uint64_t off = strata::core::shared_arena_alloc(rounded, strata::core::kSharedArenaPageBytes);
         return off == strata::core::kNoOffset ? nullptr : strata::core::shared_arena_ptr(off);
     };
-    // the rows this command owns go: a second DUMP re-records them, the stale ones go first
+    // the rows this command owns go: a second DUMP re-records them, the stale ones go first (the chain's rows
+    // are kinds 1-3 at index >= 1 - the live state's index 0 included, both re-recorded below)
     auto& a = strata::core::shared_arena_instance();
     a.rows.erase(std::remove_if(a.rows.begin(), a.rows.end(),
                                 [](const strata::core::SharedControlSegment& r) {
-                                    return r.index == 0 &&
-                                           (r.kind == strata::core::kSegmentIds || r.kind == strata::core::kSegmentGdn ||
-                                            r.kind == strata::core::kSegmentPle || r.kind == strata::core::kSegmentSidecar);
+                                    return (r.kind == strata::core::kSegmentIds || r.kind == strata::core::kSegmentGdn ||
+                                            r.kind == strata::core::kSegmentPle) ||
+                                           (r.kind == strata::core::kSegmentSidecar && r.index == 0);
                                 }),
                  a.rows.end());
     if (!ids.empty()) {   // a row, no copy: the bytes are the live vector's own
@@ -2425,29 +2427,81 @@ bool shared_arena_dump_running_state(const ConvIds& ids, const strata::core::Ses
     void* ple = nullptr;
     stage(gdn, z.gdn, ss.gdn_state, "GDN state");
     stage(ple, z.ple, ss.ple_hist, "PLE history");
-    // the sidecar blob: three u64 sizes, then every owned QSA layer's tail, dead and block_pos, in layer order
+    // the K/V layers the share publishes: the session build recorded a row per pool part (kinds 4-7, `index` =
+    // the layer, the draft ring's at `qsa_alloc`), so the sidecar describes the leading run of those layers - a
+    // layer whose pool carve fell out of the share ends the run, and a later row the table still names is the
+    // reader's refusal.  The shapes are the layers' own session-file geometry at the live extent
+    // (conversation_kv_source); one that cannot be built drops the whole shape set rather than announcing a set
+    // the table cannot back.
     const size_t layers = (size_t) std::max<int64_t>(ss.qsa_alloc, 0);
+    std::vector<char> have((size_t) ss.qsa_alloc + 1, 0);
+    for (const auto& r : a.rows)
+        if (r.kind == strata::core::kSegmentK && r.index < have.size()) have[(size_t) r.index] = 1;
+    uint64_t kv_layers = 0;
+    while (kv_layers < (uint64_t) ss.qsa_alloc && have[(size_t) kv_layers]) kv_layers += 1;
+    if (draft != nullptr && kv_layers == (uint64_t) ss.qsa_alloc && ss.qsa_alloc >= 0 && have[(size_t) ss.qsa_alloc])
+        kv_layers += 1;   // the draft ring's pool, right behind the session's QSA layers
+    std::vector<strata::core::SharedKvShape> shapes;
+    if (kv_layers > 0) {
+        bool shapes_ok = true;
+        std::string shape_err;
+        for (uint64_t j = 0; j < kv_layers && shapes_ok; ++j) {
+            const bool index = j < (uint64_t) ss.qsa_alloc;
+            const strata::core::QsaState& st = index ? ss.qsa_states[(size_t) ss.qsa_ord0 + (int64_t) j] : *draft;
+            strata::core::SessionKvSource src;
+            if (!strata::core::conversation_kv_source(src, st, g, (int64_t) ids.size(), index, shape_err)) {
+                shapes_ok = false;   // no shapes at all rather than a partial set
+                break;
+            }
+            strata::core::SharedKvShape s{};
+            s.format = src.format;
+            s.cells = src.cells;
+            s.heads = src.heads;
+            s.head_dim = src.head_dim;
+            s.page_size = src.page_size;
+            s.pooled_rows = src.pooled_rows;
+            s.idx_dim = src.idx_dim;
+            for (size_t part = 0; part < 5; ++part) s.parts[part] = src.sizes[part];
+            shapes.push_back(s);
+        }
+        if (!shapes_ok) {
+            shapes.clear();
+            kv_layers = 0;
+        }
+    }
+    // the sidecar: the directory and small state in one span - the engine's device copies fill the three small
+    // arrays' payloads at the layout's offsets, the writer fills the rest
+    strata::core::SharedChainEntry chain_entry{};
+    const uint64_t images_bytes = imgs.size() * sizeof(ImgKey);
     const uint64_t tails = layers * z.tail, dead = layers * z.dead, block_pos = layers * z.block_pos;
+    const uint64_t checkpoints = deepest != nullptr ? 1 : 0;
+    const auto layout = strata::core::conversation_share_sidecar_layout(images_bytes, tails, dead, block_pos,
+                                                                        kv_layers, checkpoints);
     void* side = nullptr;
-    if (tails != 0 || dead != 0 || block_pos != 0) {
-        side = carve(sizeof(uint64_t) * 3 + tails + dead + block_pos);
+    if (layout.bytes != 0) {
+        side = carve(layout.bytes);
         if (side == nullptr) {
-            fail("the share has no room for the indexer state");
+            fail("the share has no room for the sidecar");
         } else {
             auto* b = (uint8_t*) side;
-            std::memcpy(b, &tails, sizeof(tails));
-            std::memcpy(b + 8, &dead, sizeof(dead));
-            std::memcpy(b + 16, &block_pos, sizeof(block_pos));
+            std::memset(b, 0, layout.bytes);   // the align gaps stay zero, as the format's readers expect
             for (size_t j = 0; j < layers; ++j) {
                 const auto& st = ss.qsa_states[(size_t) ss.qsa_ord0 + j];
-                if (!d2h(b + sizeof(uint64_t) * 3 + j * z.tail, st.idx_tail, z.tail) ||
-                    !d2h(b + sizeof(uint64_t) * 3 + tails + j * z.dead, st.idx_dead, z.dead) ||
-                    !d2h(b + sizeof(uint64_t) * 3 + tails + dead + j * z.block_pos, st.idx_block_pos, z.block_pos)) {
+                if (!d2h(b + layout.tails_at + j * z.tail, st.idx_tail, z.tail) ||
+                    !d2h(b + layout.dead_at + j * z.dead, st.idx_dead, z.dead) ||
+                    !d2h(b + layout.block_pos_at + j * z.block_pos, st.idx_block_pos, z.block_pos)) {
                     side = nullptr;
                     break;
                 }
             }
         }
+    }
+    // the chain's directory entry, and the rows naming the deepest checkpoint's share-resident state - only
+    // when the sidecar that describes them landed (rows without a directory would be a table the reader
+    // refuses)
+    if (side != nullptr && deepest != nullptr) {
+        std::string chain_err;
+        (void) strata::core::conversation_share_chain_publish(*deepest, 1, chain_entry, chain_err);
     }
     // the copies above are ordered on the default stream: the synchronize is what says the share holds them
     bool landed = true;
@@ -2466,19 +2520,39 @@ bool shared_arena_dump_running_state(const ConvIds& ids, const strata::core::Ses
         if (ple != nullptr) strata::core::shared_arena_record_bytes(strata::core::kSegmentPle, 0,
                                                                     strata::core::shared_arena_offset(ple),
                                                                     round_page(z.ple));
-        if (side != nullptr)
+        if (side != nullptr) {
+            strata::core::SharedSidecarMeta meta;
+            meta.tokens = ids.size();
+            meta.gdn_bytes = z.gdn;
+            meta.ple_bytes = ss.ple_hist != nullptr ? z.ple : 0;
+            meta.images = imgs.data();
+            meta.images_count = imgs.size();
+            meta.shapes = shapes.data();
+            meta.kv_layers = shapes.size();
+            meta.chain = &chain_entry;
+            meta.checkpoints = checkpoints;
+            meta.layer_lo = ss.layer_lo;
+            meta.layer_hi = ss.layer_hi;
+            meta.cvec = cvec ? 1u : 0u;
+            meta.geometry = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads,
+                             g.ssm_v_heads, g.ssm_d_conv, g.ssm_conv_channels, g.ssm_value_dim,
+                             g.n_head, g.n_head_kv, g.head_dim, g.idx_q_heads, g.idx_key_dim,
+                             g.hc, g.hc_lr, g.n_expert, g.n_ff};
+            strata::core::conversation_share_sidecar_write((uint8_t*) side, layout, meta);
             strata::core::shared_arena_record_bytes(strata::core::kSegmentSidecar, 0,
                                                     strata::core::shared_arena_offset(side),
-                                                    round_page(sizeof(uint64_t) * 3 + tails + dead + block_pos));
+                                                    round_page(layout.bytes));
+        }
     }
     return ok;
 }
 
 /// The request-start reload's data movement, the counterpart of shared_arena_dump_running_state: the session
 /// the plugin staged into the share comes back into the device.  The running state copies H2D out of the
-/// published rows (the same bytes and order the DUMP wrote); the K/V host pools ARE the share's kinds 4-7
-/// rows (the plugin rewrote them in place), so only their residency refresh moves anything - the streamed
-/// window map or the resident ring is refilled from the pools (ConversationKvTarget::finish).
+/// published rows (the same bytes and offsets the DUMP wrote, the sidecar's member table naming the small
+/// arrays); the K/V host pools ARE the share's kinds 4-7 rows (the plugin rewrote them in place), so only their
+/// residency refresh moves anything - the streamed window map or the resident ring is refilled from the pools
+/// (ConversationKvTarget::finish).
 ///
 /// False (with `error`) when the rows are missing, their sizes disagree with this session's
 /// (conversation_session_sizes, and `tokens` against the session's cells), or a copy failed - the caller
@@ -2531,21 +2605,36 @@ bool shared_arena_load_running_state(const int32_t*& ids_row, uint64_t tokens, s
         return false;
     }
     const uint8_t* side_bytes = nullptr;
-    if (row_side != nullptr) {   // the sidecar says its payload sizes again; they must be this session's
+    strata::core::SharedSidecarView side;
+    const strata::core::SharedSidecarMember *side_tails_m = nullptr, *side_dead_m = nullptr,
+                                             *side_block_pos_m = nullptr;
+    if (row_side != nullptr) {   // the sidecar is the published session's directory (conversation_share.hpp):
         side_bytes = static_cast<const uint8_t*>(strata::core::shared_arena_ptr(row_side->offset));
-        if (side_bytes == nullptr) { error = "the sidecar row points outside the share"; return false; }
-        uint64_t side_tails = 0, side_dead = 0, side_block_pos = 0;
-        std::memcpy(&side_tails, side_bytes, sizeof(side_tails));
-        std::memcpy(&side_dead, side_bytes + 8, sizeof(side_dead));
-        std::memcpy(&side_block_pos, side_bytes + 16, sizeof(side_block_pos));
-        if (side_tails != tails || side_dead != dead || side_block_pos != block_pos ||
-            row_side->bytes < sizeof(uint64_t) * 3 + tails + dead + block_pos ||
-            row_side->bytes % 4096 != 0) {
+        if (side_bytes == nullptr || row_side->bytes % 4096 != 0 ||
+            !strata::core::shared_sidecar_view(side_bytes, row_side->bytes, side) || !side.valid()) {
+            error = "the sidecar is not one of this format's sidecars";
+            return false;
+        }
+        // the directory must describe THIS session: the same tokens, running state and indexer sizes, or the
+        // staged image is not the session the caller is resuming
+        if (side.header->tokens != tokens || side.header->ids_bytes != tokens * sizeof(int32_t) ||
+            side.header->gdn_bytes != (want_gdn ? z.gdn : 0) || side.header->ple_bytes != (want_ple ? z.ple : 0)) {
+            error = "the sidecar describes another session's running state";
+            return false;
+        }
+        side_tails_m = side.find(strata::core::kSidecarTails, 0);
+        side_dead_m = side.find(strata::core::kSidecarDead, 0);
+        side_block_pos_m = side.find(strata::core::kSidecarBlockPos, 0);
+        // the writer always carries the three members (0 bytes when this image has no indexer state), so the
+        // members' lengths - not their presence - must be this session's
+        if ((side_tails_m != nullptr ? side_tails_m->bytes != tails : tails != 0) ||
+            (side_dead_m != nullptr ? side_dead_m->bytes != dead : dead != 0) ||
+            (side_block_pos_m != nullptr ? side_block_pos_m->bytes != block_pos : block_pos != 0)) {
             error = "the indexer sidecar names other payload sizes";
             return false;
         }
     }
-    if ((tails != 0 || dead != 0 || block_pos != 0) != (row_side != nullptr)) {
+    if ((tails != 0 || dead != 0 || block_pos != 0) && row_side == nullptr) {
         error = "the indexer sidecar is missing";   // this session's indexer state has nowhere to come from
         return false;
     }
@@ -2566,7 +2655,10 @@ bool shared_arena_load_running_state(const int32_t*& ids_row, uint64_t tokens, s
         error = "a running-state row points outside the share";
         return false;
     }
-    const uint8_t* payloads = side_bytes != nullptr ? side_bytes + sizeof(uint64_t) * 3 : nullptr;
+    // the small arrays' payloads sit at their member offsets inside the sidecar span
+    const uint8_t* tails_payload = side.data(side_tails_m);
+    const uint8_t* dead_payload = side.data(side_dead_m);
+    const uint8_t* block_pos_payload = side.data(side_block_pos_m);
     bool ok = true;
     auto fail = [&](const std::string& why) {
         if (ok) error = why;   // the first failure is the one the log names
@@ -2592,11 +2684,11 @@ bool shared_arena_load_running_state(const int32_t*& ids_row, uint64_t tokens, s
     if (ss.ple_hist != nullptr) h2d(ss.ple_hist, ple_row, z.ple);
     for (size_t j = 0; j < layers && ok; ++j) {
         strata::core::QsaState& st = ss.qsa_states[(size_t) ss.qsa_ord0 + j];
-        h2d(st.idx_tail, payloads + j * z.tail, z.tail);
-        h2d(st.idx_dead, payloads + tails + j * z.dead, z.dead);
-        h2d(st.idx_block_pos, payloads + tails + dead + j * z.block_pos, z.block_pos);
+        h2d(st.idx_tail, tails_payload + j * z.tail, z.tail);
+        h2d(st.idx_dead, dead_payload + j * z.dead, z.dead);
+        h2d(st.idx_block_pos, block_pos_payload + j * z.block_pos, z.block_pos);
         // the pooled row the next token fills is rebuilt from `dead`, as a checkpoint restore rebuilds it
-        h2d(st.idx_pooled + (size_t) (tokens / idx_block) * g.idx_key_dim, payloads + tails + j * z.dead, z.dead);
+        h2d(st.idx_pooled + (size_t) (tokens / idx_block) * g.idx_key_dim, dead_payload + j * z.dead, z.dead);
     }
     if (!ok) return false;
     const cudaError_t landed = cudaDeviceSynchronize();
@@ -16769,7 +16861,10 @@ int main(int argc, char** argv) {
                     strata::core::conversation_checkpoint_join(nullptr);
                     strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: the last park's K/V)
                     std::string dump_err;
-                    if (!shared_arena_dump_running_state(live, ss, g, dump_err)) {
+                    if (!shared_arena_dump_running_state(live, live_imgs,
+                                                         strata::core::session_deepest_checkpoint(checks),
+                                                         use_mtp ? &mtp.kv_state() : nullptr, cvec_cached, ss, g,
+                                                         dump_err)) {
                         static bool dump_said = false;
                         if (!dump_said) {
                             dump_said = true;

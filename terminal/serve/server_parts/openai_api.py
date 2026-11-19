@@ -205,6 +205,8 @@ def openai_collect(chunks) -> dict:
         out["strata_rejected_tool_calls"] = last["strata_rejected_tool_calls"]
     if last.get("strata_unread_tool_markup"):
         out["strata_unread_tool_markup"] = last["strata_unread_tool_markup"]
+    if last.get("session"):
+        out["session"] = last["session"]                # a strata_session composite's restore/save/splice report
     return out
 
 

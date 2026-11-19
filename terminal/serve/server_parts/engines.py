@@ -100,6 +100,20 @@ class SessionRefused(ValueError):
         return self.STATUS[self.kind]
 
 
+class SpliceConflict(Exception):
+    """strata_session splice refused: the base recorded in the token sidecar cannot be trusted for this request.
+    A 409 (never a silent mismatch): `kind` is splice_stale (the sidecar is missing, was written by another
+    tokenizer/template, or the engine restored fewer tokens than it holds - the client resends the whole
+    conversation once to rebuild the base) or splice_base_seam (the base does not end on a full turn's stop
+    token, e.g. it was cut mid-turn).  `fields` become the error body's extra keys: expected / got only where two
+    numbers are genuinely compared (the sidecar's version, the restored token count); an identity-hash mismatch
+    (another tokenizer/template) names the changed class in `detail`, with no expected/got at all."""
+
+    def __init__(self, kind: str, message: str, **fields):
+        super().__init__(message)
+        self.kind, self.fields = kind, fields
+
+
 class EngineStuck(RuntimeError):
     """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
     reporting its GPU and RAM as given back."""

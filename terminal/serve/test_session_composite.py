@@ -86,6 +86,7 @@ class FakeEngine(MockEngine):
             raise SessionRefused(*self.save_refusal)
         tokens = self.save_tokens if self.save_tokens is not None else self.live
         self.files[path] = tokens
+        Path(path).write_bytes(b"sess")       # the engine wrote the file: a later restore opens it
         return {"tokens": tokens, "bytes": tokens * 4, "ms": 34.5}
 
 
@@ -138,6 +139,12 @@ class Composite(unittest.TestCase):
     def sidecar(self, name):
         return Path(self.dir.name, name + ".tokens.json")
 
+    def sess(self, name):
+        """A session file a restore opens: the server checks it is there before it hands the engine the path."""
+        path = Path(self.dir.name, name)
+        path.write_bytes(b"sess")
+        return path
+
     def write_sidecar(self, name, ids, **kw):
         kw.setdefault("engine_tokens", self.engine_count(ids))       # what the engine's SAVE reported for them
         data = {"version": 2, "tokenizer": self.svc.session_tok_hash, "template": self.svc.session_tpl_hash,
@@ -189,6 +196,7 @@ class Composite(unittest.TestCase):
     # T2: one fifo turn - a plain chat's GEN never lands between another request's RESTORE, GEN and SAVE
     def test_t2_restore_generate_save_is_atomic_with_a_plain_chat(self):
         self.engine.restore_tokens = 11                                # the file it loads: no save here wrote it
+        self.sess("t2.sess")
         self.engine.gen_gate = threading.Event()                       # hold the composite's generate in the fifo
         self.engine.gen_entered = threading.Event()
         composite = {"messages": [{"role": "user", "content": "composite"}],
@@ -228,6 +236,7 @@ class Composite(unittest.TestCase):
 
     # T3: a restore refusal fails the whole request; a save refusal rides a 200 and writes no sidecar
     def test_t3_restore_refusal_fails_the_whole_request(self):
+        self.sess("t3.sess")                                         # there, so the engine's own answer decides
         self.engine.restore_error = ("invalid", "session file: saved with another model (model fingerprint differs)")
         body = {"messages": [{"role": "user", "content": "hi"}],
                 "strata_session": {"restore": "t3.sess", "save": "t3.sess"}}
@@ -302,6 +311,7 @@ class Composite(unittest.TestCase):
     def test_t5_a_restore_count_below_the_sidecar_is_409_with_expected_and_got(self):
         base = self.base_ids("one", "one done")
         self.write_sidecar("t5b.sess", base)
+        self.sess("t5b.sess")
         engine_base = self.engine_count(base)                       # the engine's count: the restore check's number
         self.engine.restore_tokens = engine_base - 3                 # the file changed underneath: it restores fewer
         body = {"messages": [{"role": "user", "content": "next"}],
@@ -319,6 +329,7 @@ class Composite(unittest.TestCase):
     def test_t6_a_short_resume_degrades_to_resume_ok_false(self):
         base = self.base_ids("one", "one done")
         self.write_sidecar("t6.sess", base)
+        self.sess("t6.sess")
         engine_base = self.engine_count(base)
         self.engine.restore_tokens = engine_base
         self.engine.next_reused = engine_base - 10                   # the engine's RESUME, short of the base
@@ -353,6 +364,7 @@ class Composite(unittest.TestCase):
         try:
             base = self.base_ids("one", "one done")
             self.write_sidecar("t7b.sess", base)
+            self.sess("t7b.sess")
             self.engine.restore_tokens = self.engine_count(base)
             loop = "<think>" + "ab" * 1500 + "</think>\n\nThe answer is 42."
             end = self.tok.encode(IM_END, parse_special=True)
@@ -451,6 +463,7 @@ class Composite(unittest.TestCase):
     def test_t9_a_same_name_save_between_prepare_and_the_turn_is_409(self):
         base = self.base_ids("one", "one done")
         self.write_sidecar("race.sess", base)
+        self.sess("race.sess")
         self.engine.restore_tokens = self.engine_count(base)        # both restores answer the base's count
         self.engine.gen_gate = threading.Event()                   # B holds the fifo inside its generate
         self.engine.gen_entered = threading.Event()
@@ -536,6 +549,29 @@ class Composite(unittest.TestCase):
         data = json.loads(self.sidecar("t11.sess").read_text())
         self.assertEqual(data["engine_tokens"], 5)                   # the engine's count: authoritative for restore
         self.assertGreater(len(data["ids"]), 6)
+
+    # T12: a session that cannot be reused answers 404, the one status the client rebuilds its base on (a 400 left
+    # its reset stuck on http_400) - /slots/0?action=restore has answered a missing file that way all along
+    def test_t12_a_restore_of_a_missing_session_file_is_404(self):
+        body = {"messages": [{"role": "user", "content": "hi"}],
+                "strata_session": {"restore": "t12none.sess", "save": "t12none.sess"}}
+        s, b = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 404, b)
+        self.assertEqual(b["error"]["type"], "invalid_request_error")
+        self.assertIn("no saved session named t12none.sess", b["error"]["message"])
+        self.assertEqual(self.engine.commands, [])                   # refused before the engine was asked
+
+    def test_t12_a_session_saved_with_another_engine_configuration_is_404(self):
+        self.sess("t12cfg.sess")                                     # there: the engine's answer is what decides
+        self.engine.restore_error = ("invalid", "session file: saved with another engine configuration "
+                                                "(config fingerprint differs)")
+        body = {"messages": [{"role": "user", "content": "hi"}],
+                "strata_session": {"restore": "t12cfg.sess", "save": "t12cfg.sess"}}
+        s, b = self.post("/v1/chat/completions", body)
+        self.assertEqual(s, 404, b)
+        self.assertEqual(b["error"]["type"], "invalid_request_error")
+        self.assertIn("config fingerprint differs", b["error"]["message"])
+        self.assertEqual(self.engine.commands, ["RESTORE"])          # no GEN, so nothing is saved either
 
 
 if __name__ == "__main__":

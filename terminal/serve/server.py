@@ -179,6 +179,7 @@ from serve.server_parts.engines import (  # noqa: F401  (moved unchanged, file s
     QueueWaitExpired,
     SPLIT_MAX_LANES,
     ServerStopping,
+    SessionFileMissing,
     SessionRefused,
     SpliceConflict,
     TRANSIENT_START_MARKS,
@@ -5602,12 +5603,27 @@ class Service:
                     if session is not None and session.get("restore"):
                         # a composite strata_session request: the restore runs here, inside this request's fifo turn
                         # and before any generation, so restore -> generate -> save cannot interleave with another
-                        # request.  A refusal (SessionRefused) or a dead engine fails the whole request: nothing is
-                        # generated and nothing is saved.  Only the phase is set: busy stays off until the prompt is
-                        # read, so a failed restore records no history row.
+                        # request.  A missing session file, a session saved with another engine configuration
+                        # (SessionFileMissing), any other refusal (SessionRefused) or a dead engine fails the whole
+                        # request: nothing is generated and nothing is saved.  Only the phase is set: busy stays off
+                        # until the prompt is read, so a failed restore records no history row.
                         with self.status_lock:
                             st.update(phase="restoring a session", started=time.time(), first_token=None)
-                        restored = self.engine.session_file("restore", session["restore"])
+                        try:
+                            os.lstat(session["restore"])        # the engine opens it without following a link
+                        except OSError:
+                            raise SessionFileMissing(f"no saved session named {session['restore_name']}") from None
+                        try:
+                            restored = self.engine.session_file("restore", session["restore"])
+                        except SessionRefused as e:
+                            # a session that cannot be reused answers 404: the file is gone, or an engine upgrade
+                            # changed the config fingerprint and every session saved before it is stale.  The client
+                            # rebuilds its session only on a 404, so these two must not ride the generic 400.  Every
+                            # other refusal keeps the status its kind gives it.
+                            if e.kind == "invalid" and ("No such file" in str(e)
+                                                        or "another engine configuration" in str(e)):
+                                raise SessionFileMissing(str(e)) from e
+                            raise
                         session_out["restored"] = restored
                         if session.get("splice") and restored["tokens"] != session.get("splice_engine_tokens"):
                             raise SpliceConflict("splice_stale", f"{session['restore_name']}: the engine restored "
@@ -7400,6 +7416,9 @@ def make_handler(svc: Service):
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
+            except SessionFileMissing as e:                 # strata_session restore: rebuild the base, as /slots' 404
+                print(f"[strata] 404: {e}", flush=True)
+                self._json(404, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":

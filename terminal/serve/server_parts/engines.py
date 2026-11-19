@@ -83,6 +83,15 @@ class EngineNonFinite(ValueError):
     ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
 
 
+class SessionFileMissing(Exception):
+    """Disk sessions: a strata_session RESTORE cannot be served from the file it names - there is no such file, or
+    the engine says it was saved with another engine configuration (an upgrade changes the config fingerprint, so
+    every session saved before it is stale).  Neither is the request's fault and neither heals by sending the same
+    name again: the client rebuilds its session only on a 404, so both answer 404, as /slots/0?action=restore
+    already answers a missing file.  Not a ValueError: the handler's generic ValueError clause would turn it into
+    the 400 the client could not recover from."""
+
+
 class SessionRefused(ValueError):
     """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
     <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:

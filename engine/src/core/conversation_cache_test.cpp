@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 using namespace strata::core;
@@ -22,6 +23,98 @@ SavedConversation image(std::initializer_list<int32_t> ids, bool cvec = true) {
 }
 
 int main() {
+    {
+        int mib = conversation_cache_swap_default_block_mib;
+        check(mib == 64, "host exchange block defaults to 64 MiB");
+        for (const auto& [text, value] : std::vector<std::pair<std::string, int>>{
+                 {"1",1}, {"17",17}, {"63",63}, {"64",64}, {"255",255}, {"256",256}}) {
+            check(parse_conversation_cache_swap_block_mib(text, mib) && mib == value, "exchange block accepts any in-range decimal");
+        }
+        for (const auto& text : {"", "0", "257", "-1", "+1", "1x", "1.0", " 1", "1 ", "99999999999999999999999"})
+            check(!parse_conversation_cache_swap_block_mib(text, mib), "exchange block rejects invalid or partial numbers");
+    }
+    {
+        auto pattern_a = [](size_t i) { return uint8_t((i * 17 + 31) % 251); };
+        auto pattern_b = [](size_t i) { return uint8_t((i * 29 + 87) % 251); };
+        const size_t segment = ConversationBuffer::segment_bytes;
+        for (const auto& [a_size, b_size, block] : std::vector<std::array<size_t,3>>{
+                 {73,73,17}, {101,63,17}, {63,101,17}, {segment+53,segment+19,3*1024*1024+7},
+                 {segment+19,segment+53,segment+5}}) {
+            ConversationBuffer parked;
+            parked.resize_for_overwrite(b_size);
+            check(parked.visit(0,b_size,[&](uint8_t* p,size_t n,size_t at) {
+                for (size_t i=0;i<n;++i) p[i]=pattern_b(at+i);
+                return true;
+            }), "initialize parked exchange image");
+            uint8_t* original = nullptr;
+            parked.visit(0,1,[&](uint8_t* p,size_t,size_t) { original=p; return true; });
+            const size_t original_bytes = parked.bytes();
+            const size_t peak = parked.allocation_peak(std::max(a_size,b_size));
+            parked.resize_for_overwrite(std::max(a_size,b_size));
+            check(parked.bytes() <= peak, "exchange growth stays within admitted capacity");
+            if (a_size <= b_size) check(parked.bytes() == original_bytes, "exchange allocates no new K/V capacity when B is long enough");
+            std::vector<uint8_t> active(std::max(a_size,b_size), 0);
+            for (size_t i=0;i<a_size;++i) active[i]=pattern_a(i);
+            std::vector<uint8_t> scratch(block);
+            bool written = false;
+            check(!conversation_buffer_exchange(parked,active.data(),a_size,b_size,nullptr,block,written) && !written,
+                  "missing scratch fails before a write");
+            check(conversation_buffer_exchange(parked,active.data(),a_size,b_size,scratch.data(),block,written) && written,
+                  "exchange succeeds with one scratch block");
+            parked.visit(0,1,[&](uint8_t* p,size_t,size_t) { check(p==original,"exchange reuses B's first allocation"); return true; });
+            for (size_t i=0;i<b_size;++i) if (active[i]!=pattern_b(i)) check(false,"active bytes equal B");
+            check(parked.visit(0,a_size,[&](const uint8_t* p,size_t n,size_t at) {
+                for (size_t i=0;i<n;++i) if (p[i]!=pattern_a(at+i)) return false;
+                return true;
+            }), "parked bytes equal A across block and segment boundaries");
+            written = false;
+            check(conversation_buffer_exchange(parked,active.data(),b_size,a_size,scratch.data(),block,written) && written,
+                  "reverse exchange succeeds");
+            for (size_t i=0;i<a_size;++i) if (active[i]!=pattern_a(i)) check(false,"active bytes return to A");
+            check(parked.visit(0,b_size,[&](const uint8_t* p,size_t n,size_t at) {
+                for (size_t i=0;i<n;++i) if (p[i]!=pattern_b(at+i)) return false;
+                return true;
+            }), "parked bytes return to B");
+        }
+    }
+    {
+        // The second chunk crosses a deliberately small internal segment, and
+        // later chunks start far beyond the five-byte scratch allocation.
+        constexpr size_t first = 7, total = 83, block = 5;
+        ConversationBuffer parked;
+        parked.resize_for_overwrite(first);
+        parked.resize_for_overwrite(total);
+        std::vector<uint8_t> active(total), expected_a(total), expected_b(total), scratch(block);
+        for (size_t i = 0; i < total; ++i) {
+            expected_a[i] = uint8_t((i * 17 + 31) % 251);
+            expected_b[i] = uint8_t((i * 29 + 87) % 251);
+        }
+        active = expected_a;
+        size_t spans = 0;
+        check(parked.visit(0, total, [&](uint8_t* p, size_t n, size_t at) {
+            ++spans;
+            std::memcpy(p, expected_b.data() + at, n);
+            return true;
+        }) && spans == 2, "small exchange crosses an internal segment");
+        bool written = false;
+        check(conversation_buffer_exchange(parked, active.data(), total, total, scratch.data(), block, written) && written,
+              "small scratch exchanges at least three chunks across a segment");
+        std::vector<uint8_t> actual(total);
+        check(active == expected_b && parked.read(actual.data(), 0, total) && actual == expected_a,
+              "small scratch keeps the offsets and contents of both images");
+        std::array<uint8_t, 3> boundary{};
+        check(parked.read(boundary.data(), first - 1, boundary.size()) &&
+              std::equal(boundary.begin(), boundary.end(), expected_a.begin() + first - 1),
+              "short read spans the internal segment boundary");
+        std::array<uint8_t, 3> tail{};
+        check(parked.read(tail.data(), total - tail.size(), tail.size()) &&
+              std::equal(tail.begin(), tail.end(), expected_a.end() - tail.size()),
+              "short read at a late segment offset uses a bounded destination");
+        written = false;
+        check(conversation_buffer_exchange(parked, active.data(), total, total, scratch.data(), block, written) && written &&
+              active == expected_a && parked.read(actual.data(), 0, total) && actual == expected_b,
+              "small scratch exchange round trip restores both images");
+    }
     {
         ConversationBuffer bytes;
         const size_t first = ConversationBuffer::segment_bytes + 17;

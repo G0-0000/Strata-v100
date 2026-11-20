@@ -261,6 +261,16 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+inline constexpr int conversation_cache_swap_default_block_mib = 64;
+inline bool parse_conversation_cache_swap_block_mib(std::string_view text, int& mib) {
+    if (text.empty()) return false;
+    int64_t value = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || value < 1 || value > 256) return false;
+    mib = (int) value;
+    return true;
+}
+
 /// `--conversation-cache-min-tokens WRITE[,READ]`: the two automatic thresholds.  WRITE is the shortest outgoing
 /// conversation worth one of the cache's slots (ConversationCache::wants); READ is the shortest complete prompt worth
 /// searching the parked conversations for (conversation_cache_should_read_parked).  A single value is WRITE,0 - the
@@ -646,8 +656,10 @@ public:
         if (max_tokens_ > 0) return put_capped(std::move(image), n, held);
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
-        entries_.push_back(std::move(image));
-        serials_.push_back(next_serial_++);
+        serials_.push_back(next_serial_);
+        try { entries_.push_back(std::move(image)); }
+        catch (...) { serials_.pop_back(); throw; }
+        ++next_serial_;
         bytes_ += n;
         return true;
     }

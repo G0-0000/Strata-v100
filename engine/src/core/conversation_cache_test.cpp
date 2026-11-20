@@ -1211,5 +1211,52 @@ int main() {
             check(refused > 0 && evicted_any > 0 && pool.shrinks > 0, "the workload refused, evicted and trimmed the pool at least once");
         }
     }
+    // A RESTORE names one conversation, not a prefix of one: the exact lookup that finds the conversation an on-disk
+    // restore asks for already held in RAM (ConversationCache::exact).
+    {
+        ConversationCache cache(1 << 22, 4);
+        auto parked_image = [](std::initializer_list<int32_t> ids, std::initializer_list<ConversationImageKey> imgs,
+                               bool cvec) {
+            SavedConversation s;
+            s.live.ids = ids;
+            s.live.imgs = imgs;
+            s.live.gdn.resize(4096, 1);
+            s.cvec = cvec;
+            return s;
+        };
+        const std::vector<int32_t> ids = {11, 12, 13, 14};
+        const std::vector<ConversationImageKey> imgs = {{2, 0xfeedfaceull}};
+        check(cache.put(parked_image({11, 12, 13, 14}, {{2, 0xfeedfaceull}}, true)), "exact: the conversation is parked");
+        const auto hit = cache.exact(ids, imgs, true);
+        check(hit.tokens == 4 && hit.live && hit.index == 0 && hit.serial != 0, "exact: the same conversation is found");
+        check(cache.find(hit.serial) != nullptr, "exact: its serial still names it");
+        // an equal length, never a prefix: a longer and a shorter ask both miss, where best() finds the prefix
+        check(cache.exact(std::vector<int32_t>{11, 12, 13, 14, 15}, imgs, true).tokens == 0,
+              "exact: a longer conversation does not match (the parked one is its prefix)");
+        check(cache.best(std::vector<int32_t>{11, 12, 13, 14, 15}, imgs, true).tokens == 4,
+              "exact: that is what best() answers instead (the parked prefix)");
+        check(cache.exact(std::vector<int32_t>{11, 12, 13}, imgs, true).tokens == 0,
+              "exact: a shorter conversation does not match (it is the parked one's prefix)");
+        // the pictures and the steering mode count; an empty ask matches nothing
+        check(cache.exact(ids, std::vector<ConversationImageKey>{{2, 0xbeef}}, true).tokens == 0, "exact: another picture");
+        check(cache.exact(ids, std::vector<ConversationImageKey>{}, true).tokens == 0, "exact: a picture missing");
+        check(cache.exact(ids, imgs, false).tokens == 0, "exact: another steering mode");
+        check(cache.exact(std::vector<int32_t>{}, {}, true).tokens == 0, "exact: an empty conversation matches nothing");
+        // read-only: nothing taken, nothing evicted
+        check(cache.size() == 1 && cache.evictions() == 0 && cache.exact(ids, imgs, true).serial == hit.serial,
+              "exact: nothing is taken and no entry evicted by looking");
+        // of two equal entries the most recently parked answers
+        check(cache.put(parked_image({11, 12, 13, 14}, {{2, 0xfeedfaceull}}, true)), "exact: a second copy is parked");
+        const auto newer = cache.exact(ids, imgs, true);
+        check(newer.tokens == 4 && newer.index == 1 && newer.serial != hit.serial,
+              "exact: the most recently parked of two equal copies answers");
+        check(cache.size() == 2, "exact: both copies stay parked");
+        // a layer split's conversation is spread over its stage images: never one image to restore
+        auto split = parked_image({21, 22}, {}, true);
+        split.stage_images.emplace_back();
+        check(cache.put(std::move(split)), "exact: a split conversation is parked");
+        check(cache.exact(std::vector<int32_t>{21, 22}, {}, true).tokens == 0,
+              "exact: a split conversation is not one image");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

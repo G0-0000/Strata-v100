@@ -17695,6 +17695,15 @@ int main(int argc, char** argv) {
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
+                    // A RESTORE names one conversation, and the engine may already hold exactly it in RAM: the live
+                    // session itself, or a conversation parked in the cache.  The file's header and the live state's
+                    // identity answer that (at most one 16 MiB read block of a 631 MiB file); only when neither holds
+                    // it is the payload read.  Anything wrong with them falls through to the full read below, which
+                    // reports it exactly as it does today.
+                    strata::core::ConversationCache::Match ram_copy;   // the parked entry that holds it (tokens 0: none)
+                    size_t take_at = SIZE_MAX;                         // ... its index, once its own copy has validated
+                    int64_t restore_tokens = 0;                        // the conversation's length, for the K/V growth
+                    bool from_ram = false;                             // `image` came from the cache, not from the file
                     try {
                         // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every
                         // state and K/V part), checked as the file is parsed and before each array is allocated; the
@@ -17718,26 +17727,81 @@ int main(int argc, char** argv) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
-                        strata::core::SessionStatus st;
-                        if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
-                            refuse(err, st.error);
-                            continue;
+                        // #879 is the decision helper's rule: after non-finite logits nothing in RAM is trusted, and
+                        // the file - the known-good copy - answers as it always has
+                        strata::core::SessionFileLiveIdentity live_in_file;   // what the file holds, as its front says
+                        if (strata::core::session_file_read_live_identity(path, id, live_in_file, limits)) {
+                            bytes = live_in_file.bytes;
+                            restore_tokens = (int64_t) live_in_file.ids.size();
+                            ram_copy = conversations.exact(live_in_file.ids, live_in_file.imgs, live_in_file.cvec);
+                            const auto source = strata::core::session_restore_source(
+                                live_ok,
+                                live == live_in_file.ids && live_imgs == live_in_file.imgs &&
+                                    cvec_cached == live_in_file.cvec,
+                                ram_copy.tokens > 0, nan_flush);
+                            if (source == strata::core::SessionRestoreSource::live) {
+                                // nothing to move: the live session already is this conversation
+                                std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints from %s "
+                                             "in %.1f ms (the live session already is this conversation: nothing read, "
+                                             "nothing moved)\n", live.size(), checks.size(), path.c_str(), ms());
+                                std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
+                                std::fflush(stdout);
+                                continue;
+                            }
+                            if (source == strata::core::SessionRestoreSource::parked) {
+                                // validated while it stays parked, so a refusal costs the RAM answer, never the file
+                                const strata::core::SavedConversation* parked_image = conversations.find(ram_copy.serial);
+                                if (parked_image != nullptr &&
+                                    strata::core::conversation_snapshot_validate(*parked_image, ss, g, session_draft, err))
+                                    take_at = conversations.index_of(ram_copy.serial);
+                                else if (parked_image != nullptr) {
+                                    std::fprintf(stderr, "strata serve: conversation cache: the parked copy of %s does "
+                                                         "not validate (%s); reading the file\n", path.c_str(), err.c_str());
+                                    err.clear();
+                                }
+                            }
+                        }
+                        if (take_at == SIZE_MAX) {
+                            strata::core::SessionStatus st;
+                            if (!strata::core::session_file_read(path, id, image, bytes, err, limits, &st)) {
+                                refuse(err, st.error);
+                                continue;
+                            }
+                            restore_tokens = (int64_t) image.live.ids.size();
                         }
                     } catch (const std::bad_alloc&) {
                         refuse("not enough RAM to read the session", strata::core::SessionError::memory);
                         continue;
                     }
                     const double read_ms = ms();
-                    // the whole image against this engine, still without any device write
-                    blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, session_draft, err)) {
-                        refuse(err);
-                        continue;
+                    if (take_at == SIZE_MAX) {
+                        // the whole image against this engine, still without any device write
+                        blocking("validate", bytes);
+                        if (!strata::core::conversation_snapshot_validate(image, ss, g, session_draft, err)) {
+                            refuse(err);
+                            continue;
+                        }
                     }
-                    // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
-                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
+                    // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the
+                    // conversation's cells (a refusal here leaves a parked copy where it is)
+                    if (!kvg_ensure(restore_tokens + 256, adapt_quiesce)) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
+                    }
+                    if (take_at != SIZE_MAX) {
+                        image = conversations.take(take_at);   // validated above, and nothing changed the cache since
+                        from_ram = true;
+                    }
+                    // the outgoing live conversation is parked first, as a request that replaced it would park it, so
+                    // it stays reusable: best effort (a refused park never fails a valid restore).  A conversation the
+                    // cache already holds exactly needs no second copy: parking it again would copy the whole K/V and
+                    // could evict another entry.  #879 keeps its flush: with the RAM copies about to go, nothing is
+                    // parked
+                    if (!nan_flush && conversations.exact(live, live_imgs, cvec_cached).tokens == 0 &&
+                        !park_current(from_ram ? image.bytes() : 0)) {
+                        std::fprintf(stderr, "strata serve: session restore: the outgoing conversation was not parked "
+                                             "(%s)\n", err.empty() ? "refused" : err.c_str());
+                        err.clear();
                     }
                     conversations.take_reuse();   // retained K/V described the outgoing session
                     live_ok = false;
@@ -17754,6 +17818,10 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                         return 1;
                     }
+                    if (from_ram)
+                        std::fprintf(stderr, "strata serve: session restore %s: answered from the conversation cache held "
+                                             "in RAM (its header and tokens are the file's; the payload was not read)\n",
+                                     path.c_str());
                     live = std::move(image.live.ids);
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);

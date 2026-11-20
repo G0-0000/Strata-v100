@@ -289,6 +289,94 @@ int main() {
         check(!session_file_read((dir / "absent.bin").string(), id, keep, b, error), "missing read fails");
         check(same(keep, original), "failed read does not modify the destination");
     }
+    // The front of a file, for a RESTORE's lookup: the header's checks and the live state's identity, with no payload
+    // read at all (the running state, the deepest checkpoint and the K/V stay on the disk)
+    {
+        SessionFileLiveIdentity front;
+        check(session_file_read_live_identity(good.string(), id, front), "front: a good file reads");
+        check(front.ids == original.live.ids && front.imgs == original.live.imgs && front.cvec == original.cvec,
+              "front: the live state's tokens, images and steering flag");
+        check(front.bytes == image.size(), "front: the file's own size");
+        // the payload is not parsed: limits that refuse it leave the front readable, and no RAM is admitted
+        SessionReadLimits thin;
+        thin.max_kv_layers = 0;
+        thin.max_checkpoints = 0;
+        check(rejects(good, id, "limit", thin), "front: the full read refuses to parse that payload");
+        uint64_t asked = 0;
+        thin.admit = [&](uint64_t, std::string& why) { ++asked; why = "no"; return false; };
+        check(session_file_read_live_identity(good.string(), id, front, thin) && asked == 0,
+              "front: no payload parse and no RAM admission");
+        // the steering flag reads back either way
+        {
+            SavedConversation on = sample();
+            const fs::path p = dir / "front-cvec.bin";
+            on.cvec = true;
+            check(session_file_write(p.string(), on, id, written, error) &&
+                  session_file_read_live_identity(p.string(), id, front) && front.cvec,
+                  "front: a steering flag of 1 reads back");
+            on.cvec = false;
+            check(session_file_write(p.string(), on, id, written, error) &&
+                  session_file_read_live_identity(p.string(), id, front) && !front.cvec,
+                  "front: a steering flag of 0 reads back");
+        }
+        // every refusal that comes before the payload is a refusal here too
+        check(!session_file_read_live_identity(good.string(), {id.model ^ 1, id.config}, front), "front: another model");
+        check(!session_file_read_live_identity(good.string(), {id.model, id.config ^ 1}, front),
+              "front: another configuration");
+        check(!session_file_read_live_identity((dir / "absent.bin").string(), id, front), "front: a missing file");
+        {
+            auto d = image;
+            d[20] ^= 0x40;   // a header byte
+            const fs::path p = dir / "front-flip.bin";
+            spit(p, d);
+            check(!session_file_read_live_identity(p.string(), id, front), "front: a corrupted header");
+            d = image;
+            uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+            const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
+            const fs::path q = dir / "front-version.bin";
+            spit(q, d);
+            check(!session_file_read_live_identity(q.string(), id, front), "front: an unknown version");
+            for (size_t cut : {size_t(0), size_t(63), size_t(64), size_t(200), image.size() - 16}) {
+                const fs::path r = dir / "front-cut.bin";
+                spit(r, std::vector<char>(image.begin(), image.begin() + (std::ptrdiff_t) cut));
+                check(!session_file_read_live_identity(r.string(), id, front), "front: a truncated file");
+            }
+            // an element count that cannot fit the payload is refused before anything is allocated
+            auto c = image;
+            const size_t at = 64 + 21 * 8;   // geometry, layer carve and steering flag, then live.ids' count
+            uint64_t huge = 0x0fffffffffffffffull; std::memcpy(c.data() + at, &huge, 8);
+            const fs::path s = dir / "front-count.bin";
+            spit(s, c);
+            check(!session_file_read_live_identity(s.string(), id, front), "front: an oversized token count");
+        }
+        // the runtime's geometry, layer range and token bound apply, as they do to the full read
+        SessionReadLimits l;
+        l.geometry = original.geometry;
+        (*l.geometry)[3] ^= 1;
+        check(!session_file_read_live_identity(good.string(), id, front, l), "front: another geometry");
+        l.geometry = original.geometry;
+        l.layer_range = std::make_pair(int64_t(0), int64_t(24));
+        check(!session_file_read_live_identity(good.string(), id, front, l), "front: another layer range");
+        l.layer_range.reset();
+        l.max_tokens = 999;   // the live state holds 1000
+        check(!session_file_read_live_identity(good.string(), id, front, l), "front: more tokens than the runtime takes");
+        l.max_tokens = 1000;
+        check(session_file_read_live_identity(good.string(), id, front, l), "front: within the runtime's limits");
+    }
+    // Where a RESTORE takes the conversation from: the live session, a copy held in RAM, else the file - in that
+    // order - and #879 puts nothing in RAM first
+    {
+        check(session_restore_source(true, true, true, false) == SessionRestoreSource::live, "source: the live session wins");
+        check(session_restore_source(false, true, true, false) == SessionRestoreSource::parked,
+              "source: no live session, a copy in RAM");
+        check(session_restore_source(true, false, true, false) == SessionRestoreSource::parked,
+              "source: the live session is another conversation");
+        check(session_restore_source(true, false, false, false) == SessionRestoreSource::file,
+              "source: nothing holds it, so the file");
+        check(session_restore_source(true, true, true, true) == SessionRestoreSource::file, "source: #879 trusts the file");
+        check(session_restore_source(false, false, false, true) == SessionRestoreSource::file,
+              "source: #879 with nothing in RAM either");
+    }
     // layer-split images are not written; no file appears
     {
         SavedConversation split = sample();
@@ -786,6 +874,9 @@ int main() {
         const fs::path link = dir / "link.bin";
         fs::create_symlink(good, link);
         check(rejects(link, id, "symbolic link"), "a symbolic link is not followed");
+        SessionFileLiveIdentity front;
+        check(!session_file_read_live_identity(link.string(), id, front), "front: a symbolic link is not followed either");
+        check(!session_file_read_live_identity(dir.string(), id, front), "front: a directory is refused");
         const fs::path hard = dir / "hard.bin";
         fs::create_hard_link(good, hard);
         check(rejects(hard, id, "hard link"), "a hard-linked file is refused");

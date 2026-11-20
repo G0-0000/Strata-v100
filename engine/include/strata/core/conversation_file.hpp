@@ -235,6 +235,38 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
 
+// The part of a session file a RESTORE needs before it can tell where to restore from: the live state's identity (its
+// tokens, its images, its steering flag) and the file's own size.  The payload - the running-state arrays, the deepest
+// checkpoint and every K/V byte (631 MiB at 27.8k tokens) - is not read: at most one 16 MiB read block (the ids
+// themselves are a few hundred KB).
+struct SessionFileLiveIdentity {
+    std::vector<int32_t> ids;
+    std::vector<ConversationImageKey> imgs;
+    bool cvec = true;
+    size_t bytes = 0;   // the file's whole size (header, payload, trailer): what RESTORED answers with
+};
+
+// The header, identity and size checks session_file_read makes (a regular file with one name, no link; magic,
+// checksum, version, the fingerprints, the file size against the limits), then the live state's identity.  The
+// payload's hash is NOT verified and `limits.admit` is not asked (a front read is the size of the token list): this
+// only decides where a RESTORE reads from, and any RAM copy it matches is validated in full before it is restored.
+// False on any header, identity or format problem - the caller then reads the file the ordinary way, whose error it
+// reports - and `live` is unchanged.
+bool session_file_read_live_identity(const std::string& path, const SessionFileIdentity& id,
+                                     SessionFileLiveIdentity& live, const SessionReadLimits& limits = {});
+
+// Where a RESTORE takes the conversation from, in this order: the live session itself when it already holds exactly
+// what the file holds (nothing to move, no byte read); a RAM copy of that conversation (a parked one, whose own copy
+// must validate and which is taken only then); else the file.  `nan_flush` (#879): after non-finite logits nothing in
+// RAM is trusted and the file, the known-good copy, answers as it always has.
+enum class SessionRestoreSource { live, parked, file };
+inline SessionRestoreSource session_restore_source(bool live_ok, bool live_is_the_file, bool parked_holds_it,
+                                                   bool nan_flush) {
+    if (nan_flush) return SessionRestoreSource::file;
+    if (live_ok && live_is_the_file) return SessionRestoreSource::live;
+    return parked_holds_it ? SessionRestoreSource::parked : SessionRestoreSource::file;
+}
+
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).

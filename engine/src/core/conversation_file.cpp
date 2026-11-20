@@ -751,18 +751,27 @@ struct In {
     }
 };
 
-bool get_checkpoint(In& in, ConversationCheckpoint& c) {
+// A checkpoint's identity: its tokens and its images (what a parked conversation is matched by), which the payload's
+// other fields follow
+bool get_checkpoint_identity(In& in, ConversationCheckpoint& c) {
     if (!in.vec(c.ids, in.limits.max_tokens)) return false;
     uint64_t n = 0;
     if (!in.count(n, 16, in.limits.max_tokens)) return false;
     c.imgs.resize((size_t) n);
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
+    return true;
+}
+
+bool get_checkpoint(In& in, ConversationCheckpoint& c) {
+    if (!get_checkpoint_identity(in, c)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
     return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+// the payload's head: the geometry, the layer carve and the steering flag, each checked against the limits before any
+// state array is read
+bool get_payload_head(In& in, SavedConversation& s) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -774,7 +783,11 @@ bool get_payload(In& in, SavedConversation& s) {
         return in.fail("saved with another layer range than this runtime's");
     if (cvec > 1) return in.fail("invalid cvec flag");
     s.cvec = cvec == 1;
-    if (!get_checkpoint(in, s.live)) return false;
+    return true;
+}
+
+bool get_payload(In& in, SavedConversation& s) {
+    if (!get_payload_head(in, s) || !get_checkpoint(in, s.live)) return false;
     uint64_t n = 0;
     // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
@@ -1237,6 +1250,50 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     return true;
 }
 } // namespace
+
+namespace {
+// read_impl's checks up to the payload's head: a file that fails any of them is refused here exactly as it is there,
+// with no message (the caller's full read reports it)
+bool read_live_identity_impl(const std::string& path, const SessionFileIdentity& id, SessionFileLiveIdentity& live,
+                             const SessionReadLimits& limits) {
+    RawFile raw;
+    uint64_t size = 0;
+    if (!raw.open_session(path, size)) return false;
+    if (size < kHeader + kTrailer) return false;
+    const uint64_t max_size = session_read_max_file_bytes(limits);
+    if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) return false;
+    FileSource f(raw);
+    if (!f.ok()) return false;
+    uint8_t h[kHeader];
+    if (!f.read(h, kHeader)) return false;
+    uint32_t version = 0, hsize = 0;
+    uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+    std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+    std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+    std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+    if (std::memcmp(h, kMagic, 8) != 0 || hh != session_hash64(h, 56, 0) || version != kVersion ||
+        hsize != kHeader || r0 || r1 || model != id.model || config != id.config) return false;
+    if (payload > size || size - kHeader - kTrailer != payload) return false;
+    SavedConversation head;
+    std::string error;   // (nobody reports this read's text: the caller's full read says what is wrong)
+    In in{&f, SessionHasher(0), payload, error, limits};
+    if (!get_payload_head(in, head) || !get_checkpoint_identity(in, head.live)) return false;
+    live.ids = std::move(head.live.ids);
+    live.imgs = std::move(head.live.imgs);
+    live.cvec = head.cvec;
+    live.bytes = (size_t) size;
+    return true;
+}
+} // namespace
+
+bool session_file_read_live_identity(const std::string& path, const SessionFileIdentity& id,
+                                     SessionFileLiveIdentity& live, const SessionReadLimits& limits) {
+    try {
+        return read_live_identity_impl(path, id, live, limits);
+    } catch (const std::bad_alloc&) {
+        return false;   // (the full read makes the same allocation and reports its failure)
+    }
+}
 
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus* status) {

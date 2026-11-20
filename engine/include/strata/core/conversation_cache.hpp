@@ -402,6 +402,25 @@ public:
         return best;
     }
 
+    /// A RESTORE names one conversation, never a prefix of one: the parked entry that holds exactly these tokens with
+    /// exactly these images and this steering mode - an equal length (`best` is the prefix match, `holds` covers a
+    /// continuation).  Read-only: no LRU effect, nothing taken.  tokens 0 when none holds it, as `best` says it; of two
+    /// equal entries the most recently parked answers.
+    template<class Token>
+    Match exact(const std::vector<Token>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const {
+        Match found;
+        if (ids.empty()) return found;
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const auto& e = entries_[i];
+            // a layer split's conversation is spread over its stage images: it is never one image to restore
+            if (e.cvec != cvec || !e.stage_images.empty() || e.live.ids.size() != ids.size() || e.live.imgs != images ||
+                !std::equal(e.live.ids.begin(), e.live.ids.end(), ids.begin(), ids.end())) continue;
+            found = {i, (int64_t) ids.size(), true, serials_[i]};
+            break;
+        }
+        return found;
+    }
+
     /// With a cap, require the slot's exact live state and every checkpoint the slot would park; otherwise a
     /// continuation of the slot's state is enough. Read-only; no LRU effect.
     template<class Token>

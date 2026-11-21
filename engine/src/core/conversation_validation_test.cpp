@@ -217,6 +217,49 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation full,incremental;
     check(conversation_snapshot_save(full,view,ss,g,draft.st,error), "full capture through host transfer backend");
     const size_t full_copies = copied_bytes;
+    {
+        // A valid retained prefix makes the exchange ineligible. Even when
+        // its budget check would fail, the ordinary capture can still use it.
+        const size_t budget = full.bytes() * 3;
+        ConversationCache reuse_cache(budget, 2);
+        check(!reuse_cache.has_reusable_kv_for(view.ids), "no retained prefix leaves exchange eligible");
+        reuse_cache.retain(std::vector<ConversationKv>(full.kv), 9, {}, image.live.ids);
+        const size_t retained_bytes = reuse_cache.retained_bytes();
+        const std::vector<int32_t> unrelated{99, 100, 101};
+        auto partial = image.live.ids;
+        partial[4] = 99;
+        check(retained_bytes > 0 && reuse_cache.has_reusable_kv_for(view.ids) &&
+              reuse_cache.has_reusable_kv_for(partial) && !reuse_cache.has_reusable_kv_for(unrelated) &&
+              !reuse_cache.has_reusable_kv_for(std::vector<int32_t>{}),
+              "exchange gate uses the current live tokens, including partial and unrelated prefixes");
+        auto partial_reuse = reuse_cache.take_reuse_for(partial);
+        check(partial_reuse.unchanged_tokens == 4, "the exchange gate shares the ordinary path's prefix criterion");
+        reuse_cache.retain(std::move(partial_reuse.kv), 9, {}, image.live.ids);
+        const size_t denied_bytes = budget - reuse_cache.bytes() + 1;
+        bool attempted_swap = false;
+        if (!reuse_cache.has_reusable_kv_for(view.ids)) {
+            attempted_swap = true;
+            (void) reuse_cache.take_reuse();
+        }
+        check(!attempted_swap && !reuse_cache.can_fit(denied_bytes) &&
+              reuse_cache.retained_bytes() == retained_bytes,
+              "exchange refusal and budget failure leave the retained prefix intact");
+        auto retained = reuse_cache.take_reuse_for(view.ids);
+        check(retained.unchanged_tokens == 9 && !retained.kv.empty() && !reuse_cache.has_reusable_kv_for(view.ids),
+              "the ordinary path takes the same retained prefix");
+        SavedConversation reparked;
+        size_t reused_prefix = 0;
+        copied_bytes = 0;
+        check(conversation_snapshot_save(reparked,view,ss,g,draft.st,error,std::move(retained),&reused_prefix) &&
+              reused_prefix > 0 && copied_bytes + reused_prefix == full_copies,
+              "ordinary capture actually reuses the prefix after exchange refusal");
+        check(reparked.kv.size() == full.kv.size(), "ordinary capture keeps every K/V layer");
+        for (size_t i = 0; i < full.kv.size(); ++i)
+            check(reparked.kv[i].k == full.kv[i].k && reparked.kv[i].v == full.kv[i].v &&
+                  reparked.kv[i].k_scale == full.kv[i].k_scale && reparked.kv[i].v_scale == full.kv[i].v_scale &&
+                  reparked.kv[i].pooled == full.kv[i].pooled,
+                  "ordinary capture preserves every retained K/V payload");
+    }
     ConversationKvReuse reuse{full.kv,9,9};
     size_t peak = 0, reused = 0;
     check(conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.st,peak,error), "incremental capture admission without transfers");

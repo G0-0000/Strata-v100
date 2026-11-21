@@ -18831,7 +18831,8 @@ int main(int argc, char** argv) {
             // All other sources and park decisions continue through park_current.
             if (incoming && !from_ssd && taken.live && taken.tokens == (int64_t) incoming->live.ids.size() &&
                 !borrow && !rewind_skip && !reply_replaced && park_worth && live_ok && !live.empty() &&
-                conversations.wants((int64_t) live.size()) && stages.empty() && o.batch == 0 && !kvg.on) {
+                conversations.wants((int64_t) live.size()) && !conversations.has_reusable_kv_for(live) &&
+                stages.empty() && o.batch == 0 && !kvg.on) {
                 swap_t0 = Clock::now();
                 struct SwapStage {
                     SwapStage() { strata::core::progress_at("request: parking the previous conversation"); }
@@ -18844,8 +18845,8 @@ int main(int argc, char** argv) {
                     strata::core::ConversationSwapPlan plan;
                     if (strata::core::conversation_snapshot_swap_prepare(plan, *incoming, view, ss, g,
                             use_mtp ? &mtp.kv_state() : nullptr, block_bytes, err)) {
-                        // The old full-image reuse is no longer useful on this path.
-                        // It is not part of the incoming image or the new image.
+                        // A reusable prefix takes the ordinary park path instead.
+                        // Any retained image left here is unusable for this live session.
                         { auto old_reuse = conversations.take_reuse(); }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         auto admit = [&](uint64_t additional) {
@@ -18882,7 +18883,7 @@ int main(int argc, char** argv) {
                                 bool stored = false;
                                 try {
                                     if (conversations.can_fit(snapshot_bytes, incoming->bytes()))
-                                        stored = conversations.put(std::move(outgoing), incoming->bytes());
+                                        stored = conversations.put_exchanged(std::move(outgoing), incoming->bytes());
                                 } catch (const std::bad_alloc&) {
                                     std::fprintf(stderr, "strata serve: conversation cache: allocation failed while publishing exchanged image\n");
                                 }

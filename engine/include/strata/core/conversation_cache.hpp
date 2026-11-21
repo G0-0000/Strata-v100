@@ -17,6 +17,7 @@
 #include <new>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -377,9 +378,7 @@ public:
     template<class Token>
     ConversationKvReuse take_reuse_for(const std::vector<Token>& live) {
         ConversationKvReuse r = std::exchange(reuse_, {});
-        const int64_t n = std::min<int64_t>((int64_t) r.ids.size(), (int64_t) live.size());
-        int64_t same = 0;
-        while (same < n && (int64_t) r.ids[(size_t) same] == (int64_t) live[(size_t) same]) ++same;
+        const int64_t same = reuse_common_prefix(r, live);
         r.unchanged_tokens = std::min(r.unchanged_tokens, same);
         for (auto& st : r.stages) st.unchanged_tokens = std::min(st.unchanged_tokens, same);
         if (r.unchanged_tokens <= 0) return {};
@@ -387,6 +386,11 @@ public:
     }
     size_t retained_bytes() const { return reuse_.bytes(); }
     int64_t retained_tokens() const { return reuse_.kv.empty() ? 0 : reuse_.unchanged_tokens; }
+    // The ordinary park can reuse this live prefix; an exchange must not discard it.
+    template<class Token>
+    bool has_reusable_kv_for(const std::vector<Token>& live) const {
+        return !reuse_.kv.empty() && reuse_.unchanged_tokens > 0 && reuse_common_prefix(reuse_, live) > 0;
+    }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
                entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
@@ -664,7 +668,57 @@ public:
         return true;
     }
 
+    // An exchanged image must already fit without evicting anything. Reserve
+    // both queue slots and trim idle pools before changing any old image.
+    bool put_exchanged(SavedConversation&& image, size_t held = 0) {
+        const size_t n = image.bytes();
+        if (!can_fit(n, held)) return false;
+        static_assert(std::is_nothrow_move_assignable_v<SavedConversation>);
+        serials_.push_back(next_serial_);
+        try { entries_.emplace_back(); }
+        catch (...) { serials_.pop_back(); throw; }
+        try { trim_pool(held + n); }
+        catch (...) { entries_.pop_back(); serials_.pop_back(); throw; }
+
+        // All fallible work is done; keep the caller's image untouched until now.
+        entries_.back() = std::move(image);
+        ++next_serial_;
+        bytes_ += n;
+        if (max_tokens_ > 0) clear_cache_protection(entries_.back());
+        auto replaces = [&](size_t i, const SavedConversation& candidate) {
+            const auto& old = entries_[i];
+            if (is_guarded(i) || old.cvec != candidate.cvec) return false;
+            if (max_tokens_ <= 0)
+                return superseded_prefix_tokens(old, candidate.live.ids, candidate.live.imgs, candidate.checkpoints) != 0;
+            auto covers = [&](const SavedConversation& previous, const SavedConversation& next) {
+                return previous.cvec == next.cvec &&
+                       superseded_prefix_tokens(previous, next.live.ids, next.live.imgs, next.checkpoints,
+                                                next.live.pinned) != 0;
+            };
+            return covers(old, candidate) &&
+                   std::equal(old.stage_images.begin(), old.stage_images.end(),
+                              candidate.stage_images.begin(), candidate.stage_images.end(), covers);
+        };
+        // Exclude the new back entry itself from superseding cleanup.
+        for (size_t i = 0; i + 1 < entries_.size();) {
+            if (replaces(i, entries_.back())) {
+                bytes_ -= entries_[i].bytes();
+                erase(i);
+                ++superseded_;
+            } else ++i;
+        }
+        if (max_tokens_ > 0) claim_cache_protection(entries_.back(), entries_.back().cvec);
+        return true;
+    }
+
 private:
+    template<class Token>
+    static int64_t reuse_common_prefix(const ConversationKvReuse& reuse, const std::vector<Token>& live) {
+        const int64_t n = std::min<int64_t>((int64_t) reuse.ids.size(), (int64_t) live.size());
+        int64_t same = 0;
+        while (same < n && (int64_t) reuse.ids[(size_t) same] == (int64_t) live[(size_t) same]) ++same;
+        return same;
+    }
     static bool holds_checkpoint(const ConversationCheckpoint& c, const std::vector<int32_t>& ids,
                                  const std::vector<ConversationImageKey>& images,
                                  const std::vector<ConversationCheckpoint>& checkpoints) {

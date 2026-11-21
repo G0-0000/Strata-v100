@@ -281,7 +281,7 @@ void full_swap(int fmt, size_t a_tokens, size_t b_tokens) {
     SavedConversation other;
     other.live.ids={9999}; other.live.gdn.resize(64,1); other.cvec=false;
     check(cache.put(std::move(other)) && cache.can_fit(outgoing.bytes(),incoming.bytes()) &&
-          cache.put(std::move(outgoing),incoming.bytes()),"publish A without evicting the unrelated entry");
+          cache.put_exchanged(std::move(outgoing),incoming.bytes()),"publish A without evicting the unrelated entry");
     check(cache.evictions()==0 && cache.size()==2 && cache.retained_bytes()==0,
           "successful publication has no retained B K/V");
     outgoing=cache.take(1);

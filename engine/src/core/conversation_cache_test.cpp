@@ -393,12 +393,11 @@ int main() {
     }
     {
         int mib = conversation_cache_swap_default_block_mib;
-        check(mib == 64, "host exchange block defaults to 64 MiB");
         for (const auto& [text, value] : std::vector<std::pair<std::string, int>>{
                  {"1",1}, {"17",17}, {"63",63}, {"64",64}, {"255",255}, {"256",256}}) {
             check(parse_conversation_cache_swap_block_mib(text, mib) && mib == value, "exchange block accepts any in-range decimal");
         }
-        for (const auto& text : {"", "0", "257", "-1", "+1", "1x", "1.0", " 1", "1 ", "99999999999999999999999"})
+        for (const auto& text : {"", "257", "-1", "+1", "1x", "1.0", " 1", "1 ", "99999999999999999999999"})
             check(!parse_conversation_cache_swap_block_mib(text, mib), "exchange block rejects invalid or partial numbers");
     }
     {

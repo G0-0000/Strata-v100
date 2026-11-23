@@ -196,6 +196,21 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
     return true;
 }
 
+/// #2518: the checkpoints a slot carries for `live` - every one whose tokens are a strict prefix of it, in the
+/// order given.  The retained checkpoints are a chain (each a prefix of the next), and a request that branches
+/// inside the conversation resumes from the point it shares, which is usually NOT the longest checkpoint: the
+/// deepest one diverges before it.  Keeping only the longest left the slot with nothing such a request could
+/// start from.  An image prompt is not matched again by tokens alone, so it carries none.
+inline std::vector<ConversationCheckpoint> conversation_checkpoints_prefixing(
+        const std::vector<ConversationCheckpoint>& checks, const std::vector<int32_t>& live, bool image) {
+    std::vector<ConversationCheckpoint> out;
+    if (image) return out;
+    for (const ConversationCheckpoint& c : checks)
+        if (c.ids.size() < live.size() && std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+            out.push_back(c);
+    return out;
+}
+
 struct SavedConversation {
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
@@ -262,12 +277,13 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
-inline constexpr int conversation_cache_swap_default_block_mib = 64;
+inline constexpr int conversation_cache_swap_default_block_mib = 0;
 inline bool parse_conversation_cache_swap_block_mib(std::string_view text, int& mib) {
     if (text.empty()) return false;
+    for (const char c : text) if (c < '0' || c > '9') return false;
     int64_t value = 0;
     const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || value < 1 || value > 256) return false;
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || value < 0 || value > 256) return false;
     mib = (int) value;
     return true;
 }
@@ -312,6 +328,11 @@ inline bool parse_conversation_cache_min_tokens(std::string_view text, Conversat
 // READ gates only automatic parked-candidate lookup and uses the complete prompt length.
 inline bool conversation_cache_should_read_parked(int64_t prompt_tokens, int64_t read_min_tokens) {
     return read_min_tokens <= 0 || prompt_tokens >= read_min_tokens;
+}
+
+// The parser bounds this value; zero leaves the original switch/retain path alone.
+inline constexpr size_t conversation_cache_swap_block_bytes(int mib) {
+    return (size_t) mib << 20;
 }
 
 class ConversationCache {
@@ -390,6 +411,12 @@ public:
     template<class Token>
     bool has_reusable_kv_for(const std::vector<Token>& live) const {
         return !reuse_.kv.empty() && reuse_.unchanged_tokens > 0 && reuse_common_prefix(reuse_, live) > 0;
+    }
+    // take_reuse_for can use a positive prefix exactly when the first tokens match.
+    template<class Token>
+    bool has_reuse_for(const std::vector<Token>& live) const {
+        return retained_tokens() > 0 && !reuse_.ids.empty() && !live.empty() &&
+               (int64_t) reuse_.ids.front() == (int64_t) live.front();
     }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
@@ -668,23 +695,29 @@ public:
         return true;
     }
 
-    // An exchanged image must already fit without evicting anything. Reserve
-    // both queue slots and trim idle pools before changing any old image.
+    // Exchange publication must finish every fallible step before removing old entries.
     bool put_exchanged(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
         if (!can_fit(n, held)) return false;
-        static_assert(std::is_nothrow_move_assignable_v<SavedConversation>);
+        static_assert(std::is_nothrow_move_constructible_v<SavedConversation> &&
+                      std::is_nothrow_move_assignable_v<SavedConversation>);
         serials_.push_back(next_serial_);
-        try { entries_.emplace_back(); }
+        try { entries_.push_back(std::move(image)); }
         catch (...) { serials_.pop_back(); throw; }
+        // Keep the payload outside the deque: erasing an old entry can move its
+        // remaining elements. An entry without checkpoints cannot supersede itself.
+        SavedConversation staged = std::move(entries_.back());
+        entries_.back().checkpoints.clear();
         try { trim_pool(held + n); }
-        catch (...) { entries_.pop_back(); serials_.pop_back(); throw; }
-
-        // All fallible work is done; keep the caller's image untouched until now.
-        entries_.back() = std::move(image);
+        catch (...) {
+            entries_.pop_back(); serials_.pop_back();
+            image = std::move(staged);
+            throw;
+        }
         ++next_serial_;
         bytes_ += n;
-        if (max_tokens_ > 0) clear_cache_protection(entries_.back());
+        // The cap's representative mark is claimed again below, on the entry as it is published.
+        if (max_tokens_ > 0) clear_cache_protection(staged);
         auto replaces = [&](size_t i, const SavedConversation& candidate) {
             const auto& old = entries_[i];
             if (is_guarded(i) || old.cvec != candidate.cvec) return false;
@@ -699,15 +732,16 @@ public:
                    std::equal(old.stage_images.begin(), old.stage_images.end(),
                               candidate.stage_images.begin(), candidate.stage_images.end(), covers);
         };
-        // Exclude the new back entry itself from superseding cleanup.
+        // The back entry is a payload-free stub here, so no entry can supersede itself.
         for (size_t i = 0; i + 1 < entries_.size();) {
-            if (replaces(i, entries_.back())) {
+            if (replaces(i, staged)) {
                 bytes_ -= entries_[i].bytes();
                 erase(i);
                 ++superseded_;
             } else ++i;
         }
-        if (max_tokens_ > 0) claim_cache_protection(entries_.back(), entries_.back().cvec);
+        if (max_tokens_ > 0) claim_cache_protection(staged, staged.cvec);
+        entries_.back() = std::move(staged);
         return true;
     }
 

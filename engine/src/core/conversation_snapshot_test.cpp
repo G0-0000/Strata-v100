@@ -8,12 +8,29 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <string>
 #include <cstdlib>
 #include <limits>
+#include <new>
 #include <utility>
 #include <vector>
+
+// The cumulative bytes requested on the exchange thread upper-bound its
+// transient live allocations, even when a temporary buffer is freed in-call.
+static thread_local bool count_exchange_allocations = false;
+static thread_local size_t exchange_allocated_bytes = 0;
+void* operator new(std::size_t n) {
+    if (count_exchange_allocations) exchange_allocated_bytes += n;
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t n) { return ::operator new(n); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { ::operator delete(p); }
+void operator delete[](void* p, std::size_t) noexcept { ::operator delete(p); }
 
 using namespace strata::core;
 using namespace strata::kernels;
@@ -223,6 +240,25 @@ void full_swap(int fmt, size_t a_tokens, size_t b_tokens) {
     const ConversationView view_b{ids_b,imgs_b,expected_b.checkpoints,false};
     constexpr size_t block=37;
     ConversationSwapPlan plan;
+    if (fmt==kKvF16 && a_tokens==65 && b_tokens==65) {
+        // The default uses the original capture/restore/retain path, with no exchange.
+        const size_t disabled=conversation_cache_swap_block_bytes(conversation_cache_swap_default_block_mib);
+        check(disabled==0 && !conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,disabled,err),
+              "default zero does not prepare an exchange");
+        SavedConversation old_out, old_readback;
+        check(snap_save(old_out,view_a,ss,g,draft.state,err) && same(old_out,kept_a),
+              "default path captures the outgoing session and the checkpoints within the limit");
+        ConversationCache old_cache(old_out.bytes()+incoming.bytes()+4096,2);
+        check(old_cache.put(std::move(old_out)) &&
+              conversation_snapshot_restore(incoming,ss,g,draft.state,err)==ConversationRestore::restored,
+              "default path parks A and restores B");
+        old_cache.retain(std::move(incoming.kv),int64_t(ids_b.size()),{},ids_b);
+        check(old_cache.retained_bytes()>0 && snap_save(old_readback,view_b,ss,g,draft.state,err) &&
+              same(old_readback,expected_b), "default path retains B's K/V after restoring it");
+        check(conversation_snapshot_restore(expected_a,ss,g,draft.state,err)==ConversationRestore::restored,
+              "return to A before testing the opt-in path");
+        incoming=expected_b;
+    }
     auto* alias_base=main.state.host_device_base;
     main.state.host_device_base=alias_base+1;
     check(!conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,block,err),
@@ -256,9 +292,21 @@ void full_swap(int fmt, size_t a_tokens, size_t b_tokens) {
     const auto* main_table=main.state.page_table;
     const auto* draft_table=draft.state.page_table;
     check(conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,block,err),"prepare after refusal");
-    auto accept=[](size_t,size_t) { return true; };
-    check(conversation_snapshot_swap(plan,incoming,outgoing,view_a,ss,g,block,accept,err)==ConversationSwap::swapped,
-          "exchange A and B");
+    const std::function<bool(size_t,size_t)> accept=[](size_t,size_t) { return true; };
+    const bool measure_allocations = fmt==kKvF16 && a_tokens==65 && b_tokens==65;
+    exchange_allocated_bytes = 0;
+    count_exchange_allocations = measure_allocations;
+    const auto swap_result = conversation_snapshot_swap(plan,incoming,outgoing,view_a,ss,g,block,accept,err);
+    count_exchange_allocations = false;
+    check(swap_result==ConversationSwap::swapped,"exchange A and B");
+    if (measure_allocations) {
+        size_t full_kv = 0;
+        for (const auto& kv : expected_a.kv)
+            full_kv += kv.k.size() + kv.v.size() + kv.k_scale.size() + kv.v_scale.size();
+        check(full_kv > 0 && exchange_allocated_bytes > 0 && exchange_allocated_bytes <= plan.additional_bytes &&
+              plan.additional_bytes - exchange_allocated_bytes < full_kv,
+              "transient allocation upper bound leaves no room for a third full K/V image");
+    }
     check(main.state.host_cpu_base==active_main && draft.state.host_cpu_base==active_draft &&
           main.state.host_device_base==main_alias && draft.state.host_device_base==draft_alias &&
           main.state.page_table==main_table && draft.state.page_table==draft_table,
@@ -289,6 +337,20 @@ void full_swap(int fmt, size_t a_tokens, size_t b_tokens) {
           "restore exchanged A");
     check(snap_save(readback,view_a,ss,g,draft.state,err) && same(readback,kept_a),"A/B/A round trip exact");
 
+    if (fmt==kKvF16 && a_tokens==65 && b_tokens==65) {
+        int mib=conversation_cache_swap_default_block_mib;
+        check(parse_conversation_cache_swap_block_mib("1",mib),"parse a positive opt-in block");
+        const size_t enabled=conversation_cache_swap_block_bytes(mib);
+        incoming=expected_b;
+        check(enabled==(size_t(1)<<20) &&
+              conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,enabled,err) &&
+              conversation_snapshot_swap(plan,incoming,outgoing,view_a,ss,g,enabled,accept,err)==ConversationSwap::swapped &&
+              same(outgoing,kept_a), "positive option enables the whole-session exchange");
+        check(snap_save(readback,view_b,ss,g,draft.state,err) && same(readback,expected_b),
+              "positive option restores B through exchange");
+        check(conversation_snapshot_restore(outgoing,ss,g,draft.state,err)==ConversationRestore::restored,
+              "return to A before the post-write fault test");
+    }
     incoming=expected_b;
     check(conversation_snapshot_swap_prepare(plan,incoming,view_a,ss,g,&draft.state,block,err),"prepare post-write fault");
     auto fail_restore=[&](size_t,size_t) { incoming.live.dead.pop_back(); return true; };

@@ -444,6 +444,10 @@ void swap_transfer_failure() {
     constexpr size_t scratch=7;
     copy_calls=sync_calls=fail_copy=fail_sync=0;
     check(st.host_cpu_base!=st.host_device_base,"mock CPU mapping and device alias differ");
+    const size_t disabled=conversation_cache_swap_block_bytes(conversation_cache_swap_default_block_mib);
+    check(disabled==0 && !conversation_snapshot_swap_prepare(plan,incoming,active,ss,g,nullptr,disabled,error) &&
+          copy_calls==0 && sync_calls==0 && incoming.kv[0].k==original.kv[0].k && mapped[0]==0x55,
+          "default zero leaves both sessions untouched for the old path");
     {
         // K needs a new segment as well as spare capacity; V grows entirely
         // within spare capacity that may never have been resident.

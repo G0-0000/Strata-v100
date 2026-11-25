@@ -403,6 +403,8 @@ struct GpuPlanSink {
     int32_t* start2 = nullptr;
     /// STRATA_ADAPT_FETCH (pcie_mode 2): per PCIe group, the VRAM cache slot its blob is copied into instead of
     /// staging (0: staging).  staging_cap entries.
+    /// E1: a non-zero entry may carry the in-place-exchange bit (exclusive_cache.hpp): the copy kernel then also writes
+    /// the evicted expert back into the source blob's RAM place.  Its readers take the address with exclusive::fetch_slot.
     unsigned long long* dst2 = nullptr;
     unsigned long long staging = 0;
     int64_t staging_cap = 0;
@@ -415,6 +417,17 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    int groups = 1;                ///< E1: token groups in this verify window (1 or 2)
+    /// E1: a window whose pool may swap in place is in flight - set by the verifier's settle guard inside run(),
+    /// cleared when that window settles.  False: no window of this verifier can publish an exchange, so none is made.
+    bool exchange_live = false;
+    /// E1 (exclusive_cache.hpp): the window's own synchronization point settles the in-place exchanges its pool
+    /// published, called once on the thread that planned them - 1 = the window ran and its stream synced (the copy
+    /// kernel ran), 0 = provably not executed, 2 = unknown (the engine stops rather than read an expert from a place
+    /// it is not in).  Null: the exchange is off and nothing new runs.
+    // deviation: one settle point in the verifier instead of a classification in each driver loop.
+    void (*exchange_settle)(void* ctx, int outcome) = nullptr;
+    void* exchange_ctx = nullptr;
     int32_t cpu_jobs = 0;   ///< host only: the distinct experts the pool computes for the layer just published
     float* hit_out_dev = nullptr;   ///< device address of this group's hit_out buffer on the primary GPU (P2P peer scatter)
     bool device_hits_only = false;   ///< STRATA_VERIFY_DEVICE_HITS=1: GPU built its own hit plan; host only marks kind[]
@@ -667,6 +680,13 @@ struct ExpertDispatch {
     bool evict_sync = false;
     bool res_dirty = false;
     std::vector<int32_t> res_dirty_idx;
+    /// E1: the in-place exchanges this window published (the evicted expert, the admitted one that takes its RAM
+    /// place).  Settled and emptied at the window's synchronization point (`GpuPlanSink::exchange_settle`), so it
+    /// holds one window's worth at most.
+    struct FetchEvict { int32_t layer, evicted, admitted; };
+    std::vector<FetchEvict> fetch_evicted;
+    class FileExpertSource* exclusive = nullptr;   ///< E1: the source whose RAM place an admitted expert swaps into
+    int64_t fetch_swaps = 0;                       ///< E1: admissions that swapped in place (the decode summary)
     /// STRATA_ADAPT_CHECKRES: the device's residency table as read back before the window; a layer with CPU experts
     /// whose routed ids all look resident there publishes no activation (doorbell_publish_res) - counted
     const int32_t* dres_check = nullptr;
@@ -830,6 +850,13 @@ public:
     // differ in block size keeps spares per size).
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
+    /// E1: `in` holds a RAM place and `out` does not, so the fetch kernel may swap their bytes in place.
+    bool can_exchange_resident(int64_t layer, int64_t in, int64_t out) const;
+    /// E1: give `out` the RAM place `in` held - the GPU wrote `out`'s bytes there.  Called once that copy has run.
+    bool exchange_resident(int64_t layer, int64_t in, int64_t out);
+    /// E1: settle the exchanges the window published in `d`: commit them (1), put the residency back (0), or stop
+    /// the engine (2).  Called at the window's synchronization point, on the thread that planned it.
+    void settle_fetch_exchanges(ExpertDispatch& d, int outcome);
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     /// `bounce`: how many of the last buffers are only staged through and never hold an exchange (STRATA_EXCHANGE_ROTATE
     /// keeps those in the largest block size alone).

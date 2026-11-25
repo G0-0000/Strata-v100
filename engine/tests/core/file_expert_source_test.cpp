@@ -1165,6 +1165,98 @@ void test_replace_resident(bool pin) {
     std::cout << "replace_resident: pinned=" << pin << " exact_bytes=PASS\n";
 }
 
+// E1 (core/exclusive_cache.hpp): the in-place exchanges a fetch window publishes are settled at its synchronization
+// point - 1 commits each pair (the evicted expert takes the admitted one's RAM place), 0 puts the window's plan back
+// and asks for both table entries to be patched - and a pair is never planned while an eviction is staged (override_)
+// or a soft commit is in flight (soft_in_).
+void test_settle_fetch_exchanges(bool pin) {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    int ndev = 0;
+    // the fixture needs a device for its cache slot and its D2H copy; without one this skips, so that a plain
+    // `file_expert_source_test` run on a machine with no card stays green
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) {
+        std::cout << "settle_fetch_exchanges: pinned=" << pin << " no CUDA device here, SKIPPED\n";
+        return;
+    }
+#if defined(_WIN32)
+    _putenv_s("STRATA_EXCHANGE_ROTATE", "0");
+#else
+    setenv("STRATA_EXCHANGE_ROTATE", "0", 1);
+#endif
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
+    const size_t bytes = (size_t) BLOB;
+    std::vector<std::vector<uint8_t>> truth(5, std::vector<uint8_t>(bytes));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        for (size_t e = 0; e < truth.size(); ++e) {
+            for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t) ((i * 131u + e * 37u) ^ (i >> 8));
+            out.write((const char*) truth[e].data(), (std::streamsize) bytes);
+        }
+        require((bool) out, "fixture write failed");
+    }
+    FileExpertSource src;
+    ExpertCache cache;
+    require(src.open(dir.path.string(), 1, 5, err), err);
+    require(cache.open(2, 1, 5, BLOB, err), err);
+    int slot2 = -1, slot3 = -1;
+    for (int e : {2, 3}) {
+        const int slot = cache.admit(0, e);
+        require(slot >= 0 && cache.fill_slot_blocking(slot, truth[e].data(), err), err);
+        if (e == 2) slot2 = slot;
+        else slot3 = slot;
+    }
+    const std::vector<std::pair<int32_t, int32_t>> rank{{0,0},{0,1},{0,2},{0,3},{0,4}};
+    // as in test_replace_resident: experts 2 and 3 are in VRAM, the RAM budget holds 0 and 1, expert 4 stays on the file tier
+    require(src.pin_cache_complement(cache, err, pin, {}, -1, 0, 2 * bytes, &rank), err);
+    require(src.reserve_exchanges(2, err), err);
+    require(src.has_resident(0, 0) && src.has_resident(0, 1) && !src.has_resident(0, 4), "fixture residency wrong");
+    // (a) a window whose sync succeeded (1): expert 0 was admitted into expert 4's VRAM slot and the copy wrote 4's
+    // bytes into 0's RAM place, so the place changes hands and the admitted expert is resident nowhere
+    ExpertDispatch settled;
+    require(src.can_exchange_resident(0, 0, 4), "the fixture pair is not one the pool would plan");
+    settled.fetch_evicted.push_back({0, 4, 0});   // layer 0: expert 4 evicted, expert 0 admitted
+    src.settle_fetch_exchanges(settled, 1);
+    require(settled.fetch_evicted.empty(), "the settled exchange was kept");
+    require(src.has_resident(0, 4) && !src.has_resident(0, 0),
+            "settle(1) did not give the admitted expert's RAM place to the evicted one");
+    // (b) a window that provably did not run (0): its plan had flipped both entries, the settle puts them back and asks
+    // the driver to patch both - the RAM holds 1 and 4 now, the VRAM tier 2 and 3
+    std::vector<int32_t> res{-1, -1, slot2, slot3, -1};
+    require(src.can_exchange_resident(0, 4, 2), "the second fixture pair is not one the pool would plan");
+    ExpertDispatch rolled;
+    rolled.res_mut = res.data();
+    const int32_t slot = res[2];
+    res[2] = -1;   // what the plan wrote: expert 2's slot goes to expert 4
+    res[4] = slot;
+    rolled.fetch_evicted.push_back({0, 2, 4});
+    src.settle_fetch_exchanges(rolled, 0);
+    require(res[2] == slot && res[4] == -1, "settle(0) did not put the window's plan back");
+    require(rolled.res_dirty && rolled.res_dirty_idx == std::vector<int32_t>({2, 4}),
+            "settle(0) did not ask for both entries to be patched");
+    // (c) no pair is planned while an eviction is staged (override_) or a soft commit is in flight (soft_in_).  4 -> 3 is
+    // residency-valid, so its acceptance shows the refusals come from the in-flight state and not from the pair
+    require(src.can_exchange_resident(0, 4, 3), "the control pair is not one the pool would plan");
+    // expert 2's eviction, from the RAM place expert 4 holds; then expert 0's, from expert 1's place
+    require(cudaMemcpy(src.exchange_buffer(0), cache.device_slot(slot2), bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
+            "D2H eviction failed");
+    require(src.stage_exchange(0, 4, 2, 0), "stage rejected");
+    std::memcpy(src.exchange_buffer(1), truth[0].data(), bytes);
+    require(src.stage_exchange(0, 1, 0, 1), "stage rejected");
+    require(!src.can_exchange_resident(0, 4, 0) && !src.can_exchange_resident(0, 1, 2) &&
+                src.can_exchange_resident(0, 4, 3),
+            "a pair was offered beside a staged exchange");
+    const bool soft = src.soft_commit_exchanges();   // STRATA_ADAPT_OVERLAP: the pair already looks committed
+    require(!src.can_exchange_resident(0, 4, 0) && !src.can_exchange_resident(0, 1, 2),
+            "a pair was offered beside a soft commit");
+    require(src.commit_exchanges() == 2, "commit count wrong");
+    src.close();
+    std::cout << "settle_fetch_exchanges: pinned=" << pin << " soft commit " << (soft ? "on" : "unavailable here")
+              << ": PASS\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1182,6 +1274,10 @@ int main(int argc, char** argv) {
         test_canonical_layout();
         test_unbuffered_reads();
         test_io_prefetch();
+        // E1: the exchange's own settle.  Not behind --rotation-gpu, so a plain `file_expert_source_test` run (the one
+        // ctest makes) covers it; the test skips itself where there is no CUDA device.
+        test_settle_fetch_exchanges(true);
+        test_settle_fetch_exchanges(false);
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif

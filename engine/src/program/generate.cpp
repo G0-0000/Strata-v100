@@ -2366,6 +2366,20 @@ int adapt_fetch() {
     return v;
 }
 
+/// STRATA_ADAPT_FETCH_RESIDENT=1: allow the PCIe share's admissions in the resident RAM mode
+/// (--resident-experts --resident-budget-gib N), where they are off by default.
+static bool adapt_fetch_resident() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_ADAPT_FETCH_RESIDENT"); return e != nullptr && e[0] != '\0' && e[0] != '0'; }();
+    return v;
+}
+
+/// E1 (core/exclusive_cache.hpp): the verifier calls this at the window's synchronization point, on the thread that
+/// planned the window, with its verified outcome (1 executed, 0 provably not executed, 2 unknown).
+static void settle_window_exchanges(void* ctx, int outcome) {
+    auto& d = *(strata::core::ExpertDispatch*) ctx;
+    if (d.exclusive != nullptr) d.exclusive->settle_fetch_exchanges(d, outcome);
+}
+
 /// ExpertDispatch::evict_sync where the tier does not wait for its copies; STRATA_ADAPT_EVICT_SYNC=0 turns it off.
 bool adapt_evict_sync() {
     static const bool v = [] { const char* e = std::getenv("STRATA_ADAPT_EVICT_SYNC"); return e == nullptr || std::atoi(e) != 0; }();
@@ -15030,11 +15044,14 @@ int main(int argc, char** argv) {
             split_drive_b.pcie_num[0] = drive.d.pcie_num;
         };
         // the serial windows of one GPU, where the pool can admit (expert_pool_dispatch_multi's fetch_on)
+        // deviation: STRATA_ADAPT_OVERLAP=1 used to close this path too (the term stood at the end of the chain below,
+        // with no reason stated - the pair was excluded, not reasoned about).  What the overlap leaves unsettled is the
+        // promoted expert whose copy still lands while the window's settlement releases its RAM place; that one is kept
+        // out of the victim choice instead (core/expert_source.cpp, the `in_flight` term of the victim predicate).
         const char* fetch_off = d_res == nullptr ? "no residency table" : xcache.slots() <= 0 ? "0-slot expert cache" : o.spec_split ? "--spec-split"
                               : multi_gpu || !stages.empty() ? "a layer split" : peer.valid() ? "--peer-device"
                               : remote_opt || drive.d.remote_count > 0 ? "helper GPUs" : o.adapt_async ? "--adapt-async"
-                              : o.pipeline_windows > 0 ? "--pipeline-windows" : o.batch > 0 ? "--batch"
-                              : adapt_overlap() ? "STRATA_ADAPT_OVERLAP=1" : nullptr;
+                              : o.pipeline_windows > 0 ? "--pipeline-windows" : o.batch > 0 ? "--batch" : nullptr;
         if (fetch_off == nullptr && !pcie_auto.on && drive.d.pcie_num == 0 && fs_swap == nullptr && !ver.pcie_balance_on()) {
             ver.set_no_pcie_share(true);
             if (ver.device_hits_active())
@@ -15046,7 +15063,11 @@ int main(int argc, char** argv) {
                             : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"
                             : drive.d.plan == nullptr ? "no GPU plan"
                             : drive.d.pcie_num <= 0 ? "no PCIe share"
-                            : src.complement_ready() ? "the resident RAM mode" : nullptr;
+                            // E1: the resident RAM mode is this path's premise, not a reason to turn it off - but only in
+                            // the one configuration the in-place exchange is defined for (see below).
+                            // deviation: STRATA_ADAPT_FETCH=2 exactly, with STRATA_ADAPT_FETCH_RESIDENT=1.
+                            : src.complement_ready() && !(adapt_fetch_resident() && adapt_fetch() == 2) ? "the resident RAM mode"
+                            : nullptr;
             if (off != nullptr) {
                 if (strata::core::adapt_fetch_is_default())   // the default of a card with 16 GiB or less, not the user's setting
                     std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH=2 (the default for this card) is not used in this run (%s)\n", off);
@@ -15059,10 +15080,24 @@ int main(int argc, char** argv) {
                 drive.d.fetch_avail.assign((size_t) g.n_layers, 0);
                 if (const char* v = std::getenv("STRATA_ADAPT_FETCH_MIN")) drive.d.fetch_min = (float) std::atof(v);
                 if (const char* v = std::getenv("STRATA_ADAPT_FETCH_MARGIN")) drive.d.fetch_margin = (float) std::atof(v);
+                // E1 (core/exclusive_cache.hpp): an admitted expert takes the RAM place of the expert it evicts, and the
+                // fetch kernel writes that one back into the slot it frees - no SSD read for it.
+                // deviation: the exact value 2 is required (only then are the tier's own RAM->VRAM copies off, which is
+                // what leaves the admitted expert's RAM place free to take the evicted one).
+                if (src.complement_ready() && adapt_fetch_resident() && drive.d.fetch_admit == 2) {
+                    drive.d.exclusive = &src;
+                    drive.d.plan->exchange_settle = &settle_window_exchanges;   // (the window's own sync point settles it)
+                    drive.d.plan->exchange_ctx = &drive.d;
+                    std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH_RESIDENT=1: an admitted expert swaps in place with the "
+                                         "expert it evicts (no SSD read; the evicted expert takes its RAM place)\n");
+                }
                 std::fprintf(stderr, "strata serve: STRATA_ADAPT_FETCH=%d: the PCIe share takes each layer's most-routed "
                                      "misses and admits those routed >= %.2f and %.2f more than a resident one%s\n",
                              drive.d.fetch_admit, drive.d.fetch_min, drive.d.fetch_margin,
-                             drive.d.fetch_admit == 2 ? "; the tier's own copies are off" : "");
+                             drive.d.fetch_admit == 2
+                                 ? (src.complement_ready() ? "; the tier keeps the rest (its copies still run)"
+                                                           : "; the tier's own copies are off")
+                                 : "");
             }
         }
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
@@ -23889,6 +23924,12 @@ int main(int argc, char** argv) {
                                      "VRAM tier, %lld blob reads from the file\n",
                              (double) src.resident_bytes() / 1073741824.0, (long long) src.exchanges(),
                              (long long) src.file_reads());
+            // E1 (core/exclusive_cache.hpp), cumulative: the admissions that needed no read of the file - the evicted
+            // expert took the admitted one's RAM place.  The generate summary's line (deviation: serve printed none, so
+            // a production run could not tell whether the exchange ever fired).
+            if (drive.d.fetch_admit > 0 && drive.d.exclusive != nullptr)
+                std::fprintf(stderr, "strata serve: fetch exchange: %lld in place (no read of the file; the evicted expert "
+                                     "takes the RAM place)\n", (long long) drive.d.fetch_swaps);
             if (ram_adapt2.on)   // 149-prefetch: the staged promotions, cumulative
                 std::fprintf(stderr, "strata serve: resident RAM (STRATA_RAM_ADAPT2): %lld promotions read on the I/O thread, "
                                      "%lld installed, %lld skipped at the install (%lld of them: the GPU tier took one of the pair)\n",
@@ -24673,7 +24714,11 @@ int main(int argc, char** argv) {
                             : o.pcie_mode == "dma" || o.pcie_mode == "direct" ? "--pcie-mode dma / direct"
                             : drive.d.plan == nullptr ? "no GPU plan"
                             : drive.d.pcie_num <= 0 ? "no PCIe share"
-                            : src.complement_ready() ? "the resident RAM mode" : nullptr;
+                            // E1: the resident RAM mode is this path's premise, not a reason to turn it off - but only in
+                            // the one configuration the in-place exchange is defined for (see below).
+                            // deviation: STRATA_ADAPT_FETCH=2 exactly, with STRATA_ADAPT_FETCH_RESIDENT=1.
+                            : src.complement_ready() && !(adapt_fetch_resident() && adapt_fetch() == 2) ? "the resident RAM mode"
+                            : nullptr;
             if (off != nullptr) {
                 if (strata::core::adapt_fetch_is_default())
                     std::fprintf(stderr, "strata generate: STRATA_ADAPT_FETCH=2 (the default for this card) is not used in this run (%s)\n", off);
@@ -24687,10 +24732,24 @@ int main(int argc, char** argv) {
                 if (const char* v = std::getenv("STRATA_ADAPT_FETCH_MIN")) drive.d.fetch_min = (float) std::atof(v);
                 if (const char* v = std::getenv("STRATA_ADAPT_FETCH_MARGIN")) drive.d.fetch_margin = (float) std::atof(v);
                 drive.d.fetch_log_on = std::getenv("STRATA_ADAPT_FETCH_VERIFY") != nullptr;
+                // E1 (core/exclusive_cache.hpp): an admitted expert takes the RAM place of the expert it evicts, and the
+                // fetch kernel writes that one back into the slot it frees - no SSD read for it.
+                // deviation: the exact value 2 is required (only then are the tier's own RAM->VRAM copies off, which is
+                // what leaves the admitted expert's RAM place free to take the evicted one).
+                if (src.complement_ready() && adapt_fetch_resident() && drive.d.fetch_admit == 2) {
+                    drive.d.exclusive = &src;
+                    drive.d.plan->exchange_settle = &settle_window_exchanges;   // (the window's own sync point settles it)
+                    drive.d.plan->exchange_ctx = &drive.d;
+                    std::fprintf(stderr, "strata generate: STRATA_ADAPT_FETCH_RESIDENT=1: an admitted expert swaps in place with the "
+                                         "expert it evicts (no SSD read; the evicted expert takes its RAM place)\n");
+                }
                 std::fprintf(stderr, "strata generate: STRATA_ADAPT_FETCH=%d: the PCIe share takes each layer's most-routed "
                                      "misses and admits those routed >= %.2f and %.2f more than a resident one%s\n",
                              drive.d.fetch_admit, drive.d.fetch_min, drive.d.fetch_margin,
-                             drive.d.fetch_admit == 2 ? "; the tier's own copies are off" : "");
+                             drive.d.fetch_admit == 2
+                                 ? (src.complement_ready() ? "; the tier keeps the rest (its copies still run)"
+                                                           : "; the tier's own copies are off")
+                                 : "");
             }
         }
         // before every window: the device's table follows the host's (the tier's evictions while its copies are in
@@ -25198,8 +25257,13 @@ int main(int argc, char** argv) {
                 for (const auto& [i, slot] : drive.d.fetch_log) {
                     std::string verr;
                     const int64_t l = i / g.n_expert;
+                    // E1: after an in-place exchange the place is the evicted expert's, so this falls back to the file's
+                    // blob of the admitted one - and that read can come back empty: verify_slot memcmps the pointer as
+                    // it is (expert_cache.cpp:984), so null is refused here rather than inside it.
+                    const uint8_t* b = srcp->blob_stable(l, i % g.n_expert);
                     const bool same = host_res[(size_t) i] != slot ||   // evicted again since: nothing to check
-                        xcache.verify_slot(slot, srcp->blob_stable(l, i % g.n_expert), verr,
+                        b == nullptr ||
+                        xcache.verify_slot(slot, b, verr,
                                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
                     ++checked;
                     if (!same) {
@@ -25405,9 +25469,14 @@ int main(int argc, char** argv) {
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
-        if (rounds > 0 && drive.d.fetch_admit > 0)
+        if (rounds > 0 && drive.d.fetch_admit > 0) {
             std::printf("%-24s %lld experts admitted from the PCIe share (%.2f a round)\n", "fetch admission",
                         (long long) drive.d.fetch_admitted, (double) drive.d.fetch_admitted / (double) rounds);
+            // E1: the admissions that needed no read of the file: the evicted expert took the admitted one's RAM place
+            if (drive.d.exclusive != nullptr)
+                std::printf("%-24s %lld in place (no read of the file; the evicted expert takes the RAM place)\n",
+                            "fetch exchange", (long long) drive.d.fetch_swaps);
+        }
         if (res_checking)
             std::printf("%-24s %lld windows, %lld with mismatches (%lld entries), %lld layer-windows with CPU experts and "
                         "no activation published\n", "residency check", (long long) res_windows,

@@ -3821,6 +3821,22 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const OnDevice on_device(device_);
     last_batch_ = false;
     split_logits_materialized_ = false;
+    // E1 (core/exclusive_cache.hpp): the in-place VRAM<->RAM exchanges this window's pool publishes are settled
+    // exactly once, at its synchronization point, whichever way run() leaves: 1 = the window's stream synced (its copy
+    // kernel ran), 0 = provably not executed, 2 = unknown (the engine stops rather than read an expert from a place it
+    // is not in).  The pool plans on this thread, inside the loop below, so the markers are this window's alone.
+    struct ExchangeSettle {
+        GpuPlanSink& s;
+        bool done = false;
+        void operator()(int outcome) {
+            if (done) return;
+            done = true;
+            s.exchange_live = false;   // from here no pool dispatch of this verifier can publish an exchange
+            if (s.exchange_settle != nullptr) s.exchange_settle(s.exchange_ctx, outcome);
+        }
+        ~ExchangeSettle() { (*this)(2); }
+    } settle_exchange{sink_};
+    sink_.exchange_live = sink_.exchange_settle != nullptr;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     // a layer split's hand-off buffers hold kVerifyMaxT rows
     if (T > kVerifyMaxT && (next_ != nullptr || lb_ > 0)) { err = "verify: windows past 8 tokens need one stage"; return false; }
@@ -3939,7 +3955,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #endif
         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
         graph_launched = true;
-        if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+        // E1: a launch that did not enqueue settled nothing of this window's exchanges (0).  A non-exchange admission of the
+        // same window keeps `res_mut` as planned here: pre-existing behaviour, outside this feature, left untouched.
+        if (le != cudaSuccess) { settle_exchange(0); err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
 #if defined(STRATA_VERIFY_HGL)
         (void) launch_o->query();
 #else
@@ -4134,6 +4152,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             cudaStreamSynchronize(copy_);
             copy_used_ = false;
         }
+        // E1: this branch's own sync above is its proof that its copies ran, as at 4182 (deviation from the first port,
+        // which left it to the destructor's 2): every path that synchronized successfully settles as 1.
+        settle_exchange(se == cudaSuccess ? 1 : 2);
         if (!ok) return false;
         if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
         if (handoff_failed(err)) return false;   // a middle stage of three or more: its own hand-in
@@ -4163,6 +4184,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
+    settle_exchange(se == cudaSuccess ? 1 : 2);   // E1: the window's own sync is its proof that its copies ran
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
@@ -4350,6 +4372,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.start2 = base + ptr_off + 4 * cap;
     sink_.dst2 = (unsigned long long*) (base + dst2_off_);
     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
+    sink_.groups = G;   // E1: the pool swaps in place only in a one-group window
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.device_hits_only = !last_batch_ && device_hits_active();

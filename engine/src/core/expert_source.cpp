@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/exclusive_cache.hpp"   // E1: the fetch target's swap bit
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/tail_skip_default.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -4783,6 +4784,66 @@ bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
     return resident_blob(index) != nullptr;
 }
 
+// ---- E1 (exclusive_cache.hpp): STRATA_ADAPT_FETCH=2 with STRATA_ADAPT_FETCH_RESIDENT=1 admits a RAM-resident expert
+// into a VRAM slot whose expert has no host copy, and the fetch kernel writes that evicted expert back into the place
+// the admitted one leaves - no SSD read, no extra RAM.  The place changes hands only after that copy has run: the pool
+// that plans the window only *checks* the pair (can_exchange_resident) and tags the kernel's target with the swap bit
+// (exclusive::fetch_target), and the window's synchronization point settles the pairs it recorded
+// (ExpertDispatch::fetch_evicted).  Flipping the table before the copy is what makes a lost window read an expert
+// from a place it is not in; it is never done from the pool.
+bool FileExpertSource::can_exchange_resident(int64_t layer, int64_t in, int64_t out) const {
+    if (!complement_ready_ || exchange_storage_.active() || complement_host_ == nullptr || layer < 0 || layer >= n_layers_ ||
+        in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out)
+        return false;
+    const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
+    const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
+    if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
+    if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
+    // a staged exchange (soft_in_, the place `out` will take) is in flight: the place this pair would move is not final
+    if (!soft_in_.empty() && (soft_in_[i_in] != SIZE_MAX || soft_in_[i_out] != SIZE_MAX)) return false;
+    return complement_offsets_[i_in] != kNoComplement && complement_offsets_[i_out] == kNoComplement;
+}
+
+bool FileExpertSource::exchange_resident(int64_t layer, int64_t in, int64_t out) {
+    if (!can_exchange_resident(layer, in, out)) return false;
+    return detail::exchange_cache_complement(complement_offsets_, (size_t) layer * (size_t) n_expert_ + (size_t) in,
+                                             (size_t) layer * (size_t) n_expert_ + (size_t) out);
+}
+
+void FileExpertSource::settle_fetch_exchanges(ExpertDispatch& d, int outcome) {
+    if (d.fetch_evicted.empty()) return;
+    if (outcome == 2) {   // the window never reached its sync: nothing can tell whether its copy ran
+        std::fprintf(stderr, "strata FATAL: %zu in-place VRAM<->RAM exchange(s) of the last window cannot be verified "
+                             "(the window did not reach its synchronization point).  The engine stops: an exchange "
+                             "that half ran leaves both experts where neither is read.\n",
+                     d.fetch_evicted.size());
+        std::fflush(stderr);
+        std::abort();
+    }
+    for (const auto& ev : d.fetch_evicted) {
+        const size_t lb = (size_t) ev.layer * (size_t) n_expert_;
+        if (outcome == 1) {   // the copy ran: the evicted expert's bytes are in the place the admitted one left
+            if (!exchange_resident(ev.layer, ev.admitted, ev.evicted)) {
+                std::fprintf(stderr, "strata FATAL: layer %d experts %d/%d: the in-place exchange ran but its RAM place "
+                                     "cannot change hands.  The engine stops.\n",
+                             (int) ev.layer, (int) ev.evicted, (int) ev.admitted);
+                std::fflush(stderr);
+                std::abort();
+            }
+            continue;
+        }
+        // provably not executed: nothing moved, so the evicted expert keeps its slot and the admitted one is not resident
+        if (d.res_mut != nullptr) {
+            d.res_mut[lb + (size_t) ev.evicted] = d.res_mut[lb + (size_t) ev.admitted];
+            d.res_mut[lb + (size_t) ev.admitted] = -1;   // kNotResident
+            d.res_dirty = true;
+            d.res_dirty_idx.push_back((int32_t) (lb + (size_t) ev.evicted));
+            d.res_dirty_idx.push_back((int32_t) (lb + (size_t) ev.admitted));
+        }
+    }
+    d.fetch_evicted.clear();
+}
+
 bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bounce) {
     err.clear();
     if (n <= xstage_cap_) return true;
@@ -5412,6 +5473,10 @@ namespace {
 // STRATA_ROUTE_TAIL_SKIP: the rank from which a missed expert that every token of the window routes that low is skipped.  An
 // environment value is read once.  Not set: off on every backend (strata/core/tail_skip_default.hpp; rank 7 on CUDA and gfx1200/gfx1201 until 0.1.62).
 std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
+// E1: the in-place exchanges one window may publish.  Its markers are settled, and emptied, at that window's
+// synchronization point, so this is a bound on a vector that never grows past one window (deviation: upstream's push
+// had no limit and the generate loop never cleared it).
+constexpr size_t kMaxFetchExchange = 4096;
 }  // namespace
 int tail_skip_rank() {
     int r = g_tail_skip_rank.load(std::memory_order_relaxed);
@@ -5653,8 +5718,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int32_t vic[64];
             int nv = 0;
             for (int32_t e = 0; e < (int32_t) d.n_expert && nc > 0; ++e) {
+                // deviation: with STRATA_ADAPT_OVERLAP=1 a promoted expert is resident in `res_mut` from the flip the
+                // window starts with, while its copy still lands and the window's settlement releases its RAM place -
+                // a victim taken here would write into a place that is about to leave the tier.  Upstream never saw the
+                // pair: its STRATA_ADAPT_OVERLAP=1 turned this whole path off (program/generate.cpp, no reason stated).
+                // The candidate above is skipped by `in_flight`; the victim is now too.
                 if (d.res_mut[lb + (size_t) e] < 0 || d.fetch_mark[(size_t) e] != 0 ||
-                    (d.fetch_pin != nullptr && d.fetch_pin[lb + (size_t) e] != 0)) continue;
+                    (d.fetch_pin != nullptr && d.fetch_pin[lb + (size_t) e] != 0) ||
+                    (!d.in_flight.empty() && d.in_flight[lb + (size_t) e] != 0)) continue;
                 if (nv < nc) vic[nv++] = e;
                 else if (use[e] < use[vic[nv - 1]]) vic[nv - 1] = e;
                 else continue;
@@ -5665,14 +5736,31 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const int32_t e = ids[pcie_i0[q]], v = vic[j];
                 if (use[e] < use[v] + d.fetch_margin) break;
                 const int32_t slot = d.res_mut[lb + (size_t) v];
-                P.dst2[q] = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
-                                                                                   : (size_t) slot * (size_t) d.cache_blob));
+                const unsigned long long target =
+                    (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
+                                                                          : (size_t) slot * (size_t) d.cache_blob));
+                // E1: the copy kernel writes the evicted expert back into the place the admitted one leaves, in place.
+                // deviation: never in a window of two token groups (one group would write the RAM place back under the
+                // other group's read of it), and only in a window whose synchronization point settles it
+                // (`P.exchange_live`).  `d.fs == nullptr` (no Foresight staging) is a property of this path already:
+                // fetch_can ruled it out before the plan was made.
+                const bool swap = d.exclusive != nullptr && P.exchange_live && P.groups == 1 &&
+                                  d.fetch_evicted.size() < kMaxFetchExchange && !d.src->pinned(d.layers, v) &&
+                                  d.exclusive->can_exchange_resident(d.layers, e, v);
+                P.dst2[q] = exclusive::fetch_target(target, swap);
+                if (swap) {   // deviation: only recorded here - the place changes hands once the window has synced
+                    d.fetch_evicted.push_back({(int32_t) d.layers, v, e});
+                    ++d.fetch_swaps;
+                }
                 d.res_mut[lb + (size_t) v] = -1;   // kNotResident
                 d.res_mut[lb + (size_t) e] = slot;
                 ++d.fetch_admitted;
                 d.res_dirty = true;
                 d.res_dirty_idx.push_back((int32_t) (lb + (size_t) v));
                 d.res_dirty_idx.push_back((int32_t) (lb + (size_t) e));
+                // E1: a swapped admission is read back like any other (deviation from the first port, which skipped it):
+                // the settlement gives `e`'s old RAM place to the evicted expert, so the next window's read-back falls
+                // back to the file - exactly the bytes this slot must hold.
                 if (d.fetch_log_on) d.fetch_log.emplace_back((int64_t) (lb + (size_t) e), slot);
             }
             for (int64_t i = 0; i < n; ++i)
